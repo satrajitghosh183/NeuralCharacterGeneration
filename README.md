@@ -1,6 +1,4 @@
-Got it. Here's the full `README.md` content — clean, complete, and structured to reflect your full pipeline, integration of `FDNeRF` and `nerftrinsic_four`, and detailed setup:
 
----
 
 # Neural Character Generation
 
