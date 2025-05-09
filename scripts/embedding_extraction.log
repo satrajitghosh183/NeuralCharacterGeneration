@@ -1,0 +1,16 @@
+2025-05-03 10:11:29,549 - EmbeddingExtractor - INFO - Using device: cpu
+2025-05-03 10:11:29,549 - EmbeddingExtractor - INFO - Loading DINOv2 model...
+2025-05-03 10:11:30,216 - dinov2 - INFO - using MLP layer as FFN
+2025-05-03 10:11:30,617 - EmbeddingExtractor - INFO - Successfully loaded DINOv2 model
+2025-05-03 10:11:30,617 - EmbeddingExtractor - INFO - Found 1 images to process for pose front
+2025-05-03 10:11:30,832 - EmbeddingExtractor - INFO - Extracted embedding from 000.png
+2025-05-03 10:11:30,833 - EmbeddingExtractor - INFO - Successfully processed 1/1 images for pose front
+2025-05-03 10:11:30,834 - EmbeddingExtractor - INFO - Embedding extraction completed for subject_1746281452705 - front
+2025-05-03 10:14:14,013 - EmbeddingExtractor - INFO - Using device: cpu
+2025-05-03 10:14:14,013 - EmbeddingExtractor - INFO - Loading DINOv2 model...
+2025-05-03 10:14:14,554 - dinov2 - INFO - using MLP layer as FFN
+2025-05-03 10:14:14,913 - EmbeddingExtractor - INFO - Successfully loaded DINOv2 model
+2025-05-03 10:14:14,913 - EmbeddingExtractor - INFO - Found 1 images to process for pose front
+2025-05-03 10:14:15,012 - EmbeddingExtractor - INFO - Extracted embedding from 000.png
+2025-05-03 10:14:15,012 - EmbeddingExtractor - INFO - Successfully processed 1/1 images for pose front
+2025-05-03 10:14:15,012 - EmbeddingExtractor - INFO - Embedding extraction completed for subject_1746281631945 - front

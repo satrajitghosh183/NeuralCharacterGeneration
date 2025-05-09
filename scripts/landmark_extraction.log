@@ -1,0 +1,8 @@
+2025-05-03 10:11:25,686 - LandmarkExtractor - INFO - Found 1 images to process for pose front
+2025-05-03 10:11:25,766 - LandmarkExtractor - INFO - Extracted landmarks from 000.png
+2025-05-03 10:11:25,766 - LandmarkExtractor - INFO - Successfully processed 1/1 images for pose front
+2025-05-03 10:11:25,767 - LandmarkExtractor - INFO - Landmark extraction completed for subject_1746281452705 - front
+2025-05-03 10:14:09,722 - LandmarkExtractor - INFO - Found 1 images to process for pose front
+2025-05-03 10:14:09,779 - LandmarkExtractor - INFO - Extracted landmarks from 000.png
+2025-05-03 10:14:09,780 - LandmarkExtractor - INFO - Successfully processed 1/1 images for pose front
+2025-05-03 10:14:09,780 - LandmarkExtractor - INFO - Landmark extraction completed for subject_1746281631945 - front

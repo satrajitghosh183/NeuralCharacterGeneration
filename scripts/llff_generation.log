@@ -1,0 +1,10 @@
+2025-05-03 10:11:36,400 - LLFFGenerator - INFO - Found 1 images to process
+2025-05-03 10:11:36,444 - LLFFGenerator - INFO - Saved poses_bounds.npy with 1 entries
+2025-05-03 10:11:36,451 - LLFFGenerator - INFO - Created train split with 1 images
+2025-05-03 10:11:36,451 - LLFFGenerator - INFO - Created val split with 0 images
+2025-05-03 10:11:36,451 - LLFFGenerator - INFO - LLFF data generation completed for subject_1746281452705
+2025-05-03 10:14:20,329 - LLFFGenerator - INFO - Found 1 images to process
+2025-05-03 10:14:20,363 - LLFFGenerator - INFO - Saved poses_bounds.npy with 1 entries
+2025-05-03 10:14:20,363 - LLFFGenerator - INFO - Created train split with 1 images
+2025-05-03 10:14:20,363 - LLFFGenerator - INFO - Created val split with 0 images
+2025-05-03 10:14:20,363 - LLFFGenerator - INFO - LLFF data generation completed for subject_1746281631945
