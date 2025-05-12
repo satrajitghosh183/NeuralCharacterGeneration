@@ -28,6 +28,7 @@ The final outputs support mesh extraction, relighting, and NeRF-based texture sy
 ├── nerftrinsic_four/          # Forked and modified from NeRFtrinsic-Four (pose + focal learning)
 ├── mtcm_mae/                  # MTCM transformer for view selection and pose prediction
 ├── nerf/                      # TinyNeRF and weighted variants with attention refinement
+├── fdnerf/                    # FDNeRF for few shot avatar reconstruction. Deployment guide within sub-directory.
 ├── scripts/                   # App runner (includes app.py web interface)
 ├── dataset_joint_mtcm_nerf.py
 ├── train_joint_mtcm_nerf.py
