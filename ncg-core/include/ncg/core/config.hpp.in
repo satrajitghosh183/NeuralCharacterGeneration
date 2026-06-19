@@ -1,0 +1,10 @@
+#pragma once
+// Generated from config.hpp.in by CMake. Do not edit the generated copy.
+
+#define NCG_VERSION_MAJOR @PROJECT_VERSION_MAJOR@
+#define NCG_VERSION_MINOR @PROJECT_VERSION_MINOR@
+#define NCG_VERSION_PATCH @PROJECT_VERSION_PATCH@
+#define NCG_VERSION "@PROJECT_VERSION@"
+
+// Defined when the project is built with CUDA support (the H100 build).
+#cmakedefine NCG_WITH_CUDA

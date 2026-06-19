@@ -1,0 +1,32 @@
+---
+# NeuralCharGen C++/CUDA style. Enforced; a cheap correctness/readability win for a
+# write-blind/build-remote loop. Run: clang-format -i $(git ls-files '*.cpp' '*.hpp' '*.cu' '*.cuh')
+BasedOnStyle: LLVM
+Language: Cpp
+Standard: c++20
+ColumnLimit: 100
+IndentWidth: 2
+ContinuationIndentWidth: 4
+AccessModifierOffset: -2
+PointerAlignment: Left
+DerivePointerAlignment: false
+AllowShortFunctionsOnASingleLine: InlineOnly
+AllowShortIfStatementsOnASingleLine: WithoutElse
+AlwaysBreakTemplateDeclarations: Yes
+BinPackArguments: false
+BinPackParameters: false
+IncludeBlocks: Regroup
+SortIncludes: CaseInsensitive
+IncludeCategories:
+  # Matching module header is forced to top by clang-format automatically.
+  - Regex: '^<ncg/'
+    Priority: 2
+  - Regex: '^<torch/'
+    Priority: 3
+  - Regex: '^<(catch2|spdlog|nlohmann)/'
+    Priority: 4
+  - Regex: '^<.*\.(h|hpp)>'
+    Priority: 5
+  - Regex: '^<[^/.]+>'   # standard library
+    Priority: 6
+---

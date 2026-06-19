@@ -1,0 +1,54 @@
+{
+  "version": 6,
+  "cmakeMinimumRequired": { "major": 3, "minor": 27, "patch": 0 },
+  "configurePresets": [
+    {
+      "name": "base",
+      "hidden": true,
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/${presetName}",
+      "cacheVariables": {
+        "CMAKE_CXX_COMPILER_LAUNCHER": "ccache",
+        "CMAKE_CUDA_COMPILER_LAUNCHER": "ccache"
+      }
+    },
+    {
+      "name": "h100-release",
+      "inherits": "base",
+      "displayName": "H100 RelWithDebInfo (sm_90)",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "RelWithDebInfo",
+        "CMAKE_CUDA_ARCHITECTURES": "90-real",
+        "CMAKE_PREFIX_PATH": "$env{LIBTORCH_ROOT}"
+      }
+    },
+    {
+      "name": "h100-debug",
+      "inherits": "h100-release",
+      "displayName": "H100 Debug (sm_90, cuda sync checks on)",
+      "cacheVariables": { "CMAKE_BUILD_TYPE": "Debug" }
+    },
+    {
+      "name": "mac-lint",
+      "inherits": "base",
+      "displayName": "Mac host-only configure (compile_commands for clang-tidy)",
+      "cacheVariables": {
+        "NCG_LINT_ONLY": "ON",
+        "NCG_BUILD_APPS": "OFF",
+        "CMAKE_PREFIX_PATH": "$env{LIBTORCH_ROOT}"
+      }
+    }
+  ],
+  "buildPresets": [
+    { "name": "h100-release", "configurePreset": "h100-release" },
+    { "name": "h100-debug", "configurePreset": "h100-debug" }
+  ],
+  "testPresets": [
+    {
+      "name": "h100",
+      "configurePreset": "h100-release",
+      "output": { "outputOnFailure": true },
+      "execution": { "stopOnFailure": false }
+    }
+  ]
+}

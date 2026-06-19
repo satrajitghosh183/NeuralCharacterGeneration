@@ -1,0 +1,31 @@
+# Build trees
+/build/
+build*/
+out/
+*.o
+*.obj
+
+# CMake user-local (per-machine LibTorch/CUDA paths)
+CMakeUserPresets.json
+
+# Editor / IDE
+.idea/
+.vscode/
+*.swp
+.DS_Store
+
+# Python dev tooling (tools/)
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Large artifacts (prefer git-LFS or fetch scripts; never commit raw weights)
+*.pt
+*.pth
+*.ckpt
+# NOTE: *.safetensors / *.ncgw / *.npy under data/ are tracked via git-LFS (.gitattributes)
+
+# Renders / scratch
+out.png
+*.scratch

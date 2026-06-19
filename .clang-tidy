@@ -1,0 +1,23 @@
+# Focused, low-noise checks that catch real bugs in a build-blind loop.
+# Run on host (.cpp) units: clang-tidy -p build/<preset> <file>
+Checks: >
+  -*,
+  bugprone-*,
+  -bugprone-easily-swappable-parameters,
+  -bugprone-narrowing-conversions,
+  cppcoreguidelines-pro-type-member-init,
+  cppcoreguidelines-init-variables,
+  cppcoreguidelines-slicing,
+  misc-uninitialized-record,
+  misc-use-after-move,
+  performance-*,
+  -performance-avoid-endl,
+  readability-misleading-indentation,
+  readability-redundant-declaration,
+  modernize-use-nullptr,
+  modernize-use-override,
+  modernize-use-using
+
+WarningsAsErrors: ''
+HeaderFilterRegex: 'ncg/.*'
+FormatStyle: file

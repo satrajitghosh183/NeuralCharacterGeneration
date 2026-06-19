@@ -1,0 +1,14 @@
+# Treat model/golden binaries as binary and store via git-LFS.
+# (Run `git lfs install` once on each clone; see docs/build.md.)
+*.safetensors filter=lfs diff=lfs merge=lfs -text
+*.ncgw        filter=lfs diff=lfs merge=lfs -text
+*.npy         filter=lfs diff=lfs merge=lfs -text
+*.png         filter=lfs diff=lfs merge=lfs -text
+
+# Normalize line endings for source.
+*.cpp  text
+*.hpp  text
+*.cu   text
+*.cuh  text
+*.cmake text
+CMakeLists.txt text
