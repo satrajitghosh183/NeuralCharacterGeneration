@@ -20,7 +20,8 @@ ncg-recon/     Gaussian avatar + cross-photo fusion; 3DGS rasterizer (Phase 1 �
 ncg-material/  intrinsic decomposition / delighting → PBR           (skeleton → P4)
 ncg-rig/       skinning + skeleton; retarget to Unity/Unreal        (skeleton → later)
 ncg-mesh/      mesh extraction + PBR bake                           (skeleton → P4)
-ncg-runtime/   real-time renderer: LBS + splat raster + relight     (Phase 1 → P2)
+ncg-runtime/   renderer: forward-splat CUDA kernel + differentiable soft renderer (Phase 1 → P2)
+ncg-fit/       Gaussian optimization loop (fit cloud to image via autograd + Adam)  (Phase 2)
 ncg-record/    experiment recording (run dirs, metrics.jsonl, image dumps, timers) + PSNR/SSIM/MAE
 ncg-unreal/    Unreal native integration                           (P2+)
 ncg-unity/     Unity native plugin                                 (P4+)
