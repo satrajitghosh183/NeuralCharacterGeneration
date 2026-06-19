@@ -56,6 +56,7 @@ add_subdirectory(ncg-recon)
 add_subdirectory(ncg-material)
 add_subdirectory(ncg-rig)
 add_subdirectory(ncg-mesh)
+add_subdirectory(ncg-record)
 
 # ncg-runtime contains the splat CUDA kernel; only meaningful with CUDA.
 if(NCG_WITH_CUDA)

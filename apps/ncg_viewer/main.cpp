@@ -11,6 +11,7 @@
 #include <ncg/core/logging.hpp>
 #include <ncg/io/image.hpp>
 #include <ncg/recon/init_from_body.hpp>
+#include <ncg/record/recorder.hpp>
 #include <ncg/runtime/renderer.hpp>
 
 #include <torch/torch.h>
@@ -34,27 +35,53 @@ int main(int argc, char** argv) {
     NCG_CHECK(ncg::cuda_available(), "ncg_viewer requires a CUDA device");
     const auto device = at::Device(at::kCUDA, 0);
 
-    auto model = ncg::body::SmplxModel::load(smplx_path, device);
+    // Record every stage to runs/<name>_<timestamp>/.
+    auto rec = ncg::record::Recorder::create("runs", args.get("run", "viewer"));
+    rec.set_config("{\"app\":\"ncg_viewer\",\"smplx\":\"" + smplx_path + "\",\"width\":" +
+                   std::to_string(width) + ",\"height\":" + std::to_string(height) +
+                   ",\"azimuth\":" + std::to_string(azimuth) + ",\"elevation\":" +
+                   std::to_string(elevation) + ",\"radius\":" + std::to_string(radius) +
+                   ",\"scale\":" + std::to_string(scale) + "}");
+
+    ncg::body::SmplxModel model = [&] {
+      auto t = rec.time("body", "load");
+      return ncg::body::SmplxModel::load(smplx_path, device);
+    }();
     NCG_LOG_INFO("loaded SMPL-X: V={} J={} betas={}", model.num_verts(), model.num_joints(),
                  model.num_betas());
+    rec.log_scalar("body", "num_verts", static_cast<double>(model.num_verts()));
+    rec.log_scalar("body", "num_joints", static_cast<double>(model.num_joints()));
 
-    const auto out = model.forward(model.neutral_params(1));
-    const auto verts = out.vertices.squeeze(0);  // [V,3]
+    ncg::Tensor verts;
+    {
+      auto t = rec.time("body", "forward");
+      verts = model.forward(model.neutral_params(1)).vertices.squeeze(0);  // [V,3]
+    }
 
     auto cloud = ncg::recon::gaussians_on_body(verts, scale);
     cloud.to_(device);
+    rec.log_scalar("recon", "num_gaussians", static_cast<double>(cloud.size()));
 
     const auto center = verts.mean(0);
     const auto cam = ncg::runtime::Camera::orbit(center, radius, azimuth, elevation,
                                                  /*fov_y_deg=*/50.0F, width, height, device);
 
-    const auto render = ncg::runtime::render_gaussians(cloud, cam, {0.0F, 0.0F, 0.0F});
+    ncg::runtime::RenderOutput render;
+    {
+      auto t = rec.time("render", "splat");
+      render = ncg::runtime::render_gaussians(cloud, cam, {0.0F, 0.0F, 0.0F});
+    }
+
     ncg::io::save_png(out_path, render.image);
+    rec.log_image("render", "rgb", render.image);
+    rec.log_image("render", "alpha", render.alpha);
 
     const double coverage = render.alpha.mean().item<double>();
     const double checksum = render.image.sum().item<double>();
-    NCG_LOG_INFO("wrote {} ({}x{}) coverage={:.4f} checksum={:.3f}", out_path, width, height,
-                 coverage, checksum);
+    rec.log_scalar("render", "coverage", coverage);
+    rec.log_scalar("render", "checksum", checksum);
+    NCG_LOG_INFO("wrote {} ({}x{}) coverage={:.4f} checksum={:.3f} | run={}", out_path, width,
+                 height, coverage, checksum, rec.dir().string());
     NCG_CHECK(coverage > 1e-3, "render produced an empty image (coverage {:.5f})", coverage);
     return 0;
   } catch (const std::exception& e) {

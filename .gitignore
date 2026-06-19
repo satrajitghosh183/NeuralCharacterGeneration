@@ -29,3 +29,6 @@ venv/
 # Renders / scratch
 out.png
 *.scratch
+
+# Experiment run outputs (ncg-record)
+/runs/

@@ -6,8 +6,9 @@ target_link_libraries(ncg_app_common INTERFACE ncg::core)
 
 add_executable(ncg_viewer ncg_viewer/main.cpp)
 target_link_libraries(ncg_viewer
-  PRIVATE ncg_app_common ncg::body ncg::recon ncg::runtime ncg::io ncg::warnings)
+  PRIVATE ncg_app_common ncg::body ncg::recon ncg::runtime ncg::io ncg::record ncg::warnings)
 
 add_executable(ncg_cli ncg_cli/main.cpp)
 target_link_libraries(ncg_cli
-  PRIVATE ncg_app_common ncg::body ncg::recon ncg::runtime ncg::io ncg::select ncg::warnings)
+  PRIVATE ncg_app_common ncg::body ncg::recon ncg::runtime ncg::io ncg::select ncg::record
+          ncg::warnings)

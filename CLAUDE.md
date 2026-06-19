@@ -21,6 +21,7 @@ ncg-material/  intrinsic decomposition / delighting → PBR           (skeleton 
 ncg-rig/       skinning + skeleton; retarget to Unity/Unreal        (skeleton → later)
 ncg-mesh/      mesh extraction + PBR bake                           (skeleton → P4)
 ncg-runtime/   real-time renderer: LBS + splat raster + relight     (Phase 1 → P2)
+ncg-record/    experiment recording (run dirs, metrics.jsonl, image dumps, timers) + PSNR/SSIM/MAE
 ncg-unreal/    Unreal native integration                           (P2+)
 ncg-unity/     Unity native plugin                                 (P4+)
 apps/          ncg_viewer (headless render), ncg_cli (pipeline)
@@ -62,4 +63,4 @@ Mac-side (lint only, optional, needs local CPU LibTorch): `cmake --preset mac-li
 - Dev loop is **git push → user builds on H100 → pastes back errors**. The user provides the git remote.
 
 ## Status
-Phase 0 + Phase 1 scaffold authored (full build, **pending first H100 build/test**). Implemented: build system, `ncg-core`, `ncg-io` (image/safetensors/WeightMap/npy), parity harness (`test_golden_linear` self-test), `ncg-body` SMPL-X LBS forward, `ncg-recon`, `ncg-runtime` (camera + forward-splat CUDA kernel), `ncg-select` (sharpness), `apps/ncg_viewer` + `apps/ncg_cli`, tests, `tools/` export/dump, `scripts/ci.sh`. **Stubs/skeletons:** `ncg::body::Nlf` (load/predict throw — first real port target, see `docs/parity.md`), `ncg-material`/`ncg-rig`/`ncg-mesh`. The slice renders the neutral SMPL-X body (NLF image→pose not yet wired). Build/test module-by-module via `scripts/ci.sh`; see `docs/plan.md` progress log.
+Phase 0 + Phase 1 scaffold + data-recording authored (full build, **pending first H100 build/test**). Implemented: build system, `ncg-core`, `ncg-io` (image/safetensors/WeightMap/npy), parity harness (`test_golden_linear` self-test), `ncg-body` SMPL-X LBS forward, `ncg-recon`, `ncg-runtime` (camera + forward-splat CUDA kernel), `ncg-select` (sharpness), `ncg-record` (run dirs + metrics.jsonl + image dumps + timers + PSNR/SSIM/MAE, wired into the viewer so every stage records), `apps/ncg_viewer` + `apps/ncg_cli`, tests, `tools/` export/dump, `scripts/ci.sh`. **Stubs/skeletons:** `ncg::body::Nlf` (load/predict throw — first real port target, see `docs/parity.md`), `ncg-material`/`ncg-rig`/`ncg-mesh`. The slice renders the neutral SMPL-X body (NLF image→pose not yet wired). Build/test module-by-module via `scripts/ci.sh`; see `docs/plan.md` progress log.
