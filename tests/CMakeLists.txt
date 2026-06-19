@@ -1,6 +1,7 @@
 include(NcgAddTest)
 
 add_subdirectory(core)
-# add_subdirectory(io)      # Phase 0 part 2
-# add_subdirectory(golden)  # Phase 0 part 2
-# add_subdirectory(body)    # Phase 1
+add_subdirectory(io)
+add_subdirectory(body)
+add_subdirectory(runtime)
+add_subdirectory(golden)

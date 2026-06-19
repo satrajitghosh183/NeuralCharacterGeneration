@@ -50,16 +50,21 @@ include(NcgWarnings)   # defines interface target ncg::warnings
 add_subdirectory(third_party)
 add_subdirectory(ncg-core)
 add_subdirectory(ncg-io)
+add_subdirectory(ncg-select)
+add_subdirectory(ncg-body)
+add_subdirectory(ncg-recon)
+add_subdirectory(ncg-material)
+add_subdirectory(ncg-rig)
+add_subdirectory(ncg-mesh)
 
-# Phase 1 modules are added as they come online:
-# add_subdirectory(ncg-select)
-# add_subdirectory(ncg-body)
-# add_subdirectory(ncg-recon)
-# add_subdirectory(ncg-runtime)
+# ncg-runtime contains the splat CUDA kernel; only meaningful with CUDA.
+if(NCG_WITH_CUDA)
+  add_subdirectory(ncg-runtime)
+endif()
 
 if(NCG_BUILD_APPS AND NCG_WITH_CUDA)
-  # apps depend on CUDA render/runtime; skip in host-only lint configs.
-  # add_subdirectory(apps)
+  # apps depend on the CUDA render/runtime path; skip in host-only lint configs.
+  add_subdirectory(apps)
 endif()
 
 if(NCG_BUILD_TESTS)

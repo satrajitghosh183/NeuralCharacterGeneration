@@ -49,6 +49,7 @@ Grounded in two deep-research passes (see `research-findings.md` + memory). Supe
 ## 5. Phased roadmap (baseline-first — prove the spine before optimizing)
 
 > **Progress log** (newest first)
+> - `2026-06-19` Phase 0 part 2 + Phase 1 scaffold (full): `ncg-io` (image/safetensors/WeightMap/npy), parity harness (`test_golden_linear` self-test, `tools/dump_golden.py`+`export_weights.py`, `docs/parity.md`), `ncg-body` (SMPL-X LBS forward + invariant tests; **NLF = stub port target**), `ncg-recon` (Gaussians on body), `ncg-runtime` (camera + forward-splat CUDA kernel + smoke test), `ncg-select` (sharpness), `ncg-material`/`ncg-rig`/`ncg-mesh` skeletons, `apps/ncg_viewer`+`ncg_cli`, `scripts/ci.sh`. ⏳ awaiting first H100 build; building module-by-module.
 > - `2026-06-19` Phase 0 part 1: build system (CMake presets, cmake helpers, FetchContent deps), `ncg-core` (tensor/cuda/log helpers + saxpy kernel + vs-LibTorch test), `CLAUDE.md`, `docs/build.md`. ⏳ awaiting first H100 build to validate the toolchain.
 
 - **Phase 0 — Foundations.** CMake/CUDA/LibTorch build; weight-port harness + numerical parity tests; tiny self-photo test set. *(part 1 done; part 2 = ncg-io + parity harness next)*

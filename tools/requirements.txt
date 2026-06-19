@@ -1,0 +1,5 @@
+# DEV-ONLY tooling, run on a Mac/workstation to export weights and dump golden activations.
+# Never part of the C++/CUDA runtime. Install in a throwaway venv.
+torch>=2.2
+numpy>=1.24
+safetensors>=0.4

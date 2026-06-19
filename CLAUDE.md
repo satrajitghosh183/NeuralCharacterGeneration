@@ -62,4 +62,4 @@ Mac-side (lint only, optional, needs local CPU LibTorch): `cmake --preset mac-li
 - Dev loop is **git push → user builds on H100 → pastes back errors**. The user provides the git remote.
 
 ## Status
-Phase 0 part 1 complete (build system + `ncg-core` + saxpy kernel test) — pending first H100 build. Next: `ncg-io` + parity harness (Phase 0 exit), then the Phase 1 vertical slice. See `docs/plan.md`.
+Phase 0 + Phase 1 scaffold authored (full build, **pending first H100 build/test**). Implemented: build system, `ncg-core`, `ncg-io` (image/safetensors/WeightMap/npy), parity harness (`test_golden_linear` self-test), `ncg-body` SMPL-X LBS forward, `ncg-recon`, `ncg-runtime` (camera + forward-splat CUDA kernel), `ncg-select` (sharpness), `apps/ncg_viewer` + `apps/ncg_cli`, tests, `tools/` export/dump, `scripts/ci.sh`. **Stubs/skeletons:** `ncg::body::Nlf` (load/predict throw — first real port target, see `docs/parity.md`), `ncg-material`/`ncg-rig`/`ncg-mesh`. The slice renders the neutral SMPL-X body (NLF image→pose not yet wired). Build/test module-by-module via `scripts/ci.sh`; see `docs/plan.md` progress log.
