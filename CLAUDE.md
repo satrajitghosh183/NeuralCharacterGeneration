@@ -19,7 +19,7 @@ ncg-body/      SMPL-X eval + NLF regressor (image → SMPL-X params)  (Phase 1)
 ncg-recon/     Gaussian avatar + cross-photo fusion; 3DGS rasterizer (Phase 1 → P2/P3)
 ncg-material/  intrinsic decomposition / delighting → PBR           (skeleton → P4)
 ncg-rig/       skinning + skeleton; retarget to Unity/Unreal        (skeleton → later)
-ncg-mesh/      mesh extraction + PBR bake                           (skeleton → P4)
+ncg-mesh/      marching-cubes mesh extraction + OBJ/PLY export      (PBR bake → P4)
 ncg-runtime/   renderer: forward-splat CUDA kernel + differentiable soft renderer (Phase 1 → P2)
 ncg-fit/       Gaussian optimization loop (fit cloud to image via autograd + Adam)  (Phase 2)
 ncg-record/    experiment recording (run dirs, metrics.jsonl, image dumps, timers) + PSNR/SSIM/MAE

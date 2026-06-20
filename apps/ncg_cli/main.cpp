@@ -13,6 +13,7 @@
 #include <ncg/io/image.hpp>
 #include <ncg/recon/init_from_body.hpp>
 #include <ncg/record/recorder.hpp>
+#include <ncg/runtime/camera.hpp>
 #include <ncg/runtime/renderer.hpp>
 #include <ncg/select/selector.hpp>
 
@@ -52,6 +53,34 @@ int cmd_render(const ncg::app::Args& args) {
   const auto render = ncg::runtime::render_gaussians(cloud, cam);
   ncg::io::save_png(args.get("out", "out.png"), render.image);
   NCG_LOG_INFO("render coverage={:.4f}", render.alpha.mean().item<double>());
+  return 0;
+}
+
+// Render a turntable of the SMPL-X body and record every frame (Phase-5 eval helper).
+int cmd_turntable(const ncg::app::Args& args) {
+  NCG_CHECK(ncg::cuda_available(), "turntable requires a CUDA device");
+  const auto device = at::Device(at::kCUDA, 0);
+  const int width = args.get_int("width", 512);
+  const int height = args.get_int("height", 512);
+  const int frames = args.get_int("frames", 36);
+
+  auto model = ncg::body::SmplxModel::load(args.require("smplx"), device);
+  const auto verts = model.forward(model.neutral_params(1)).vertices.squeeze(0);
+  auto cloud = ncg::recon::gaussians_on_body(verts, args.get_float("scale", 0.012F));
+  cloud.to_(device);
+
+  auto rec = ncg::record::Recorder::create("runs", args.get("run", "turntable"));
+  const auto cams = ncg::runtime::orbit_trajectory(verts.mean(0), args.get_float("radius", 2.5F),
+                                                   args.get_float("elevation", 10.0F), frames,
+                                                   50.0F, width, height, device);
+  for (size_t i = 0; i < cams.size(); ++i) {
+    const auto out = ncg::runtime::render_gaussians(cloud, cams[i]);
+    char name[32];
+    std::snprintf(name, sizeof(name), "frame_%03zu", i);
+    rec.log_image("turntable", name, out.image);
+    rec.log_scalar("turntable", "coverage", out.alpha.mean().item<double>());
+  }
+  NCG_LOG_INFO("turntable {} frames -> {}", frames, rec.dir().string());
   return 0;
 }
 
@@ -108,13 +137,14 @@ int cmd_fitimg(const ncg::app::Args& args) {
 int main(int argc, char** argv) {
   ncg::init_logging();
   if (argc < 2) {
-    std::fprintf(stderr, "usage: ncg_cli <render|select|fitimg|fit> [--flags]\n");
+    std::fprintf(stderr, "usage: ncg_cli <render|turntable|select|fitimg|fit> [--flags]\n");
     return 2;
   }
   const std::string cmd = argv[1];
   const ncg::app::Args args(argc, argv);
   try {
     if (cmd == "render") return cmd_render(args);
+    if (cmd == "turntable") return cmd_turntable(args);
     if (cmd == "select") return cmd_select(args);
     if (cmd == "fitimg") return cmd_fitimg(args);
     if (cmd == "fit") return cmd_fit(args);

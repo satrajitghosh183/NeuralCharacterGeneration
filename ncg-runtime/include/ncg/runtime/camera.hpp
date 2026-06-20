@@ -2,6 +2,8 @@
 
 #include <ncg/core/tensor.hpp>
 
+#include <vector>
+
 namespace ncg::runtime {
 
 /// Pinhole camera. Extrinsics map world -> camera (x right, y down, z forward into scene).
@@ -23,5 +25,11 @@ struct Camera {
   static Camera orbit(const Tensor& center, float radius, float azimuth_deg, float elevation_deg,
                       float fov_y_deg, int width, int height, at::Device device);
 };
+
+/// A turntable trajectory: `frames` cameras equally spaced in azimuth [0,360) at fixed radius
+/// and elevation (Phase-5 eval / novel-view rendering).
+std::vector<Camera> orbit_trajectory(const Tensor& center, float radius, float elevation_deg,
+                                     int frames, float fov_y_deg, int width, int height,
+                                     at::Device device);
 
 }  // namespace ncg::runtime

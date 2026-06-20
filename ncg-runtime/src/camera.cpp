@@ -57,4 +57,18 @@ Camera Camera::orbit(const Tensor& center, float radius, float azimuth_deg, floa
   return cam;
 }
 
+std::vector<Camera> orbit_trajectory(const Tensor& center, float radius, float elevation_deg,
+                                     int frames, float fov_y_deg, int width, int height,
+                                     at::Device device) {
+  NCG_CHECK(frames > 0, "orbit_trajectory: frames must be positive");
+  std::vector<Camera> cams;
+  cams.reserve(static_cast<size_t>(frames));
+  for (int i = 0; i < frames; ++i) {
+    const float az = 360.0F * static_cast<float>(i) / static_cast<float>(frames);
+    cams.push_back(Camera::orbit(center, radius, az, elevation_deg, fov_y_deg, width, height,
+                                 device));
+  }
+  return cams;
+}
+
 }  // namespace ncg::runtime

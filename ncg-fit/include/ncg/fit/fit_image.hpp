@@ -6,6 +6,7 @@
 #include <ncg/runtime/camera.hpp>
 
 #include <cstdint>
+#include <vector>
 
 namespace ncg::fit {
 
@@ -24,6 +25,14 @@ struct FitConfig {
 /// PSNR / SSIM (and periodic image dumps) to `recorder` when provided. Returns the fitted cloud.
 recon::GaussianCloud fit_gaussians_to_image(const Tensor& target_chw,
                                             const runtime::Camera& camera, const FitConfig& cfg,
+                                            record::Recorder* recorder = nullptr);
+
+/// Multi-view variant: optimizes a single Gaussian cloud to reproduce several target images
+/// from their respective cameras (Phase-3 multi-view reconstruction). `targets[i]` is rendered
+/// from `cameras[i]`; the per-iteration loss is summed across views. Sizes must match.
+recon::GaussianCloud fit_gaussians_to_views(const std::vector<Tensor>& targets,
+                                            const std::vector<runtime::Camera>& cameras,
+                                            const FitConfig& cfg,
                                             record::Recorder* recorder = nullptr);
 
 }  // namespace ncg::fit

@@ -39,3 +39,12 @@ TEST_CASE("forward splat renders a centered blob", "[cuda][runtime]") {
   const double corner_lum = out.image.index({0, 0, 0}).item<double>();
   REQUIRE(center_lum > corner_lum);
 }
+
+TEST_CASE("orbit_trajectory yields N distinct cameras", "[runtime]") {
+  const auto center = torch::zeros({3});
+  const auto cams = ncg::runtime::orbit_trajectory(center, 2.0F, 10.0F, /*frames=*/8, 50.0F, 32, 32,
+                                                   at::kCPU);
+  REQUIRE(cams.size() == 8);
+  // Opposite frames must look from different positions.
+  REQUIRE_FALSE(torch::allclose(cams[0].t, cams[4].t));
+}

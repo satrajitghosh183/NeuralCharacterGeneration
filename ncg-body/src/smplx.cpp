@@ -122,6 +122,7 @@ SmplxOutput SmplxModel::forward(const SmplxParams& p) const {
   SmplxOutput out;
   out.vertices = v_skinned + p.transl.unsqueeze(1);
   out.joints = posed_joints + p.transl.unsqueeze(1);
+  out.vertex_transforms = T;  // [B,V,4,4]
   return out;
 }
 

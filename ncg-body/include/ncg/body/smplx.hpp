@@ -15,8 +15,9 @@ struct SmplxParams {
 };
 
 struct SmplxOutput {
-  Tensor vertices;  // [B, V, 3]
-  Tensor joints;    // [B, J, 3]
+  Tensor vertices;          // [B, V, 3]
+  Tensor joints;            // [B, J, 3]
+  Tensor vertex_transforms; // [B, V, 4, 4] per-vertex LBS transform (rest -> posed)
 };
 
 /// Minimal SMPL-X forward (linear blend skinning). The model buffers are loaded from a
