@@ -17,8 +17,8 @@ ncg-io/        image I/O, safetensors loader, WeightMap, .npy I/O   (Phase 0 par
 ncg-select/    bad-upload quality filtering + learned view selector (Phase 1 stub → P3)
 ncg-body/      SMPL-X eval + NLF regressor (image → SMPL-X params)  (Phase 1)
 ncg-recon/     Gaussian avatar + cross-photo fusion; 3DGS rasterizer (Phase 1 → P2/P3)
-ncg-material/  intrinsic decomposition / delighting → PBR           (skeleton → P4)
-ncg-rig/       skinning + skeleton; retarget to Unity/Unreal        (skeleton → later)
+ncg-material/  analytical relight (real) + intrinsic decomposition (IDArb gated → P4)
+ncg-rig/       rig inheritance + OBJ/JSON export (real); UniRig + FBX/glTF gated
 ncg-mesh/      marching-cubes mesh extraction + OBJ/PLY export      (PBR bake → P4)
 ncg-runtime/   renderer: forward-splat CUDA kernel + differentiable soft renderer (Phase 1 → P2)
 ncg-fit/       Gaussian optimization loop (fit cloud to image via autograd + Adam)  (Phase 2)

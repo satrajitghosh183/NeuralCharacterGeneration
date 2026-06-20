@@ -32,6 +32,11 @@ TEST_CASE("marching cubes extracts a surface from a blob field", "[mesh]") {
   REQUIRE(mesh.num_verts() > 0);
   REQUIRE(mesh.num_faces() > 0);
   REQUIRE(mesh.faces.max().item<int64_t>() < mesh.num_verts());
+
+  const auto normals = ncg::mesh::compute_vertex_normals(mesh);
+  REQUIRE(normals.sizes() == mesh.vertices.sizes());
+  const auto norm_len = normals.norm(2, 1);  // unit length
+  REQUIRE(torch::allclose(norm_len, torch::ones_like(norm_len), 1e-4, 1e-4));
 }
 
 TEST_CASE("extract_mesh + writers produce files", "[mesh]") {

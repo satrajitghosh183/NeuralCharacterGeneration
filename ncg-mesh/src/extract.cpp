@@ -62,4 +62,23 @@ TriMesh extract_mesh(const recon::GaussianCloud& g, int res) {
   return marching_cubes(field, res, res, res, iso, origin, spacing);
 }
 
+Tensor compute_vertex_normals(const TriMesh& mesh) {
+  NCG_CHECK(mesh.num_verts() > 0 && mesh.num_faces() > 0, "compute_vertex_normals: empty mesh");
+  const auto v = mesh.vertices.to(at::kFloat);
+  const auto f = mesh.faces.to(at::kLong);
+  const auto i0 = f.select(1, 0);
+  const auto i1 = f.select(1, 1);
+  const auto i2 = f.select(1, 2);
+  const auto v0 = v.index_select(0, i0);
+  const auto v1 = v.index_select(0, i1);
+  const auto v2 = v.index_select(0, i2);
+  const auto face_n = torch::cross(v1 - v0, v2 - v0, /*dim=*/1);  // area-weighted [F,3]
+
+  auto normals = torch::zeros_like(v);
+  normals.index_add_(0, i0, face_n);
+  normals.index_add_(0, i1, face_n);
+  normals.index_add_(0, i2, face_n);
+  return normals / normals.norm(2, /*dim=*/1, /*keepdim=*/true).clamp_min(1e-8);
+}
+
 }  // namespace ncg::mesh

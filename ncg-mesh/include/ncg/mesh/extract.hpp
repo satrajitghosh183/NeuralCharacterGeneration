@@ -26,6 +26,9 @@ TriMesh marching_cubes(const std::vector<float>& field, int gx, int gy, int gz, 
 /// `grid_resolution`^3 grid over the cloud's bounding box, then marching cubes.
 TriMesh extract_mesh(const recon::GaussianCloud& gaussians, int grid_resolution = 128);
 
+/// Area-weighted per-vertex normals [V,3] (unit length). Useful for shading / relighting.
+Tensor compute_vertex_normals(const TriMesh& mesh);
+
 /// Write a TriMesh to Wavefront OBJ / binary-free ASCII PLY.
 void write_obj(const TriMesh& mesh, const std::string& path);
 void write_ply(const TriMesh& mesh, const std::string& path);
