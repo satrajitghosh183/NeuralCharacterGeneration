@@ -116,7 +116,7 @@ SafeTensors SafeTensors::open(const std::string& path) {
     }
     const json& e = it.value();
     Impl::Entry entry;
-    entry.dtype = dtype_from_string(e.at("dtype").get<std::string>());
+    entry.dtype = dtype_from_string(e.at("dtype").get<std::string>()).type;
     entry.shape = e.at("shape").get<std::vector<int64_t>>();
     const auto offsets = e.at("data_offsets").get<std::vector<size_t>>();
     NCG_CHECK(offsets.size() == 2, "safetensors: bad data_offsets for '{}'", it.key());

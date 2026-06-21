@@ -8,12 +8,15 @@
 
 #include <cuda_runtime_api.h>
 
+#include <string>
+
 namespace ncg::detail {
 
+// fmt is unavailable in CUDA TUs (see error.hpp), so build the message by hand.
 [[noreturn]] inline void cuda_fail(const char* expr, cudaError_t err, const char* file, int line) {
-  throw_error(::fmt::format("CUDA error {} ({}) at: {}", static_cast<int>(err),
-                            cudaGetErrorString(err), expr),
-              file, line);
+  std::string msg = "CUDA error " + std::to_string(static_cast<int>(err)) + " (" +
+                    cudaGetErrorString(err) + ") at: " + expr;
+  throw_error(std::move(msg), file, line);
 }
 
 /// Whether NCG_CUDA_KERNEL_CHECK() should cudaDeviceSynchronize() after each launch.
