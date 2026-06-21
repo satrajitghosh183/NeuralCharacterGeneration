@@ -54,7 +54,12 @@ runtime::RenderOutput render_volume(TinyNerf& nerf, const runtime::Camera& camer
                                     std::array<float, 3> background = {0.0F, 0.0F, 0.0F});
 
 /// Hybrid composite: `front` (e.g. the opaque Gaussian surface) over `back` (e.g. the NeRF
-/// volume) by standard front-to-back alpha compositing.
+/// volume) using the **premultiplied-alpha** "over" operator:
+///   out.image = front.image + (1 - front.alpha) * back.image
+/// This matches what render_volume and the splat renderer emit (image is the sum of weighted
+/// color, already premultiplied by occupancy), so a transparent pixel contributes nothing and
+/// a half-covered edge blends correctly without double-darkening. Inputs are assumed
+/// premultiplied; do not pass straight-alpha (non-premultiplied) colors.
 runtime::RenderOutput composite_over(const runtime::RenderOutput& front,
                                      const runtime::RenderOutput& back);
 

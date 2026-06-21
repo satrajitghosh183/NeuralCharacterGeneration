@@ -31,20 +31,36 @@ TEST_CASE("render_volume returns a finite image of the right shape", "[nerf]") {
   REQUIRE(std::isfinite(out.image.sum().item<double>()));
 }
 
-TEST_CASE("composite_over: opaque front hides back; transparent front shows back", "[nerf]") {
-  ncg::runtime::RenderOutput front;
+TEST_CASE("composite_over (premultiplied alpha): opaque hides back, transparent shows back",
+          "[nerf]") {
+  // composite_over uses the premultiplied-alpha "over" operator, matching what render_volume
+  // and the splat renderer emit (image = sum of weighted color, already premultiplied). Under
+  // that convention a transparent pixel's premultiplied color is 0, an opaque pixel's is its
+  // color, and a half-covered pixel's is 0.5*color.
   ncg::runtime::RenderOutput back;
-  front.image = torch::full({3, 4, 4}, 0.2F);
   back.image = torch::full({3, 4, 4}, 0.9F);
   back.alpha = torch::ones({1, 4, 4});
 
-  front.alpha = torch::ones({1, 4, 4});  // opaque
+  // Opaque front (alpha=1, premult image = color) fully hides the back.
+  ncg::runtime::RenderOutput front;
+  front.image = torch::full({3, 4, 4}, 0.2F);
+  front.alpha = torch::ones({1, 4, 4});
   auto opaque = ncg::nerf::composite_over(front, back);
   REQUIRE(torch::allclose(opaque.image, front.image, 1e-6, 1e-6));
 
-  front.alpha = torch::zeros({1, 4, 4});  // transparent
+  // Transparent front (alpha=0 => premult color 0) shows the back unchanged.
+  front.image = torch::zeros({3, 4, 4});
+  front.alpha = torch::zeros({1, 4, 4});
   auto clear = ncg::nerf::composite_over(front, back);
   REQUIRE(torch::allclose(clear.image, back.image, 1e-6, 1e-6));
+
+  // Half-covered front (alpha=0.5, premult color = 0.5*color) blends: 0.5*c + 0.5*back.
+  const auto c = 0.4F;
+  front.image = torch::full({3, 4, 4}, 0.5F * c);
+  front.alpha = torch::full({1, 4, 4}, 0.5F);
+  auto blend = ncg::nerf::composite_over(front, back);
+  const auto expected = torch::full({3, 4, 4}, 0.5F * c + 0.5F * 0.9F);
+  REQUIRE(torch::allclose(blend.image, expected, 1e-6, 1e-6));
 }
 
 TEST_CASE("NeRF fit overfits a single view below the gray baseline", "[nerf]") {
