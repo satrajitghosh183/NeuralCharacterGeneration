@@ -45,6 +45,7 @@ TEST_CASE("orbit_trajectory yields N distinct cameras", "[runtime]") {
   const auto cams = ncg::runtime::orbit_trajectory(center, 2.0F, 10.0F, /*frames=*/8, 50.0F, 32, 32,
                                                    at::kCPU);
   REQUIRE(cams.size() == 8);
-  // Opposite frames must look from different positions.
-  REQUIRE_FALSE(torch::allclose(cams[0].t, cams[4].t));
+  // A look-at camera keeps the target at the same camera-space depth, so `t` is identical
+  // across frames; orientation `R` differs.
+  REQUIRE_FALSE(torch::allclose(cams[0].R, cams[4].R));
 }

@@ -38,8 +38,8 @@ Camera Camera::orbit(const Tensor& center, float radius, float azimuth_deg, floa
   auto normalize = [](Tensor v) { return v / v.norm().clamp_min(1e-8); };
   const auto forward = normalize(c - eye);
   const auto world_up = torch::tensor({0.0F, 1.0F, 0.0F});
-  const auto right = normalize(torch::cross(forward, world_up));
-  const auto down = torch::cross(forward, right);  // y points down in image space
+  const auto right = normalize(torch::cross(forward, world_up, /*dim=*/-1));
+  const auto down = torch::cross(forward, right, /*dim=*/-1);  // y points down in image space
 
   // Rows of R are the camera axes expressed in world coords.
   const auto R = torch::stack({right, down, forward}, /*dim=*/0);  // [3,3]

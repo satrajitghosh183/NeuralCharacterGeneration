@@ -40,7 +40,9 @@ SmplxModel SmplxModel::load(const std::string& path, at::Device device) {
   auto st = io::SafeTensors::open(path);
   auto need = [&](const char* name) {
     NCG_CHECK(st.has(name), "SmplxModel: '{}' missing key '{}'", path, name);
-    return st.view(name).to(device);
+    // clone(): SafeTensors::view returns a non-owning view into the mmap, which is unmapped
+    // when `st` dies at the end of this function. We must own the data.
+    return st.view(name).clone().to(device);
   };
 
   SmplxModel m;
