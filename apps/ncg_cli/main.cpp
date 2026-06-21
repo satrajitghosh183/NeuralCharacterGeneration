@@ -203,7 +203,7 @@ int cmd_nerf(const ncg::app::Args& args) {
   nc.samples = args.get_int("samples", 64);
   ncg::nerf::NerfFitConfig fc;
   fc.iterations = args.get_int("iters", 300);
-  fc.lr = args.get_float("lr", 5e-3F);
+  fc.lr = args.get_float("lr", 1e-3F);
 
   auto nerf = ncg::nerf::fit_nerf_to_views({target}, {cam}, nc, fc, &rec);
   const auto volume = ncg::nerf::render_volume(*nerf, cam);

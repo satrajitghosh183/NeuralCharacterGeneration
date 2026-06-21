@@ -4,6 +4,7 @@
 #include <ncg/core/logging.hpp>
 #include <ncg/record/metrics.hpp>
 
+#include <algorithm>
 #include <cmath>
 
 namespace ncg::nerf {
@@ -21,6 +22,13 @@ TinyNerf::TinyNerf(const NerfConfig& cfg) : cfg_(cfg) {
   trunk_ = register_module("trunk", trunk);
   sigma_head_ = register_module("sigma_head", torch::nn::Linear(cfg.hidden, 1));
   rgb_head_ = register_module("rgb_head", torch::nn::Linear(cfg.hidden, 3));
+
+  // Warm, non-empty cold start: a NeRF that initializes to zero density renders pure
+  // background, which sits at a near-flat loss minimum where the encoded high frequencies
+  // push ReLUs dead and the fit freezes (the classic single-view collapse). Bias the density
+  // head positive so the field starts as a soft occupied cloud and gradients flow from step 0.
+  torch::NoGradGuard ng;
+  sigma_head_->bias.fill_(cfg.init_density_bias);
 }
 
 Tensor TinyNerf::encode(const Tensor& x) const {
@@ -127,6 +135,15 @@ std::shared_ptr<TinyNerf> fit_nerf_to_views(const std::vector<Tensor>& targets_i
   torch::optim::Adam opt(nerf->parameters(), torch::optim::AdamOptions(fc.lr));
 
   for (int it = 0; it < fc.iterations; ++it) {
+    // Linear LR warm-up: ramp 0 -> fc.lr over the first `warmup` steps so the density field
+    // settles before the high learning rate can drive ReLUs dead.
+    if (fc.warmup > 0) {
+      const double scale = std::min(1.0, static_cast<double>(it + 1) / fc.warmup);
+      for (auto& group : opt.param_groups()) {
+        static_cast<torch::optim::AdamOptions&>(group.options()).lr(fc.lr * scale);
+      }
+    }
+
     opt.zero_grad();
     Tensor loss = torch::zeros({}, targets.front().options());
     double psnr_sum = 0.0;

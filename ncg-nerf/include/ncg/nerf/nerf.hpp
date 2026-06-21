@@ -15,12 +15,13 @@
 namespace ncg::nerf {
 
 struct NerfConfig {
-  int num_freqs = 6;      // positional-encoding frequency bands
+  int num_freqs = 4;      // positional-encoding frequency bands (lower = fewer dead ReLUs)
   int hidden = 128;       // MLP width
   int hidden_layers = 4;  // MLP depth
   int samples = 64;       // samples per ray
   float near = 0.1F;
   float far = 6.0F;
+  float init_density_bias = 0.5F;  // sigma-head bias => non-empty cold start (avoids collapse)
 };
 
 /// A compact NeRF: positional-encoded MLP mapping a world point -> (density, RGB).
@@ -65,7 +66,8 @@ runtime::RenderOutput composite_over(const runtime::RenderOutput& front,
 
 struct NerfFitConfig {
   int iterations = 200;
-  double lr = 5e-3;
+  double lr = 1e-3;       // gentler than the 5e-3 that drove the single-view collapse
+  int warmup = 20;        // linear LR warm-up steps (0 disables) — settles density before detail
   int log_every = 25;
 };
 
