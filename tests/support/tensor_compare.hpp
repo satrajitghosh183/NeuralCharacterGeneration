@@ -34,8 +34,8 @@ struct CompareResult {
 inline CompareResult compare_allclose(const at::Tensor& actual, const at::Tensor& expected,
                                       double rtol = 1e-3, double atol = 1e-4) {
   NCG_CHECK(actual.sizes() == expected.sizes(),
-            "compare_allclose: shape mismatch (actual {} vs expected {})",
-            actual.sizes(), expected.sizes());
+            "compare_allclose: actual/expected shape mismatch ({}-d vs {}-d)", actual.dim(),
+            expected.dim());
 
   const auto a = actual.detach().to(at::kCPU, at::kDouble).contiguous();
   const auto e = expected.detach().to(at::kCPU, at::kDouble).contiguous();
