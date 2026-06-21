@@ -12,6 +12,7 @@
 #include <ncg/fit/fit_image.hpp>
 #include <ncg/io/image.hpp>
 #include <ncg/mesh/extract.hpp>
+#include <ncg/nerf/nerf.hpp>
 #include <ncg/recon/init_from_body.hpp>
 #include <ncg/record/recorder.hpp>
 #include <ncg/rig/rig.hpp>
@@ -183,13 +184,55 @@ int cmd_fitimg(const ncg::app::Args& args) {
   return 0;
 }
 
+// Fit a TinyNerf (implicit volume) to a target image, then render it back. With --smplx, also
+// composites the Gaussian body over the NeRF volume (hybrid path) and dumps that too.
+int cmd_nerf(const ncg::app::Args& args) {
+  NCG_CHECK(ncg::cuda_available(), "nerf requires a CUDA device");
+  const auto device = at::Device(at::kCUDA, 0);
+  const auto target = ncg::io::load_image(args.require("image"), 3).to(device);
+  const int height = static_cast<int>(target.size(1));
+  const int width = static_cast<int>(target.size(2));
+
+  auto rec = ncg::record::Recorder::create("runs", args.get("run", "nerf"));
+  rec.log_image("nerf", "target", target);
+
+  const auto cam = ncg::runtime::Camera::orbit(torch::zeros({3}, target.options()),
+                                               args.get_float("radius", 2.5F), 0.0F, 0.0F, 50.0F,
+                                               width, height, device);
+  ncg::nerf::NerfConfig nc;
+  nc.samples = args.get_int("samples", 64);
+  ncg::nerf::NerfFitConfig fc;
+  fc.iterations = args.get_int("iters", 300);
+  fc.lr = args.get_float("lr", 5e-3F);
+
+  auto nerf = ncg::nerf::fit_nerf_to_views({target}, {cam}, nc, fc, &rec);
+  const auto volume = ncg::nerf::render_volume(*nerf, cam);
+  ncg::io::save_png(args.get("out", "nerf_out.png"), volume.image);
+  rec.log_image("nerf", "render", volume.image);
+
+  // Hybrid: opaque Gaussian body (front) over the learned NeRF volume (back).
+  if (args.has("smplx")) {
+    auto model = ncg::body::SmplxModel::load(args.require("smplx"), device);
+    const auto verts = model.forward(model.neutral_params(1)).vertices.squeeze(0);
+    auto cloud = ncg::recon::gaussians_on_body(verts, args.get_float("scale", 0.012F));
+    cloud.to_(device);
+    const auto front = ncg::runtime::render_gaussians(cloud, cam);
+    const auto hybrid = ncg::nerf::composite_over(front, volume);
+    ncg::io::save_png(args.get("hybrid_out", "nerf_hybrid.png"), hybrid.image);
+    rec.log_image("nerf", "hybrid", hybrid.image);
+  }
+
+  NCG_LOG_INFO("nerf done -> {} | run={}", args.get("out", "nerf_out.png"), rec.dir().string());
+  return 0;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
   ncg::init_logging();
   if (argc < 2) {
     std::fprintf(stderr,
-                 "usage: ncg_cli <pipeline|render|turntable|select|fitimg|fit> [--flags]\n");
+                 "usage: ncg_cli <pipeline|render|turntable|select|fitimg|fit|nerf> [--flags]\n");
     return 2;
   }
   const std::string cmd = argv[1];
@@ -201,6 +244,7 @@ int main(int argc, char** argv) {
     if (cmd == "select") return cmd_select(args);
     if (cmd == "fitimg") return cmd_fitimg(args);
     if (cmd == "fit") return cmd_fit(args);
+    if (cmd == "nerf") return cmd_nerf(args);
     std::fprintf(stderr, "unknown command '%s'\n", cmd.c_str());
     return 2;
   } catch (const std::exception& e) {

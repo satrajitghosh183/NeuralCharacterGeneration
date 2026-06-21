@@ -83,10 +83,11 @@ add_subdirectory(ncg-rig)
 add_subdirectory(ncg-mesh)
 add_subdirectory(ncg-record)
 
-# ncg-runtime contains the splat CUDA kernel; ncg-fit uses its differentiable renderer.
+# ncg-runtime contains the splat CUDA kernel; ncg-fit/ncg-nerf use its renderer + camera.
 if(NCG_WITH_CUDA)
   add_subdirectory(ncg-runtime)
   add_subdirectory(ncg-fit)
+  add_subdirectory(ncg-nerf)
 endif()
 
 if(NCG_BUILD_APPS AND NCG_WITH_CUDA)

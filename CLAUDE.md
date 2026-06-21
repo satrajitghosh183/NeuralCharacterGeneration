@@ -22,6 +22,7 @@ ncg-rig/       rig inheritance + OBJ/JSON export (real); UniRig + FBX/glTF gated
 ncg-mesh/      marching-cubes mesh extraction + OBJ/PLY export      (PBR bake → P4)
 ncg-runtime/   renderer: forward-splat CUDA kernel + differentiable soft renderer (Phase 1 → P2)
 ncg-fit/       Gaussian optimization loop (fit cloud to image via autograd + Adam)  (Phase 2)
+ncg-nerf/      TinyNerf implicit volume + differentiable volume render + hybrid composite_over (NeRF leg)
 ncg-record/    experiment recording (run dirs, metrics.jsonl, image dumps, timers) + PSNR/SSIM/MAE
 ncg-unreal/    Unreal native integration                           (P2+)
 ncg-unity/     Unity native plugin                                 (P4+)
@@ -65,5 +66,7 @@ Mac-side (lint only, optional, needs local CPU LibTorch): `cmake --preset mac-li
 
 ## Status
 **Phase 0 + Phase 1 GREEN on the H100** (2026-06-21): 27/29 tests pass, 2 skip by design (real-data SMPL-X + NLF golden — need vendored assets). Toolchain (CUDA 12.0 + libtorch 2.6 cu124 pre-cxx11-ABI, sm_90) validated; weight-port parity self-test green. Build via `scripts/ci.sh`.
+
+**NeRF leg added** (2026-06-21, ⏳ pending H100 build): `ncg-nerf` (`TinyNerf` MLP + differentiable `render_volume` + `composite_over` hybrid + `fit_nerf_to_views`), `tests/nerf/test_nerf.cpp`, `ncg_cli nerf`. 3DGS + NeRF + hybrid now coexist.
 
 Phase 0 + Phase 1 scaffold + data-recording authored. Implemented: build system, `ncg-core`, `ncg-io` (image/safetensors/WeightMap/npy), parity harness (`test_golden_linear` self-test), `ncg-body` SMPL-X LBS forward, `ncg-recon`, `ncg-runtime` (camera + forward-splat CUDA kernel), `ncg-select` (sharpness), `ncg-record` (run dirs + metrics.jsonl + image dumps + timers + PSNR/SSIM/MAE, wired into the viewer so every stage records), `apps/ncg_viewer` + `apps/ncg_cli`, tests, `tools/` export/dump, `scripts/ci.sh`. **Stubs/skeletons:** `ncg::body::Nlf` (load/predict throw — first real port target, see `docs/parity.md`), `ncg-material`/`ncg-rig`/`ncg-mesh`. The slice renders the neutral SMPL-X body (NLF image→pose not yet wired). Build/test module-by-module via `scripts/ci.sh`; see `docs/plan.md` progress log.
