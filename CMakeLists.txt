@@ -17,6 +17,20 @@ endif()
 
 list(APPEND CMAKE_MODULE_PATH "${CMAKE_SOURCE_DIR}/cmake")
 
+# The presets request ccache as the compiler launcher; if it isn't installed, drop it
+# rather than failing every compile with "ccache: not found".
+foreach(_lang CXX CUDA)
+  if(CMAKE_${_lang}_COMPILER_LAUNCHER)
+    find_program(_ncg_launcher NAMES "${CMAKE_${_lang}_COMPILER_LAUNCHER}")
+    if(NOT _ncg_launcher)
+      message(WARNING "NCG: '${CMAKE_${_lang}_COMPILER_LAUNCHER}' not found — disabling ${_lang} compiler launcher.")
+      unset(CMAKE_${_lang}_COMPILER_LAUNCHER CACHE)
+      set(CMAKE_${_lang}_COMPILER_LAUNCHER "")
+    endif()
+    unset(_ncg_launcher CACHE)
+  endif()
+endforeach()
+
 # --- Options ---------------------------------------------------------------
 option(NCG_BUILD_TESTS "Build tests" ON)
 option(NCG_BUILD_APPS  "Build apps"  ON)
