@@ -58,6 +58,17 @@ if(NCG_WITH_CUDA)
   find_package(CUDAToolkit REQUIRED)
 endif()
 
+# CRITICAL: every target (including FetchContent spdlog/Catch2 which don't link Torch) must
+# use the SAME libstdc++ ABI as libtorch, or std::string-bearing symbols mismatch at link
+# time. TorchConfig sets TORCH_CXX_FLAGS to the right -D_GLIBCXX_USE_CXX11_ABI=N; apply it
+# globally. Must be set BEFORE add_subdirectory(third_party).
+if(DEFINED TORCH_CXX_FLAGS AND NOT "${TORCH_CXX_FLAGS}" STREQUAL "")
+  message(STATUS "NCG: applying Torch ABI flags to all targets: ${TORCH_CXX_FLAGS}")
+  separate_arguments(_ncg_torch_flags NATIVE_COMMAND "${TORCH_CXX_FLAGS}")
+  add_compile_options($<$<COMPILE_LANGUAGE:CXX>:${_ncg_torch_flags}>
+                      $<$<COMPILE_LANGUAGE:CUDA>:${_ncg_torch_flags}>)
+endif()
+
 include(NcgWarnings)   # defines interface target ncg::warnings
 
 # --- Modules ---------------------------------------------------------------

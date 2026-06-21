@@ -31,8 +31,7 @@ function(ncg_add_library name)
     PRIVATE ${A_PRIVATE_DEPS} ncg::warnings)
 
   target_compile_features(${name} PUBLIC cxx_std_20)
-
-  if(NCG_WITH_CUDA AND A_CUDA_SOURCES)
-    set_target_properties(${name} PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
-  endif()
+  # NOTE: deliberately NOT enabling CUDA_SEPARABLE_COMPILATION — our kernels are
+  # self-contained (no cross-TU device calls), and RDC + static libs consumed by multiple
+  # executables triggers __cudaRegisterLinkedBinary device-link errors.
 endfunction()
