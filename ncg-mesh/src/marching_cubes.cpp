@@ -48,7 +48,7 @@ TriMesh marching_cubes(const std::vector<float>& field, int gx, int gy, int gz, 
             "marching_cubes: field size mismatch");
 
   auto at_field = [&](int x, int y, int z) -> float {
-    return field[(static_cast<int64_t>(z) * gy + y) * gx + x];
+    return field[static_cast<size_t>((static_cast<int64_t>(z) * gy + y) * gx + x)];
   };
   auto world = [&](int x, int y, int z, std::array<float, 3>& out) {
     out[0] = origin[0] + static_cast<float>(x) * spacing[0];
@@ -84,7 +84,9 @@ TriMesh marching_cubes(const std::vector<float>& field, int gx, int gy, int gz, 
           float t = 0.5F;
           const float denom = val[b] - val[a];
           if (denom != 0.0F) t = (iso - val[a]) / denom;
-          for (int k = 0; k < 3; ++k) vlist[e][k] = pos[a][k] + t * (pos[b][k] - pos[a][k]);
+          for (size_t k = 0; k < 3; ++k) {
+            vlist[e][k] = pos[a][k] + t * (pos[b][k] - pos[a][k]);
+          }
         }
 
         for (int i = 0; kTriTable[cube_index][i] != -1; i += 3) {

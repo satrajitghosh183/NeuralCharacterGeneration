@@ -42,7 +42,8 @@ FetchContent_Declare(stb
 FetchContent_MakeAvailable(stb)
 add_library(stb INTERFACE)
 add_library(ncg::stb ALIAS stb)
-target_include_directories(stb INTERFACE ${stb_SOURCE_DIR})
+# SYSTEM so stb's own (very noisy) -Wconversion/-Wsign-conversion warnings are suppressed.
+target_include_directories(stb SYSTEM INTERFACE ${stb_SOURCE_DIR})
 
 # --- Eigen (header-only linear algebra; used from Phase 1 on) --------------
 FetchContent_Declare(eigen

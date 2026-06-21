@@ -20,10 +20,10 @@ TEST_CASE("marching cubes extracts a surface from a blob field", "[mesh]") {
   for (int z = 0; z < g; ++z) {
     for (int y = 0; y < g; ++y) {
       for (int x = 0; x < g; ++x) {
-        const float dx = x - c;
-        const float dy = y - c;
-        const float dz = z - c;
-        field[(static_cast<size_t>(z) * g + y) * g + x] =
+        const float dx = static_cast<float>(x) - c;
+        const float dy = static_cast<float>(y) - c;
+        const float dz = static_cast<float>(z) - c;
+        field[static_cast<size_t>((z * g + y) * g + x)] =
             std::exp(-0.02F * (dx * dx + dy * dy + dz * dz));
       }
     }

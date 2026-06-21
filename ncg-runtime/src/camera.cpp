@@ -22,16 +22,17 @@ void Camera::project(const Tensor& points, Tensor& uv, Tensor& depth) const {
 
 Camera Camera::orbit(const Tensor& center, float radius, float azimuth_deg, float elevation_deg,
                      float fov_y_deg, int width, int height, at::Device device) {
-  const double az = azimuth_deg * M_PI / 180.0;
-  const double el = elevation_deg * M_PI / 180.0;
+  const double az = static_cast<double>(azimuth_deg) * M_PI / 180.0;
+  const double el = static_cast<double>(elevation_deg) * M_PI / 180.0;
+  const double r = static_cast<double>(radius);
 
   const auto c = center.to(at::kCPU, at::kFloat).reshape({3});
   const auto ca = c.accessor<float, 1>();
 
   // Eye on a sphere around the center.
-  const float dx = static_cast<float>(radius * std::cos(el) * std::sin(az));
-  const float dy = static_cast<float>(radius * std::sin(el));
-  const float dz = static_cast<float>(radius * std::cos(el) * std::cos(az));
+  const float dx = static_cast<float>(r * std::cos(el) * std::sin(az));
+  const float dy = static_cast<float>(r * std::sin(el));
+  const float dz = static_cast<float>(r * std::cos(el) * std::cos(az));
   const auto eye = torch::tensor({ca[0] + dx, ca[1] + dy, ca[2] + dz});
 
   // Look-at basis. forward = into scene (camera +z); world up = +y.
@@ -48,7 +49,8 @@ Camera Camera::orbit(const Tensor& center, float radius, float azimuth_deg, floa
   Camera cam;
   cam.height = height;
   cam.width = width;
-  cam.fy = static_cast<float>((height / 2.0) / std::tan(fov_y_deg * M_PI / 360.0));
+  cam.fy = static_cast<float>((height / 2.0) /
+                              std::tan(static_cast<double>(fov_y_deg) * M_PI / 360.0));
   cam.fx = cam.fy;
   cam.cx = static_cast<float>(width) / 2.0F;
   cam.cy = static_cast<float>(height) / 2.0F;
