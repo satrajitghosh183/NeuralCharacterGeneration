@@ -3,24 +3,44 @@
 #include <ncg/body/smplx.hpp>
 #include <ncg/core/tensor.hpp>
 
+#include <memory>
 #include <string>
 
 namespace ncg::body {
 
-/// NLF (Neural Localizer Fields, Sarandi & Pons-Moll, NeurIPS 2024): regresses SMPL-X pose +
-/// shape from a single in-the-wild image. This is the project's primary body anchor.
+/// NLF (Neural Localizer Fields, Sarandi & Pons-Moll, NeurIPS 2024): regresses SMPL/SMPL-X
+/// pose + shape from a single in-the-wild image. This is the project's primary body anchor.
 ///
-/// PORT STATUS: scaffold. The exact upstream architecture + pretrained weights must be
-/// vendored before `load`/`predict` are implemented (the first real porting deliverable —
-/// see docs/parity.md, tests/golden/test_golden_nlf.cpp). Until then both throw, and the
-/// Phase-1 vertical slice uses SmplxModel::neutral_params() or params loaded from a .npy.
+/// PORT STRATEGY (see docs/parity.md + the cpp-cuda-direction memory): NLF is released as a
+/// **TorchScript** module (`nlf_l_multi.torchscript`), so we load it directly with
+/// `torch::jit::load` in C++ and run its `detect_smpl_batched` method — no Python at runtime,
+/// no blind layer-by-layer reimplementation, and parity is exact by construction (same graph).
+/// We port (load weights), we do not retrain. Custom CUDA kernels can replace hot paths later
+/// without changing this interface.
+///
+/// Confirm the output structure against the real checkpoint with `tools/dump_nlf.py` (dumps the
+/// output dict layout + a golden), then lock it with `tests/golden/test_golden_nlf.cpp`.
+struct NlfConfig {
+  /// TorchScript entry point. Per the NLF demo this is `detect_smpl_batched(frames_u8)`.
+  std::string method = "detect_smpl_batched";
+  /// Which detection to keep when the image has several people (0 = first / highest score).
+  int detection = 0;
+};
+
 class Nlf {
 public:
-  /// Build the module and load ported weights from a safetensors file.
-  static Nlf load(const std::string& weights_path, at::Device device);
+  /// Load the released TorchScript module onto `device`. Throws if the file is missing or not
+  /// a loadable TorchScript graph.
+  static Nlf load(const std::string& torchscript_path, at::Device device, NlfConfig cfg = {});
 
-  /// Predict SMPL-X params (batch 1) from a CHW float image in [0, 1].
+  /// Predict SMPL-X params (batch 1) from a CHW float image in [0, 1]. The image is converted
+  /// to the uint8 RGB [1,3,H,W] batch NLF expects; the chosen detection's pose/betas/trans are
+  /// returned (CPU, float) ready to feed to SmplxModel::forward.
   SmplxParams predict(const Tensor& image_chw) const;
+
+private:
+  struct Impl;
+  std::shared_ptr<Impl> impl_;
 };
 
 }  // namespace ncg::body

@@ -146,11 +146,41 @@ int cmd_select(const ncg::app::Args& args) {
   return 0;
 }
 
+// image -> NLF -> SMPL-X params -> (with --smplx) posed body Gaussians -> render.
+//   ncg_cli fit --image me.jpg --weights nlf_l_multi.torchscript [--smplx smplx.safetensors --out posed.png]
 int cmd_fit(const ncg::app::Args& args) {
-  const auto device = ncg::default_device();
-  auto nlf = ncg::body::Nlf::load(args.require("weights"), device);  // throws: port pending
-  const auto params = nlf.predict(ncg::io::load_image(args.require("image"), 3));
-  (void)params;
+  NCG_CHECK(ncg::cuda_available(), "fit requires a CUDA device");
+  const auto device = at::Device(at::kCUDA, 0);
+
+  auto nlf = ncg::body::Nlf::load(args.require("weights"), device);
+  const auto image = ncg::io::load_image(args.require("image"), 3);
+  const auto params = nlf.predict(image);
+  NCG_LOG_INFO("NLF predicted: {} joints, {} betas", params.pose_aa.size(1),
+               params.betas.size(1));
+
+  if (!args.has("smplx")) {
+    NCG_LOG_INFO("fit: pass --smplx <model.safetensors> to pose + render the predicted body");
+    return 0;
+  }
+
+  auto model = ncg::body::SmplxModel::load(args.require("smplx"), device);
+  ncg::body::SmplxParams p;  // move predicted params onto the model device
+  p.betas = params.betas.to(device);
+  p.pose_aa = params.pose_aa.to(device);
+  p.transl = params.transl.to(device);
+  const auto verts = model.forward(p).vertices.squeeze(0);
+
+  auto cloud = ncg::recon::gaussians_on_body(verts, args.get_float("scale", 0.012F));
+  cloud.to_(device);
+  const auto cam = ncg::runtime::Camera::orbit(verts.mean(0), args.get_float("radius", 2.5F),
+                                               args.get_float("azimuth", 20.0F),
+                                               args.get_float("elevation", 10.0F), 50.0F,
+                                               args.get_int("width", 512),
+                                               args.get_int("height", 512), device);
+  const auto render = ncg::runtime::render_gaussians(cloud, cam);
+  ncg::io::save_png(args.get("out", "posed.png"), render.image);
+  NCG_LOG_INFO("fit done -> {} (coverage {:.4f})", args.get("out", "posed.png"),
+               render.alpha.mean().item<double>());
   return 0;
 }
 
