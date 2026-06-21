@@ -28,6 +28,24 @@ RiggedMesh make_rigged(const Tensor& vertices, const Tensor& faces, const Tensor
   return m;
 }
 
+Tensor transfer_skinning(const Tensor& target_verts, const Tensor& source_verts,
+                         const Tensor& source_weights) {
+  NCG_CHECK(target_verts.dim() == 2 && target_verts.size(1) == 3,
+            "transfer_skinning: target_verts must be [V,3]");
+  NCG_CHECK(source_verts.dim() == 2 && source_verts.size(1) == 3,
+            "transfer_skinning: source_verts must be [M,3]");
+  NCG_CHECK(source_weights.dim() == 2 && source_weights.size(0) == source_verts.size(0),
+            "transfer_skinning: source_weights must be [M,J] matching source_verts");
+
+  const auto tv = target_verts.to(at::kCPU, at::kFloat).contiguous();
+  const auto sv = source_verts.to(at::kCPU, at::kFloat).contiguous();
+  const auto sw = source_weights.to(at::kCPU, at::kFloat).contiguous();
+
+  const auto dist = torch::cdist(tv, sv);                 // [V,M]
+  const auto nearest = std::get<1>(dist.min(/*dim=*/1));  // [V] index of closest source vert
+  return sw.index_select(0, nearest).contiguous();        // [V,J]
+}
+
 RiggedMesh autorig(const Tensor& /*vertices*/, const Tensor& /*faces*/) {
   NCG_THROW("autorig: learned auto-rigging (UniRig) is not ported yet — vendor UniRig weights, "
             "or use make_rigged() to inherit the SMPL-X rig for bodies.");

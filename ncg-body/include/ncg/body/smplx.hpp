@@ -36,6 +36,11 @@ public:
   int64_t num_betas() const { return shapedirs_.size(2); }
   at::Device device() const { return v_template_.device(); }
 
+  /// Per-vertex skinning weights [V,J] and the joint parent indices [J] — exposed so a
+  /// reconstructed mesh can inherit the SMPL-X rig (see ncg::rig::transfer_skinning).
+  Tensor lbs_weights() const { return lbs_weights_; }
+  Tensor parents() const { return parents_; }
+
   /// Zero shape + T-pose params (batch B) on this model's device — the slice default.
   SmplxParams neutral_params(int64_t batch = 1) const;
 

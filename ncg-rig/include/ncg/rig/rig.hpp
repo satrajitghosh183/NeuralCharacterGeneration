@@ -20,6 +20,15 @@ struct RiggedMesh {
 RiggedMesh make_rigged(const Tensor& vertices, const Tensor& faces, const Tensor& joints,
                        const Tensor& parents, const Tensor& skin_weights);
 
+/// Transfer per-vertex skinning weights from a source point set (e.g. SMPL-X vertices) to
+/// target vertices (e.g. a marching-cubes mesh) by nearest neighbour. Lets a reconstructed
+/// mesh inherit the SMPL-X rig. Returns [V_target, J]. REAL.
+///   target_verts   : [V,3]
+///   source_verts   : [M,3]
+///   source_weights : [M,J]
+Tensor transfer_skinning(const Tensor& target_verts, const Tensor& source_verts,
+                         const Tensor& source_weights);
+
 /// Auto-rig an arbitrary mesh (UniRig-class, learned). GATED on UniRig weights — throws.
 RiggedMesh autorig(const Tensor& vertices, const Tensor& faces);
 

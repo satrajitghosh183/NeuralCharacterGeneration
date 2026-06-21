@@ -10,5 +10,5 @@ target_link_libraries(ncg_viewer
 
 add_executable(ncg_cli ncg_cli/main.cpp)
 target_link_libraries(ncg_cli
-  PRIVATE ncg_app_common ncg::body ncg::recon ncg::runtime ncg::fit ncg::io ncg::select
-          ncg::record ncg::warnings)
+  PRIVATE ncg_app_common ncg::body ncg::recon ncg::runtime ncg::fit ncg::mesh ncg::rig ncg::io
+          ncg::select ncg::record ncg::warnings)

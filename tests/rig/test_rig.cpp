@@ -41,3 +41,17 @@ TEST_CASE("export_rigged writes OBJ + rig JSON", "[rig]") {
 TEST_CASE("autorig (UniRig) is gated", "[rig]") {
   REQUIRE_THROWS(ncg::rig::autorig(torch::randn({4, 3}), torch::zeros({2, 3}, torch::kLong)));
 }
+
+TEST_CASE("transfer_skinning copies the nearest source weights", "[rig]") {
+  // Two source verts with one-hot weights for 2 joints.
+  const auto sv = torch::tensor({{0.0F, 0.0F, 0.0F}, {10.0F, 0.0F, 0.0F}});
+  const auto sw = torch::tensor({{1.0F, 0.0F}, {0.0F, 1.0F}});
+  // Targets near each source.
+  const auto tv = torch::tensor({{0.1F, 0.0F, 0.0F}, {9.0F, 0.0F, 0.0F}, {0.0F, 0.2F, 0.0F}});
+
+  const auto w = ncg::rig::transfer_skinning(tv, sv, sw);
+  REQUIRE(w.sizes() == (std::vector<int64_t>{3, 2}));
+  REQUIRE(w[0][0].item<float>() == 1.0F);  // near source 0
+  REQUIRE(w[1][1].item<float>() == 1.0F);  // near source 1
+  REQUIRE(w[2][0].item<float>() == 1.0F);  // near source 0
+}
