@@ -73,6 +73,7 @@ def main() -> int:
 
     import numpy as np
     import torch
+    import torchvision  # noqa: F401  -- registers torchvision::nms used by NLF's detector graph
 
     os.makedirs(args.out, exist_ok=True)
     device = "cuda" if torch.cuda.is_available() else "cpu"
