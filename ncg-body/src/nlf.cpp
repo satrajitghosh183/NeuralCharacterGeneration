@@ -5,11 +5,39 @@
 
 #include <torch/script.h>
 
+#include <dlfcn.h>
+
+#include <cstdlib>
 #include <filesystem>
+#include <string>
 #include <utility>
 #include <vector>
 
 namespace ncg::body {
+
+namespace {
+
+// NLF's multi-person graph calls torchvision custom ops (torchvision::nms). Those are
+// registered by static initializers inside torchvision's compiled library, so we dlopen it
+// (RTLD_GLOBAL, so the symbols are visible to the torch dispatcher) before loading the module.
+void ensure_torchvision_ops(const std::string& configured) {
+  std::string path = configured;
+  if (path.empty()) {
+    if (const char* env = std::getenv("NCG_TORCHVISION_LIB")) path = env;
+  }
+  if (path.empty()) return;  // caller opted out (e.g. crop model with no torchvision ops)
+
+  static void* handle = nullptr;  // load once per process
+  if (handle != nullptr) return;
+  handle = dlopen(path.c_str(), RTLD_NOW | RTLD_GLOBAL);
+  NCG_CHECK(handle != nullptr,
+            "Nlf: failed to load torchvision ops library '{}': {}. Set NlfConfig::ops_library "
+            "or NCG_TORCHVISION_LIB to torchvision's _C/libtorchvision .so.",
+            path, dlerror() ? dlerror() : "unknown");
+  NCG_LOG_INFO("NLF: registered torchvision ops from {}", path);
+}
+
+}  // namespace
 
 // NLF ships as a TorchScript module (see nlf.hpp). We load and run it directly; the heavy
 // torch::jit type lives here, kept out of the public header via this pimpl.
@@ -29,6 +57,10 @@ Nlf Nlf::load(const std::string& torchscript_path, at::Device device, NlfConfig 
   nlf.impl_ = std::make_shared<Impl>();
   nlf.impl_->device = device;
   nlf.impl_->cfg = std::move(cfg);
+
+  // NLF's multi-person graph references torchvision::nms — register those ops first.
+  ensure_torchvision_ops(nlf.impl_->cfg.ops_library);
+
   try {
     nlf.impl_->module = torch::jit::load(torchscript_path, device);
   } catch (const c10::Error& e) {

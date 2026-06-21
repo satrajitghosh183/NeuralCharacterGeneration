@@ -25,6 +25,12 @@ struct NlfConfig {
   std::string method = "detect_smpl_batched";
   /// Which detection to keep when the image has several people (0 = first / highest score).
   int detection = 0;
+  /// Path to torchvision's compiled ops library. NLF's multi-person graph calls
+  /// `torchvision::nms`, which must be registered (dlopen'd) before the module loads or
+  /// torch::jit::load throws "Unknown builtin op". Empty => read the env var
+  /// `NCG_TORCHVISION_LIB`; if that's empty too, skip (only valid for graphs with no
+  /// torchvision ops, e.g. the crop model).
+  std::string ops_library;
 };
 
 class Nlf {
