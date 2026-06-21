@@ -19,7 +19,9 @@ function(ncg_add_library name)
   endif()
 
   add_library(${name} ${_sources})
-  add_library(ncg::${name} ALIAS ${name})
+  # Alias namespace drops the "ncg-" prefix: target ncg-core -> alias ncg::core.
+  string(REGEX REPLACE "^ncg-" "" _alias "${name}")
+  add_library(ncg::${_alias} ALIAS ${name})
 
   target_include_directories(${name}
     PUBLIC $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>)
