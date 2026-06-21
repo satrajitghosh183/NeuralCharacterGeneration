@@ -43,6 +43,25 @@ def first(v):
     return v
 
 
+def load_image_u8_chw(path):
+    """Read an image as a uint8 RGB [3,H,W] tensor without requiring torchvision."""
+    import numpy as np
+    import torch
+
+    arr = None
+    try:
+        from PIL import Image
+        arr = np.array(Image.open(path).convert("RGB"))            # HWC uint8
+    except Exception:
+        try:
+            import imageio.v2 as imageio
+            arr = np.asarray(imageio.imread(path))[..., :3]
+        except Exception:
+            import torchvision  # last resort
+            return torchvision.io.read_image(path)[:3]
+    return torch.from_numpy(np.ascontiguousarray(arr)).permute(2, 0, 1).contiguous()
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -54,14 +73,13 @@ def main() -> int:
 
     import numpy as np
     import torch
-    import torchvision
 
     os.makedirs(args.out, exist_ok=True)
     device = "cuda" if torch.cuda.is_available() else "cpu"
     model = torch.jit.load(args.model).to(device).eval()
 
-    image = torchvision.io.read_image(args.image).to(device)  # uint8 [3,H,W] RGB
-    frames = image.unsqueeze(0)                                # [1,3,H,W]
+    image = load_image_u8_chw(args.image).to(device)  # uint8 [3,H,W] RGB
+    frames = image.unsqueeze(0)                        # [1,3,H,W]
 
     with torch.inference_mode():
         pred = getattr(model, args.method)(frames)
