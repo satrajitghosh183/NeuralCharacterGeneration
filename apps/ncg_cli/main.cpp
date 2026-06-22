@@ -209,6 +209,43 @@ int cmd_fit(const ncg::app::Args& args) {
                  pred.vertices2d.size(0), verts.size(0));
   }
 
+  // Per-subject 3DGS refinement: build the body in its source-photo frame (NLF vertices3d),
+  // solve the camera from the 2D<->3D correspondence, then optimize the Gaussians against the
+  // photo with the differentiable renderer. Sharpens the single-sample appearance.
+  if (args.has("refine")) {
+    const auto v3d = pred.vertices3d.to(device);
+    // Downscale the (often huge) photo so the differentiable soft renderer is tractable, and
+    // scale the 2D projection by the same factor so the solved camera matches.
+    const auto img_full = image.to(device);
+    const int maxdim = args.get_int("refine_res", 320);
+    const double s = std::min(1.0, static_cast<double>(maxdim) /
+                                       static_cast<double>(std::max(img_full.size(1), img_full.size(2))));
+    namespace F = torch::nn::functional;
+    const auto img_small =
+        F::interpolate(img_full.unsqueeze(0),
+                       F::InterpolateFuncOptions()
+                           .scale_factor(std::vector<double>{s, s})
+                           .mode(torch::kBilinear)
+                           .align_corners(false))
+            .squeeze(0);
+    const int w = static_cast<int>(img_small.size(2));
+    const int h = static_cast<int>(img_small.size(1));
+    const auto v2d = pred.vertices2d.to(device) * s;
+    const auto cam_s = ncg::runtime::solve_pinhole_camera(v3d, v2d, w, h);
+    const auto pvs3 = ncg::recon::per_vertex_scale(v3d, args.get_float("scale_mult", 0.75F));
+    auto cloud0 = ncg::recon::gaussians_on_body(v3d, args.get_float("scale", 0.012F), colors, pvs3);
+    cloud0.to_(device);
+    ncg::fit::RefineConfig rc;
+    rc.iterations = args.get_int("refine_iters", 200);
+    rc.lr = args.get_float("refine_lr", 0.01F);
+    const auto refined = ncg::fit::refine_gaussians_to_image(cloud0, img_small, cam_s, rc, nullptr);
+    const auto out = ncg::runtime::render_gaussians(refined, cam_s).image;
+    ncg::io::save_png(args.get("out", "refined.png"), out);
+    NCG_LOG_INFO("refine done -> {} ({} iters at {}x{}, photo-frame view)",
+                 args.get("out", "refined.png"), rc.iterations, w, h);
+    return 0;
+  }
+
   // Adaptive per-vertex splat size (default on) so dense regions don't over-spray.
   torch::Tensor pvs;
   if (args.get_int("adaptive", 1) != 0) {

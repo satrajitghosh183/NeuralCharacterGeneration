@@ -59,6 +59,40 @@ Camera Camera::orbit(const Tensor& center, float radius, float azimuth_deg, floa
   return cam;
 }
 
+Camera solve_pinhole_camera(const Tensor& points3d, const Tensor& points2d, int width,
+                            int height) {
+  NCG_CHECK(points3d.dim() == 2 && points3d.size(1) == 3, "solve_pinhole_camera: points3d [N,3]");
+  NCG_CHECK(points2d.dim() == 2 && points2d.size(1) == 2, "solve_pinhole_camera: points2d [N,2]");
+  NCG_CHECK(points3d.size(0) == points2d.size(0), "solve_pinhole_camera: count mismatch");
+
+  const auto device = points3d.device();
+  const auto p3 = points3d.detach().to(at::kCPU, at::kFloat);
+  const auto p2 = points2d.detach().to(at::kCPU, at::kFloat);
+  const auto z = p3.select(1, 2).clamp_min(1e-6F);
+  const auto a = p3.select(1, 0) / z;  // X/Z
+  const auto b = p3.select(1, 1) / z;  // Y/Z
+  const auto u = p2.select(1, 0);
+  const auto v = p2.select(1, 1);
+
+  // Closed-form least squares of y = slope*x + intercept.
+  auto fit = [](const Tensor& x, const Tensor& y, float& slope, float& intercept) {
+    const auto mx = x.mean();
+    const auto my = y.mean();
+    const auto denom = (x - mx).pow(2).sum().clamp_min(1e-12);
+    slope = (((x - mx) * (y - my)).sum() / denom).item<float>();
+    intercept = (my - slope * mx).item<float>();
+  };
+
+  Camera cam;
+  fit(a, u, cam.fx, cam.cx);
+  fit(b, v, cam.fy, cam.cy);
+  cam.width = width;
+  cam.height = height;
+  cam.R = torch::eye(3, at::TensorOptions().dtype(at::kFloat).device(device));
+  cam.t = torch::zeros({3}, at::TensorOptions().dtype(at::kFloat).device(device));
+  return cam;
+}
+
 std::vector<Camera> orbit_trajectory(const Tensor& center, float radius, float elevation_deg,
                                      int frames, float fov_y_deg, int width, int height,
                                      at::Device device) {

@@ -27,6 +27,24 @@ recon::GaussianCloud fit_gaussians_to_image(const Tensor& target_chw,
                                             const runtime::Camera& camera, const FitConfig& cfg,
                                             record::Recorder* recorder = nullptr);
 
+struct RefineConfig {
+  int iterations = 200;
+  double lr = 0.01;
+  float mask_threshold = 0.1F;  // body silhouette taken from the initial render's alpha
+  int log_every = 25;
+};
+
+/// Per-subject 3DGS refinement: starting from an initial cloud (e.g. the photo-colored body in
+/// its source-photo frame), optimize colors/opacity/scale/position to match `target_chw` from
+/// `camera` via the differentiable renderer + Adam. The loss is confined to the body silhouette
+/// (the init render's alpha) so the background doesn't pull the fit. This sharpens the
+/// single-sample-per-vertex appearance into photographic detail. Returns the refined cloud.
+recon::GaussianCloud refine_gaussians_to_image(const recon::GaussianCloud& init,
+                                               const Tensor& target_chw,
+                                               const runtime::Camera& camera,
+                                               const RefineConfig& cfg,
+                                               record::Recorder* recorder = nullptr);
+
 /// Multi-view variant: optimizes a single Gaussian cloud to reproduce several target images
 /// from their respective cameras (Phase-3 multi-view reconstruction). `targets[i]` is rendered
 /// from `cameras[i]`; the per-iteration loss is summed across views. Sizes must match.

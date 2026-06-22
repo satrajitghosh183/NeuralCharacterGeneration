@@ -26,6 +26,13 @@ struct Camera {
                       float fov_y_deg, int width, int height, at::Device device);
 };
 
+/// Fit a pinhole camera (R = identity, t = 0) to 3D->2D correspondences by least squares on
+/// u = fx*(X/Z) + cx and v = fy*(Y/Z) + cy. Given NLF's camera-space `points3d` ([N,3]) and
+/// their image projections `points2d` ([N,2]), this recovers the camera that renders a body in
+/// its source-photo frame — the prerequisite for optimizing Gaussians against that photo.
+Camera solve_pinhole_camera(const Tensor& points3d, const Tensor& points2d, int width,
+                            int height);
+
 /// A turntable trajectory: `frames` cameras equally spaced in azimuth [0,360) at fixed radius
 /// and elevation (Phase-5 eval / novel-view rendering).
 std::vector<Camera> orbit_trajectory(const Tensor& center, float radius, float elevation_deg,
