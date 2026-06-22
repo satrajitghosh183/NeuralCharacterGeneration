@@ -178,6 +178,12 @@ int cmd_fit(const ncg::app::Args& args) {
   if (args.get_int("canonical", 1) != 0) {
     p.pose_aa.select(1, 0).zero_();
   }
+  // From a partial (e.g. upper-body) photo NLF must hallucinate unseen limbs, which contorts
+  // the mesh and sprays the splats. --restpose renders a clean neutral A-pose using NLF's shape
+  // (betas) only; appearance still maps correctly since color is keyed by vertex identity.
+  if (args.get_int("restpose", 0) != 0) {
+    p.pose_aa.zero_();
+  }
   const auto verts = model.forward(p).vertices.squeeze(0);
 
   // Appearance capture: sample the photo's color at each vertex's 2D projection (NLF's
