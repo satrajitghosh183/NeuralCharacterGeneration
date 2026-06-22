@@ -8,6 +8,13 @@ Grounded in two deep-research passes (see `research-findings.md` + memory). Supe
 
 ## 1. The contribution (three legs)
 
+> **The technical core / paper method is `docs/method.md`** (the *discovery*: casual photos are a
+> hidden multi-illumination dataset ⇒ relightable avatars are identifiable with no light stage;
+> recovered by a robust structured-consistency manifold inverse-rendering estimator; rendered with
+> a commuting animate+relight Gaussian transport). The "three legs" below are the *system*
+> framing; `method.md` is what makes it a SIGGRAPH paper rather than an integration. The pipeline
+> built so far (incl. `fuse_vertex_colors`) is the **baseline row** the method ablates against.
+
 1. **Quality/uncertainty-aware fusion of inconsistent casual photos → one canonical avatar.** Beats closest prior art **PuzzleAvatar** (SIGGRAPH Asia 2024: album→mesh, but NOT rigged, NOT relightable, SDS/not-hyperreal, no bad-image handling).
 2. **A real-time C++/CUDA animatable + relightable Gaussian-splat avatar runtime, embedded in Unreal & Unity.** Research confirms **no engine plugin does animate+relight splats** — this closes a real deployment gap and is the systems contribution that justifies the all-C++/CUDA build.
 3. **Learned photo/view selection for avatar reconstruction** — confirmed underexplored (only robotics NBV exists). The principled successor to the old MTCM; the guided web-capture tool supplies the casual-vs-guided ablation statistics.
