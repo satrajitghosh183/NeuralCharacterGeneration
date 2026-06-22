@@ -185,10 +185,17 @@ int cmd_fit(const ncg::app::Args& args) {
   // render pose. Requires vertices2d to index the same SMPL-X mesh we splat on.
   torch::Tensor colors;  // empty => gray default
   if (pred.vertices2d.size(0) == verts.size(0)) {
-    colors = ncg::recon::sample_vertex_colors(image.to(device), pred.vertices2d.to(device))
-                 .clamp(0.0, 1.0);
-    NCG_LOG_INFO("appearance: sampled per-vertex color from the photo ({} verts)",
-                 verts.size(0));
+    const auto v2d = pred.vertices2d.to(device);
+    colors = ncg::recon::sample_vertex_colors(image.to(device), v2d).clamp(0.0, 1.0);
+    // Cull occluded / back-facing vertices (they sample background or the wrong surface) to a
+    // neutral gray, so only genuinely visible vertices carry photo color.
+    const auto depth = pred.vertices3d.select(1, 2).to(device);
+    const auto vis = ncg::recon::vertex_visibility(v2d, depth,
+                                                   static_cast<int64_t>(image.size(1)),
+                                                   static_cast<int64_t>(image.size(2)));
+    colors = torch::where(vis.unsqueeze(1) > 0, colors, torch::full_like(colors, 0.6F));
+    NCG_LOG_INFO("appearance: {} verts, {:.0f}% visible & colored from photo", verts.size(0),
+                 100.0 * vis.mean().item<double>());
   } else {
     NCG_LOG_WARN("NLF vertices2d count {} != mesh verts {} — rendering gray (no appearance)",
                  pred.vertices2d.size(0), verts.size(0));
