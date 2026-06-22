@@ -168,6 +168,14 @@ int cmd_fit(const ncg::app::Args& args) {
   p.betas = params.betas.to(device);
   p.pose_aa = params.pose_aa.to(device);
   p.transl = params.transl.to(device);
+
+  // NLF returns the global orientation (joint 0) in its camera frame (Y-down), which renders
+  // upside-down in our Y-up world. For an avatar we want the body canonical-upright (then
+  // animate), so by default we zero the root orientation, keeping NLF's estimated body pose.
+  // Pass --canonical 0 to keep NLF's camera-relative orientation.
+  if (args.get_int("canonical", 1) != 0) {
+    p.pose_aa.select(1, 0).zero_();
+  }
   const auto verts = model.forward(p).vertices.squeeze(0);
 
   auto cloud = ncg::recon::gaussians_on_body(verts, args.get_float("scale", 0.012F));
