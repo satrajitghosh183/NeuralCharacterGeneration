@@ -3,12 +3,13 @@
 #include <ncg/core/error.hpp>
 #include <ncg/core/logging.hpp>
 
+#include <torch/library.h>
 #include <torch/script.h>
 
-#include <dlfcn.h>
-
-#include <cstdlib>
+#include <algorithm>
+#include <cstdint>
 #include <filesystem>
+#include <numeric>
 #include <string>
 #include <unordered_map>
 #include <utility>
@@ -18,24 +19,54 @@ namespace ncg::body {
 
 namespace {
 
-// NLF's multi-person graph calls torchvision custom ops (torchvision::nms). Those are
-// registered by static initializers inside torchvision's compiled library, so we dlopen it
-// (RTLD_GLOBAL, so the symbols are visible to the torch dispatcher) before loading the module.
-void ensure_torchvision_ops(const std::string& configured) {
-  std::string path = configured;
-  if (path.empty()) {
-    if (const char* env = std::getenv("NCG_TORCHVISION_LIB")) path = env;
-  }
-  if (path.empty()) return;  // caller opted out (e.g. crop model with no torchvision ops)
+// NLF's multi-person detector graph calls a single torchvision custom op: torchvision::nms.
+// Rather than dlopen torchvision's _C.so (a Python extension that drags in libtorch_python +
+// libpython and crashes when loaded into a non-Python process), we provide our own
+// implementation and register it under the torchvision:: namespace below. Non-max suppression
+// over a few hundred detection boxes is trivial, so a CPU O(n^2) sweep is plenty; indices are
+// returned on the input's device. Schema matches torchvision exactly:
+//   torchvision::nms(Tensor dets, Tensor scores, float iou_threshold) -> Tensor
+Tensor nms_cpu(const Tensor& dets_in, const Tensor& scores_in, double iou_threshold) {
+  TORCH_CHECK(dets_in.dim() == 2 && dets_in.size(1) == 4, "nms: dets must be [N,4]");
+  TORCH_CHECK(scores_in.dim() == 1 && scores_in.size(0) == dets_in.size(0),
+              "nms: scores must be [N] matching dets");
+  const auto dets = dets_in.to(at::kCPU, at::kFloat).contiguous();
+  const auto scores = scores_in.to(at::kCPU, at::kFloat).contiguous();
+  const int64_t n = dets.size(0);
+  auto keep = torch::empty({n}, at::TensorOptions().dtype(at::kLong));
+  if (n == 0) return keep.to(dets_in.device());
 
-  static void* handle = nullptr;  // load once per process
-  if (handle != nullptr) return;
-  handle = dlopen(path.c_str(), RTLD_NOW | RTLD_GLOBAL);
-  NCG_CHECK(handle != nullptr,
-            "Nlf: failed to load torchvision ops library '{}': {}. Set NlfConfig::ops_library "
-            "or NCG_TORCHVISION_LIB to torchvision's _C/libtorchvision .so.",
-            path, dlerror() ? dlerror() : "unknown");
-  NCG_LOG_INFO("NLF: registered torchvision ops from {}", path);
+  const float* d = dets.data_ptr<float>();
+  const float* s = scores.data_ptr<float>();
+  std::vector<int64_t> order(static_cast<size_t>(n));
+  std::iota(order.begin(), order.end(), 0);
+  std::sort(order.begin(), order.end(), [&](int64_t a, int64_t b) { return s[a] > s[b]; });
+
+  std::vector<char> suppressed(static_cast<size_t>(n), 0);
+  int64_t* k = keep.data_ptr<int64_t>();
+  int64_t num_keep = 0;
+  for (int64_t ii = 0; ii < n; ++ii) {
+    const int64_t i = order[static_cast<size_t>(ii)];
+    if (suppressed[static_cast<size_t>(i)]) continue;
+    k[num_keep++] = i;
+    const float ix1 = d[i * 4 + 0], iy1 = d[i * 4 + 1], ix2 = d[i * 4 + 2], iy2 = d[i * 4 + 3];
+    const float iarea = (ix2 - ix1) * (iy2 - iy1);
+    for (int64_t jj = ii + 1; jj < n; ++jj) {
+      const int64_t j = order[static_cast<size_t>(jj)];
+      if (suppressed[static_cast<size_t>(j)]) continue;
+      const float xx1 = std::max(ix1, d[j * 4 + 0]);
+      const float yy1 = std::max(iy1, d[j * 4 + 1]);
+      const float xx2 = std::min(ix2, d[j * 4 + 2]);
+      const float yy2 = std::min(iy2, d[j * 4 + 3]);
+      const float w = std::max(0.0F, xx2 - xx1);
+      const float h = std::max(0.0F, yy2 - yy1);
+      const float inter = w * h;
+      const float jarea = (d[j * 4 + 2] - d[j * 4 + 0]) * (d[j * 4 + 3] - d[j * 4 + 1]);
+      const float iou = inter / (iarea + jarea - inter);
+      if (iou > static_cast<float>(iou_threshold)) suppressed[static_cast<size_t>(j)] = 1;
+    }
+  }
+  return keep.narrow(0, 0, num_keep).to(dets_in.device());
 }
 
 }  // namespace
@@ -59,9 +90,8 @@ Nlf Nlf::load(const std::string& torchscript_path, at::Device device, NlfConfig 
   nlf.impl_->device = device;
   nlf.impl_->cfg = std::move(cfg);
 
-  // NLF's multi-person graph references torchvision::nms — register those ops first.
-  ensure_torchvision_ops(nlf.impl_->cfg.ops_library);
-
+  // torchvision::nms is registered at static-init time (see TORCH_LIBRARY below), so NLF's
+  // detector graph resolves it the moment the module loads.
   try {
     nlf.impl_->module = torch::jit::load(torchscript_path, device);
   } catch (const c10::Error& e) {
@@ -131,3 +161,10 @@ SmplxParams Nlf::predict(const Tensor& image_chw) const {
 }
 
 }  // namespace ncg::body
+
+// Register our torchvision::nms so NLF's detector graph resolves it without torchvision's
+// Python-entangled _C.so. The static initializer runs because nlf.o is linked into any target
+// that uses Nlf (the catch-all kernel handles both CPU and CUDA inputs).
+TORCH_LIBRARY(torchvision, m) {  // NOLINT
+  m.def("nms(Tensor dets, Tensor scores, float iou_threshold) -> Tensor", &ncg::body::nms_cpu);
+}
