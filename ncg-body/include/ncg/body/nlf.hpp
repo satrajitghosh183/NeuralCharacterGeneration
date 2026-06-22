@@ -36,6 +36,7 @@ struct NlfConfig {
 struct NlfPrediction {
   SmplxParams params;   // pose/betas/transl for SmplxModel::forward
   Tensor vertices2d;    // [V,2] image-space (x,y) of the posed mesh vertices
+  Tensor vertices3d;    // [V,3] camera-space mesh vertices (z = depth, for visibility)
 };
 
 class Nlf {

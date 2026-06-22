@@ -41,3 +41,26 @@ TEST_CASE("sample_vertex_colors clamps out-of-bounds samples to the border", "[r
   const auto colors = ncg::recon::sample_vertex_colors(img, verts2d);
   REQUIRE(torch::allclose(colors, torch::full({2, 3}, 0.7F), 1e-4, 1e-4));
 }
+
+TEST_CASE("vertex_visibility keeps the frontmost vertex per pixel", "[recon][appearance]") {
+  // Two verts on the same pixel (0,0) at depths 1 and 2; one lone vert at (3,3).
+  const auto verts2d = torch::tensor({{0.0F, 0.0F}, {0.0F, 0.0F}, {3.0F, 3.0F}});
+  const auto depth = torch::tensor({1.0F, 2.0F, 5.0F});
+  const auto vis = ncg::recon::vertex_visibility(verts2d, depth, /*H=*/4, /*W=*/4, /*tol=*/0.05);
+  REQUIRE(torch::allclose(vis, torch::tensor({1.0F, 0.0F, 1.0F}), 1e-5, 1e-5));
+}
+
+TEST_CASE("fuse_vertex_colors is a confidence-weighted mean with neutral fill", "[recon][appearance]") {
+  const std::vector<torch::Tensor> colors = {
+      torch::tensor({{1.0F, 0.0F, 0.0F}, {0.0F, 0.0F, 0.0F}, {9.0F, 9.0F, 9.0F}}),
+      torch::tensor({{0.0F, 1.0F, 0.0F}, {0.0F, 0.0F, 1.0F}, {9.0F, 9.0F, 9.0F}})};
+  const std::vector<torch::Tensor> weights = {torch::tensor({1.0F, 0.0F, 0.0F}),
+                                              torch::tensor({1.0F, 1.0F, 0.0F})};
+  const auto fused = ncg::recon::fuse_vertex_colors(colors, weights);
+
+  const auto expected = torch::tensor({{0.5F, 0.5F, 0.0F},   // seen in both, weight 1+1
+                                       {0.0F, 0.0F, 1.0F},   // seen only in view 1
+                                       {0.5F, 0.5F, 0.5F}});  // never seen -> neutral gray
+  REQUIRE(torch::allclose(fused.colors, expected, 1e-5, 1e-5));
+  REQUIRE(torch::allclose(fused.coverage, torch::tensor({2.0F, 1.0F, 0.0F}), 1e-5, 1e-5));
+}

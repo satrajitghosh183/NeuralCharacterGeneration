@@ -208,6 +208,71 @@ int cmd_fit(const ncg::app::Args& args) {
   return 0;
 }
 
+// Cross-photo fusion (the project's core): several casual photos -> one coherent textured
+// avatar. Body geometry from the first photo (canonical); per-vertex color fused across all
+// photos, each weighted by per-view visibility.
+//   ncg_cli fuse --images a.jpg,b.jpg,c.jpg --weights nlf.torchscript --smplx smplx.safetensors --out avatar.png
+int cmd_fuse(const ncg::app::Args& args) {
+  NCG_CHECK(ncg::cuda_available(), "fuse requires a CUDA device");
+  const auto device = at::Device(at::kCUDA, 0);
+  const auto paths = split_csv(args.require("images"));
+  NCG_CHECK(!paths.empty(), "fuse: --images is empty");
+
+  auto nlf = ncg::body::Nlf::load(args.require("weights"), device);
+  auto model = ncg::body::SmplxModel::load(args.require("smplx"), device);
+
+  std::vector<torch::Tensor> view_colors;
+  std::vector<torch::Tensor> view_weights;
+  torch::Tensor ref_verts;  // canonical body geometry from the first photo
+  int64_t V = 0;
+
+  for (size_t i = 0; i < paths.size(); ++i) {
+    const auto image = ncg::io::load_image(paths[i], 3);
+    const auto pred = nlf.detect(image);
+
+    if (i == 0) {
+      ncg::body::SmplxParams p;
+      p.betas = pred.params.betas.to(device);
+      p.pose_aa = pred.params.pose_aa.to(device);
+      p.transl = pred.params.transl.to(device);
+      if (args.get_int("canonical", 1) != 0) p.pose_aa.select(1, 0).zero_();
+      ref_verts = model.forward(p).vertices.squeeze(0);  // [V,3]
+      V = ref_verts.size(0);
+    }
+    if (pred.vertices2d.size(0) != V) {
+      NCG_LOG_WARN("fuse: '{}' vertices2d count {} != mesh {} — skipping view", paths[i],
+                   pred.vertices2d.size(0), V);
+      continue;
+    }
+    const auto v2d = pred.vertices2d.to(device);
+    const auto depth = pred.vertices3d.select(1, 2).to(device);  // camera-space z
+    view_colors.push_back(
+        ncg::recon::sample_vertex_colors(image.to(device), v2d).clamp(0.0, 1.0));
+    view_weights.push_back(ncg::recon::vertex_visibility(
+        v2d, depth, static_cast<int64_t>(image.size(1)), static_cast<int64_t>(image.size(2))));
+    NCG_LOG_INFO("fuse: view {}/{} '{}' done", i + 1, paths.size(), paths[i]);
+  }
+  NCG_CHECK(!view_colors.empty(), "fuse: no usable views (vertices2d count never matched the mesh)");
+
+  const auto fused = ncg::recon::fuse_vertex_colors(view_colors, view_weights);
+  const double seen = (fused.coverage > 0).to(at::kFloat).mean().item<double>();
+  NCG_LOG_INFO("fuse: {} views -> avatar; {:.1f}% of vertices seen in >=1 view", view_colors.size(),
+               100.0 * seen);
+
+  auto cloud = ncg::recon::gaussians_on_body(ref_verts, args.get_float("scale", 0.012F),
+                                             fused.colors);
+  cloud.to_(device);
+  const auto cam = ncg::runtime::Camera::orbit(ref_verts.mean(0), args.get_float("radius", 2.5F),
+                                               args.get_float("azimuth", 20.0F),
+                                               args.get_float("elevation", 10.0F), 50.0F,
+                                               args.get_int("width", 512),
+                                               args.get_int("height", 512), device);
+  const auto render = ncg::runtime::render_gaussians(cloud, cam);
+  ncg::io::save_png(args.get("out", "avatar.png"), render.image);
+  NCG_LOG_INFO("fuse done -> {}", args.get("out", "avatar.png"));
+  return 0;
+}
+
 // Optimize a Gaussian cloud to reproduce a target image (Phase-2 3DGS fitting), recording
 // per-iteration metrics.
 int cmd_fitimg(const ncg::app::Args& args) {
@@ -286,7 +351,8 @@ int main(int argc, char** argv) {
   ncg::init_logging();
   if (argc < 2) {
     std::fprintf(stderr,
-                 "usage: ncg_cli <pipeline|render|turntable|select|fitimg|fit|nerf> [--flags]\n");
+                 "usage: ncg_cli "
+                 "<pipeline|render|turntable|select|fitimg|fit|fuse|nerf> [--flags]\n");
     return 2;
   }
   const std::string cmd = argv[1];
@@ -298,6 +364,7 @@ int main(int argc, char** argv) {
     if (cmd == "select") return cmd_select(args);
     if (cmd == "fitimg") return cmd_fitimg(args);
     if (cmd == "fit") return cmd_fit(args);
+    if (cmd == "fuse") return cmd_fuse(args);
     if (cmd == "nerf") return cmd_nerf(args);
     std::fprintf(stderr, "unknown command '%s'\n", cmd.c_str());
     return 2;

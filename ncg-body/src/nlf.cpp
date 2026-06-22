@@ -158,6 +158,7 @@ NlfPrediction Nlf::detect(const Tensor& image_chw) const {
   out.params.betas = pick("betas").reshape({1, -1}).contiguous();
   out.params.transl = pick("trans").reshape({1, 3}).contiguous();
   out.vertices2d = pick("vertices2d").contiguous();  // [V,2] image-space mesh projection
+  out.vertices3d = pick("vertices3d").contiguous();  // [V,3] camera-space (z = depth)
   return out;
 }
 
