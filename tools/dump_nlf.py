@@ -69,6 +69,8 @@ def main() -> int:
     ap.add_argument("--image", required=True, help="a test image (any in-the-wild photo)")
     ap.add_argument("--out", default="data/golden/nlf")
     ap.add_argument("--method", default="detect_smpl_batched")
+    ap.add_argument("--model-name", default="smplx",
+                    help="body model NLF fits: smplx (matches SmplxModel) or smpl")
     args = ap.parse_args()
 
     import numpy as np
@@ -83,7 +85,7 @@ def main() -> int:
     frames = image.unsqueeze(0)                        # [1,3,H,W]
 
     with torch.inference_mode():
-        pred = getattr(model, args.method)(frames)
+        pred = getattr(model, args.method)(frames, model_name=args.model_name)
 
     manifest = {
         "method": args.method,

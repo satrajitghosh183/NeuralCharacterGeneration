@@ -21,8 +21,11 @@ namespace ncg::body {
 /// Confirm the output structure against the real checkpoint with `tools/dump_nlf.py` (dumps the
 /// output dict layout + a golden), then lock it with `tests/golden/test_golden_nlf.cpp`.
 struct NlfConfig {
-  /// TorchScript entry point. Per the NLF demo this is `detect_smpl_batched(frames_u8)`.
+  /// TorchScript entry point. `detect_smpl_batched(frames_u8, model_name=...)`.
   std::string method = "detect_smpl_batched";
+  /// Body model to fit. NLF is model-agnostic; "smplx" yields a [55*3] pose + 10 betas that
+  /// match SmplxModel. (Default "smpl" would give a 24-joint pose that SmplxModel can't use.)
+  std::string model_name = "smplx";
   /// Which detection to keep when the image has several people (0 = first / highest score).
   int detection = 0;
   /// Path to torchvision's compiled ops library. NLF's multi-person graph calls

@@ -10,6 +10,7 @@
 #include <cstdlib>
 #include <filesystem>
 #include <string>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -85,8 +86,11 @@ SmplxParams Nlf::predict(const Tensor& image_chw) const {
   torch::NoGradGuard no_grad;
   std::vector<torch::jit::IValue> inputs;
   inputs.emplace_back(frames);
+  // model_name="smplx" => a 55-joint pose + 10 betas matching SmplxModel (default is "smpl").
+  std::unordered_map<std::string, torch::jit::IValue> kwargs;
+  kwargs["model_name"] = impl_->cfg.model_name;
 
-  const auto result = impl_->module.get_method(impl_->cfg.method)(inputs);
+  const auto result = impl_->module.get_method(impl_->cfg.method)(std::move(inputs), kwargs);
   NCG_CHECK(result.isGenericDict(),
             "Nlf::predict: '{}' did not return a dict; confirm the API with tools/dump_nlf.py",
             impl_->cfg.method);
