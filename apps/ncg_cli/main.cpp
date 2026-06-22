@@ -194,7 +194,12 @@ int cmd_fit(const ncg::app::Args& args) {
                  pred.vertices2d.size(0), verts.size(0));
   }
 
-  auto cloud = ncg::recon::gaussians_on_body(verts, args.get_float("scale", 0.012F), colors);
+  // Adaptive per-vertex splat size (default on) so dense regions don't over-spray.
+  torch::Tensor pvs;
+  if (args.get_int("adaptive", 1) != 0) {
+    pvs = ncg::recon::per_vertex_scale(verts, args.get_float("scale_mult", 0.75F));
+  }
+  auto cloud = ncg::recon::gaussians_on_body(verts, args.get_float("scale", 0.012F), colors, pvs);
   cloud.to_(device);
   const auto cam = ncg::runtime::Camera::orbit(verts.mean(0), args.get_float("radius", 2.5F),
                                                args.get_float("azimuth", 20.0F),
@@ -259,8 +264,12 @@ int cmd_fuse(const ncg::app::Args& args) {
   NCG_LOG_INFO("fuse: {} views -> avatar; {:.1f}% of vertices seen in >=1 view", view_colors.size(),
                100.0 * seen);
 
+  torch::Tensor pvs;
+  if (args.get_int("adaptive", 1) != 0) {
+    pvs = ncg::recon::per_vertex_scale(ref_verts, args.get_float("scale_mult", 0.75F));
+  }
   auto cloud = ncg::recon::gaussians_on_body(ref_verts, args.get_float("scale", 0.012F),
-                                             fused.colors);
+                                             fused.colors, pvs);
   cloud.to_(device);
   const auto cam = ncg::runtime::Camera::orbit(ref_verts.mean(0), args.get_float("radius", 2.5F),
                                                args.get_float("azimuth", 20.0F),
