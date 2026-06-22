@@ -254,6 +254,7 @@ int cmd_fuse(const ncg::app::Args& args) {
       p.pose_aa = pred.params.pose_aa.to(device);
       p.transl = pred.params.transl.to(device);
       if (args.get_int("canonical", 1) != 0) p.pose_aa.select(1, 0).zero_();
+      if (args.get_int("restpose", 0) != 0) p.pose_aa.zero_();
       ref_verts = model.forward(p).vertices.squeeze(0);  // [V,3]
       V = ref_verts.size(0);
     }
