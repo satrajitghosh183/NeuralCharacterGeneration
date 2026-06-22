@@ -246,9 +246,15 @@ int cmd_fuse(const ncg::app::Args& args) {
 
   for (size_t i = 0; i < paths.size(); ++i) {
     const auto image = ncg::io::load_image(paths[i], 3);
-    const auto pred = nlf.detect(image);
+    ncg::body::NlfPrediction pred;
+    try {
+      pred = nlf.detect(image);  // throws if NLF detects no person (e.g. a tight face crop)
+    } catch (const std::exception& e) {
+      NCG_LOG_WARN("fuse: skipping '{}' — no person detected ({})", paths[i], e.what());
+      continue;
+    }
 
-    if (i == 0) {
+    if (!ref_verts.defined()) {  // first view with a detection sets the body geometry
       ncg::body::SmplxParams p;
       p.betas = pred.params.betas.to(device);
       p.pose_aa = pred.params.pose_aa.to(device);
