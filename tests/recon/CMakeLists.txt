@@ -15,3 +15,9 @@ ncg_add_test(test_init
   SOURCES test_init.cpp
   DEPS    ncg::recon
   LABELS  "recon")
+
+# Multi-illumination inverse rendering — the paper's core math + C1 proof (CPU).
+ncg_add_test(test_inverse_render
+  SOURCES test_inverse_render.cpp
+  DEPS    ncg::recon
+  LABELS  "recon")

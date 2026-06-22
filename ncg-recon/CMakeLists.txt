@@ -6,6 +6,7 @@ ncg_add_library(ncg-recon
     src/init_from_body.cpp
     src/animate.cpp
     src/appearance.cpp
+    src/inverse_render.cpp
   PUBLIC_DEPS
     ncg::core
     torch)
