@@ -106,6 +106,12 @@ per-channel gain** $a\!\to\!\kappa a,\ L\!\to\!\kappa^{-1}L$, removable by one s
 > to one global per-channel scale. **Discovery:** the lighting *diversity* of a casual album is
 > precisely the condition that makes full-body delighting well-posed with no light stage.
 
+> **Empirical support (2026-06-22, `tests/recon/test_inverse_render.cpp`, green on H100):** with
+> the closed-form solver (§5), scaled albedo error is **0.068 at N=1 vs 0.024 at N=5** diverse
+> lights — recovery is good under multi-illumination and *strictly improves with lighting
+> diversity*, exactly as C1 predicts. (Idealized: synthetic Lambertian, no noise/outliers yet;
+> the noise/outlier + error-vs-N sweep is the next experiment.)
+
 Honest caveats: this is a DOF-counting + cross-illumination argument, not yet a theorem under a
 formal genericity assumption; degenerate albums (all photos same light) collapse to the
 single-image case — detectable from the conditioning of the L-step normal equations and reportable
