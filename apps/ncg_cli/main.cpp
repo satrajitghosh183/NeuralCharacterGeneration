@@ -153,7 +153,9 @@ int cmd_fit(const ncg::app::Args& args) {
   NCG_CHECK(ncg::cuda_available(), "fit requires a CUDA device");
   const auto device = at::Device(at::kCUDA, 0);
 
-  auto nlf = ncg::body::Nlf::load(args.require("weights"), device);
+  ncg::body::NlfConfig nc;
+  nc.detection = args.get_int("detection", 0);  // which person, if the photo has several
+  auto nlf = ncg::body::Nlf::load(args.require("weights"), device, nc);
   const auto image = ncg::io::load_image(args.require("image"), 3);
   const auto pred = nlf.detect(image);
   const auto& params = pred.params;
