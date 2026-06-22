@@ -13,6 +13,7 @@
 #include <ncg/io/image.hpp>
 #include <ncg/mesh/extract.hpp>
 #include <ncg/nerf/nerf.hpp>
+#include <ncg/recon/appearance.hpp>
 #include <ncg/recon/init_from_body.hpp>
 #include <ncg/record/recorder.hpp>
 #include <ncg/rig/rig.hpp>
@@ -154,7 +155,8 @@ int cmd_fit(const ncg::app::Args& args) {
 
   auto nlf = ncg::body::Nlf::load(args.require("weights"), device);
   const auto image = ncg::io::load_image(args.require("image"), 3);
-  const auto params = nlf.predict(image);
+  const auto pred = nlf.detect(image);
+  const auto& params = pred.params;
   NCG_LOG_INFO("NLF predicted: {} joints, {} betas", params.pose_aa.size(1),
                params.betas.size(1));
 
@@ -178,7 +180,21 @@ int cmd_fit(const ncg::app::Args& args) {
   }
   const auto verts = model.forward(p).vertices.squeeze(0);
 
-  auto cloud = ncg::recon::gaussians_on_body(verts, args.get_float("scale", 0.012F));
+  // Appearance capture: sample the photo's color at each vertex's 2D projection (NLF's
+  // vertices2d). Color is keyed by vertex identity, so it is independent of the canonical
+  // render pose. Requires vertices2d to index the same SMPL-X mesh we splat on.
+  torch::Tensor colors;  // empty => gray default
+  if (pred.vertices2d.size(0) == verts.size(0)) {
+    colors = ncg::recon::sample_vertex_colors(image.to(device), pred.vertices2d.to(device))
+                 .clamp(0.0, 1.0);
+    NCG_LOG_INFO("appearance: sampled per-vertex color from the photo ({} verts)",
+                 verts.size(0));
+  } else {
+    NCG_LOG_WARN("NLF vertices2d count {} != mesh verts {} — rendering gray (no appearance)",
+                 pred.vertices2d.size(0), verts.size(0));
+  }
+
+  auto cloud = ncg::recon::gaussians_on_body(verts, args.get_float("scale", 0.012F), colors);
   cloud.to_(device);
   const auto cam = ncg::runtime::Camera::orbit(verts.mean(0), args.get_float("radius", 2.5F),
                                                args.get_float("azimuth", 20.0F),

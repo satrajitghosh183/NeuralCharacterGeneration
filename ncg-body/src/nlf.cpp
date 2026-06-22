@@ -102,10 +102,10 @@ Nlf Nlf::load(const std::string& torchscript_path, at::Device device, NlfConfig 
   return nlf;
 }
 
-SmplxParams Nlf::predict(const Tensor& image_chw) const {
-  NCG_CHECK(impl_ != nullptr, "Nlf::predict: model not loaded");
+NlfPrediction Nlf::detect(const Tensor& image_chw) const {
+  NCG_CHECK(impl_ != nullptr, "Nlf::detect: model not loaded");
   NCG_CHECK(image_chw.dim() == 3 && image_chw.size(0) == 3,
-            "Nlf::predict: expected a [3,H,W] image, got a {}-D tensor", image_chw.dim());
+            "Nlf::detect: expected a [3,H,W] image, got a {}-D tensor", image_chw.dim());
   const auto device = impl_->device;
 
   // NLF expects a uint8 RGB batch [B,3,H,W] on the model's device (per demo.ipynb:
@@ -122,9 +122,9 @@ SmplxParams Nlf::predict(const Tensor& image_chw) const {
 
   const auto result = impl_->module.get_method(impl_->cfg.method)(std::move(inputs), kwargs);
   NCG_CHECK(result.isGenericDict(),
-            "Nlf::predict: '{}' did not return a dict; confirm the API with tools/dump_nlf.py",
+            "Nlf::detect: '{}' did not return a dict; confirm the API with tools/dump_nlf.py",
             impl_->cfg.method);
-  const auto out = result.toGenericDict();
+  const auto dict = result.toGenericDict();
 
   // detect_smpl_batched returns per-key, per-image results for a multi-person detector. Each
   // value is a List (one entry per input image) of [num_detections, ...] tensors. We sent one
@@ -132,8 +132,8 @@ SmplxParams Nlf::predict(const Tensor& image_chw) const {
   // the plausible shapes (TensorList / generic List / bare Tensor) defensively.
   const int det = impl_->cfg.detection;
   auto pick = [&](const char* key) -> Tensor {
-    NCG_CHECK(out.contains(key), "Nlf::predict: output missing key '{}'", key);
-    const auto value = out.at(key);
+    NCG_CHECK(dict.contains(key), "Nlf::detect: output missing key '{}'", key);
+    const auto value = dict.at(key);
     Tensor per_image;
     if (value.isTensorList()) {
       per_image = value.toTensorList().get(0);
@@ -153,11 +153,12 @@ SmplxParams Nlf::predict(const Tensor& image_chw) const {
   // pose may be flat [J*3] or [J,3]; reshape to [1,J,3] (SmplxModel::forward accepts both, and
   // J is inferred so this works whether NLF emits SMPL (24j) or SMPL-X (55j) — the consuming
   // SmplxModel must have a matching joint count; verify against the golden).
-  SmplxParams p;
-  p.pose_aa = pick("pose").reshape({1, -1, 3}).contiguous();
-  p.betas = pick("betas").reshape({1, -1}).contiguous();
-  p.transl = pick("trans").reshape({1, 3}).contiguous();
-  return p;
+  NlfPrediction out;
+  out.params.pose_aa = pick("pose").reshape({1, -1, 3}).contiguous();
+  out.params.betas = pick("betas").reshape({1, -1}).contiguous();
+  out.params.transl = pick("trans").reshape({1, 3}).contiguous();
+  out.vertices2d = pick("vertices2d").contiguous();  // [V,2] image-space mesh projection
+  return out;
 }
 
 }  // namespace ncg::body

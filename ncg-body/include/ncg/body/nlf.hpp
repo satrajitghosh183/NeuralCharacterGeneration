@@ -30,16 +30,26 @@ struct NlfConfig {
   int detection = 0;
 };
 
+/// Full NLF prediction for one detection: parametric body + the data needed for appearance
+/// capture. `vertices2d` are the SMPL-X mesh vertices projected into the source image (pixel
+/// coords), so they can be sampled for per-vertex color (see recon::sample_vertex_colors).
+struct NlfPrediction {
+  SmplxParams params;   // pose/betas/transl for SmplxModel::forward
+  Tensor vertices2d;    // [V,2] image-space (x,y) of the posed mesh vertices
+};
+
 class Nlf {
 public:
   /// Load the released TorchScript module onto `device`. Throws if the file is missing or not
   /// a loadable TorchScript graph.
   static Nlf load(const std::string& torchscript_path, at::Device device, NlfConfig cfg = {});
 
-  /// Predict SMPL-X params (batch 1) from a CHW float image in [0, 1]. The image is converted
-  /// to the uint8 RGB [1,3,H,W] batch NLF expects; the chosen detection's pose/betas/trans are
-  /// returned (CPU, float) ready to feed to SmplxModel::forward.
-  SmplxParams predict(const Tensor& image_chw) const;
+  /// Full prediction (params + projected vertices) for the chosen detection, from a CHW float
+  /// image in [0,1]. The image is converted to the uint8 RGB [1,3,H,W] batch NLF expects.
+  NlfPrediction detect(const Tensor& image_chw) const;
+
+  /// Convenience: just the SMPL-X params (batch 1), ready for SmplxModel::forward.
+  SmplxParams predict(const Tensor& image_chw) const { return detect(image_chw).params; }
 
 private:
   struct Impl;
