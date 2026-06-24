@@ -33,4 +33,11 @@ Tensor compute_vertex_normals(const TriMesh& mesh);
 void write_obj(const TriMesh& mesh, const std::string& path);
 void write_ply(const TriMesh& mesh, const std::string& path);
 
+/// Export a triangle mesh as binary glTF (.glb) — the format Unity and Unreal import directly.
+/// `vertices` [V,3], `faces` [F,3]; `normals` [V,3] and `colors` [V,3] are optional (pass an
+/// undefined Tensor to omit). Colors become the COLOR_0 vertex attribute. Produces a single-file,
+/// self-contained, vertex-colored static mesh (embedded skinning is a later addition).
+void write_glb(const Tensor& vertices, const Tensor& faces, const Tensor& normals,
+               const Tensor& colors, const std::string& path);
+
 }  // namespace ncg::mesh

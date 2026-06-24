@@ -461,6 +461,52 @@ int cmd_relight(const ncg::app::Args& args) {
   return 0;
 }
 
+// Export the avatar as a binary glTF (.glb) for Unity/Unreal: SMPL-X body (neutral, or NLF
+// rest-posed from a photo) + vertex normals + per-vertex color (sampled from the photo).
+//   ncg_cli export --smplx smplx.safetensors [--image me.jpg --weights nlf.torchscript] --out avatar.glb
+int cmd_export(const ncg::app::Args& args) {
+  const bool want_color = args.has("image") && args.has("weights");
+  const auto device = ncg::cuda_available() ? at::Device(at::kCUDA, 0) : at::Device(at::kCPU);
+  auto model = ncg::body::SmplxModel::load(args.require("smplx"), device);
+  NCG_CHECK(model.has_faces(), "export needs a SMPL-X model with faces — reconvert it");
+
+  torch::Tensor verts;
+  torch::Tensor colors;
+  if (want_color) {
+    NCG_CHECK(ncg::cuda_available(), "export with --image needs a CUDA device (NLF)");
+    auto nlf = ncg::body::Nlf::load(args.require("weights"), device);
+    const auto image = ncg::io::load_image(args.require("image"), 3);
+    const auto pred = nlf.detect(image);
+    ncg::body::SmplxParams p;
+    p.betas = pred.params.betas.to(device);
+    p.pose_aa = pred.params.pose_aa.to(device);
+    p.transl = pred.params.transl.to(device);
+    p.pose_aa.zero_();  // clean canonical rest pose
+    verts = model.forward(p).vertices.squeeze(0);
+    if (pred.vertices2d.size(0) == verts.size(0)) {
+      const auto v2d = pred.vertices2d.to(device);
+      colors = ncg::recon::sample_vertex_colors(image.to(device), v2d).clamp(0.0, 1.0);
+      const auto depth = pred.vertices3d.select(1, 2).to(device);
+      const auto vis = ncg::recon::vertex_visibility(v2d, depth, static_cast<int64_t>(image.size(1)),
+                                                     static_cast<int64_t>(image.size(2)));
+      colors = torch::where(vis.unsqueeze(1) > 0, colors, torch::full_like(colors, 0.6F));
+    }
+  } else {
+    verts = model.forward(model.neutral_params(1)).vertices.squeeze(0);
+    colors = torch::full({verts.size(0), 3}, 0.75F, verts.options());
+  }
+
+  ncg::mesh::TriMesh mesh;
+  mesh.vertices = verts.to(at::kCPU);
+  mesh.faces = model.faces().to(at::kCPU);
+  const auto normals = ncg::mesh::compute_vertex_normals(mesh);
+  ncg::mesh::write_glb(mesh.vertices, mesh.faces, normals, colors.to(at::kCPU),
+                       args.get("out", "avatar.glb"));
+  NCG_LOG_INFO("export -> {} ({} verts, {} faces)", args.get("out", "avatar.glb"), verts.size(0),
+               mesh.faces.size(0));
+  return 0;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -468,7 +514,8 @@ int main(int argc, char** argv) {
   if (argc < 2) {
     std::fprintf(stderr,
                  "usage: ncg_cli "
-                 "<pipeline|render|turntable|select|fitimg|fit|fuse|relight|nerf> [--flags]\n");
+                 "<pipeline|render|turntable|select|fitimg|fit|fuse|relight|export|nerf> "
+                 "[--flags]\n");
     return 2;
   }
   const std::string cmd = argv[1];
@@ -482,6 +529,7 @@ int main(int argc, char** argv) {
     if (cmd == "fit") return cmd_fit(args);
     if (cmd == "fuse") return cmd_fuse(args);
     if (cmd == "relight") return cmd_relight(args);
+    if (cmd == "export") return cmd_export(args);
     if (cmd == "nerf") return cmd_nerf(args);
     std::fprintf(stderr, "unknown command '%s'\n", cmd.c_str());
     return 2;
