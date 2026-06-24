@@ -21,7 +21,8 @@ uint32_t u32_at(const std::vector<char>& b, size_t o) {
 }
 // A unit tetrahedron mesh.
 std::pair<torch::Tensor, torch::Tensor> tetra() {
-  auto v = torch::tensor({{0.0F, 0, 0}, {1, 0, 0}, {0, 1, 0}, {0, 0, 1}});
+  auto v = torch::tensor({{0.0F, 0.0F, 0.0F}, {1.0F, 0.0F, 0.0F}, {0.0F, 1.0F, 0.0F},
+                          {0.0F, 0.0F, 1.0F}});
   auto f = torch::tensor({{0, 2, 1}, {0, 1, 3}, {0, 3, 2}, {1, 2, 3}}, torch::kLong);
   return {v, f};
 }
@@ -47,7 +48,7 @@ TEST_CASE("write_glb produces a valid binary glTF", "[mesh][glb]") {
 
 TEST_CASE("write_glb_skinned embeds a skin + joints", "[mesh][glb]") {
   auto [v, f] = tetra();
-  const auto joints = torch::tensor({{0.0F, 0, 0}, {0, 0.5F, 0}});      // 2 joints
+  const auto joints = torch::tensor({{0.0F, 0.0F, 0.0F}, {0.0F, 0.5F, 0.0F}});  // 2 joints
   const auto parents = torch::tensor({0, 0}, torch::kLong);            // joint1 child of root
   const auto skin = torch::rand({4, 2});                               // [V,J] weights
   const auto path = (std::filesystem::temp_directory_path() / "ncg_test_skinned.glb").string();
