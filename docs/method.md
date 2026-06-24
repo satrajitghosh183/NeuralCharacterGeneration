@@ -106,11 +106,17 @@ per-channel gain** $a\!\to\!\kappa a,\ L\!\to\!\kappa^{-1}L$, removable by one s
 > to one global per-channel scale. **Discovery:** the lighting *diversity* of a casual album is
 > precisely the condition that makes full-body delighting well-posed with no light stage.
 
-> **Empirical support (2026-06-22, `tests/recon/test_inverse_render.cpp`, green on H100):** with
-> the closed-form solver (§5), scaled albedo error is **0.068 at N=1 vs 0.024 at N=5** diverse
-> lights — recovery is good under multi-illumination and *strictly improves with lighting
-> diversity*, exactly as C1 predicts. (Idealized: synthetic Lambertian, no noise/outliers yet;
-> the noise/outlier + error-vs-N sweep is the next experiment.)
+> **Empirical support (2026-06-22→24, `tests/recon/test_inverse_render.cpp`, all green on H100):**
+> - **C1 (identifiability):** scaled albedo error **0.069 (N=1) → 0.029 (N=5)** — recovery is good
+>   under multi-illumination and *strictly improves with lighting diversity*, exactly as predicted.
+> - **C2 (robustness):** with **35% corrupted** observations (clothing-swap/junk), the robust
+>   consistency estimator gets **0.031 vs 0.096** for non-robust (≈3×), and the inferred
+>   consistency is **0.004 on corrupted vs ≈1 on clean** — it *identifies* the junk.
+> - **Relighting:** recovered albedo rendered under a **novel, never-observed** directional light
+>   matches the ground-truth-albedo render to **6.9% relative error** — relightable, no light stage.
+>
+> Idealized so far (synthetic Lambertian normals); the real-geometry + error-vs-N sweep and the
+> real-photo relighting render are the next experiments.
 
 Honest caveats: this is a DOF-counting + cross-illumination argument, not yet a theorem under a
 formal genericity assumption; degenerate albums (all photos same light) collapse to the
