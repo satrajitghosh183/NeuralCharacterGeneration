@@ -13,6 +13,11 @@ Tensor sh_basis(const Tensor& normals);
 /// Returns rendered RGB [V,3] = albedo ⊙ (sh · sh_basis(normals)).
 Tensor shade_sh(const Tensor& albedo, const Tensor& sh, const Tensor& normals);
 
+/// SH coefficients [3,9] for a directional light from `direction` ([3]) of `color` ([3]) plus an
+/// ambient term. Lets us relight a recovered albedo under any chosen lighting (the payoff of the
+/// inverse-rendering decomposition): shade_sh(albedo, sh_directional_light(d,c,a), normals).
+Tensor sh_directional_light(const Tensor& direction, const Tensor& color, float ambient = 0.2F);
+
 struct InverseRenderConfig {
   int iterations = 40;       // L/A alternations
   float albedo_ridge = 1e-4F;

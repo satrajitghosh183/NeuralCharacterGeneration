@@ -9,6 +9,7 @@
 using ncg::recon::InverseRenderConfig;
 using ncg::recon::shade_sh;
 using ncg::recon::sh_basis;
+using ncg::recon::sh_directional_light;
 using ncg::recon::solve_inverse_render;
 
 // Ambient-only SH lighting => uniform irradiance over all normals (sanity for the basis/shading).
@@ -108,4 +109,39 @@ TEST_CASE("robust consistency rejects corrupted observations (C2)", "[recon][inv
   REQUIRE(e_rob < e_plain);             // robustness helps under corruption
   REQUIRE(e_rob < 0.06);                // and still recovers albedo well
   REQUIRE(mean_corrupt < mean_clean);   // it actually identifies the bad observations
+}
+
+// Relighting payoff: recover albedo from casually-lit photos, then render it under a NOVEL,
+// never-observed light and check it matches the ground-truth-albedo render under that light.
+// This is the relightable claim, validated numerically (no light stage, no Python).
+TEST_CASE("recovered albedo relights correctly under a novel light", "[recon][inverse]") {
+  torch::manual_seed(2);
+  const int V = 300;
+  const int N = 6;
+  auto normals = torch::randn({V, 3});
+  normals = normals / normals.norm(2, -1, true);
+  const auto a_true = torch::rand({V, 3}) * 0.7F + 0.2F;
+  const auto b = sh_basis(normals);
+
+  auto L = torch::randn({N, 3, 9}) * 0.25F;
+  L.select(2, 0) += 1.2F;
+  const auto obs = (a_true.unsqueeze(0) * torch::einsum("nck,vk->nvc", {L, b})).clamp_min(0.0);
+  const auto nv = normals.unsqueeze(0).expand({N, V, 3}).contiguous();
+
+  InverseRenderConfig cfg;
+  cfg.iterations = 80;
+  auto a_rec = solve_inverse_render(obs, nv, torch::ones({N, V}), cfg).albedo;
+  // Undo the global per-channel gauge before relighting.
+  a_rec = a_rec * ((a_rec * a_true).sum(0) / (a_rec * a_rec).sum(0).clamp_min(1e-8));
+
+  // A novel directional light that appeared in none of the input photos.
+  const auto Lnew = sh_directional_light(torch::tensor({0.4F, -0.7F, 0.6F}),
+                                         torch::tensor({1.0F, 0.95F, 0.9F}), /*ambient=*/0.25F);
+  const auto relit_true = shade_sh(a_true, Lnew, normals);
+  const auto relit_rec = shade_sh(a_rec, Lnew, normals);
+
+  const double rel_err = (relit_true - relit_rec).norm().item<double>() /
+                         relit_true.norm().clamp_min(1e-8).item<double>();
+  INFO("relight relative error under novel light = " << rel_err);
+  REQUIRE(rel_err < 0.05);  // relighting to an unseen light is faithful
 }

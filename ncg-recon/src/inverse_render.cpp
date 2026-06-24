@@ -33,6 +33,22 @@ Tensor shade_sh(const Tensor& albedo, const Tensor& sh, const Tensor& normals) {
   return albedo * E;
 }
 
+Tensor sh_directional_light(const Tensor& direction, const Tensor& color, float ambient) {
+  const auto d = (direction.to(at::kFloat).reshape({3}) /
+                  direction.to(at::kFloat).reshape({3}).norm().clamp_min(1e-8));
+  const auto x = d[0].item<float>(), y = d[1].item<float>(), z = d[2].item<float>();
+  // Raw real SH Y_lm(d) (lighting coefficients; the Lambertian A_l is folded into sh_basis).
+  std::vector<float> Y = {0.282095F,
+                          0.488603F * y, 0.488603F * z, 0.488603F * x,
+                          1.092548F * x * y, 1.092548F * y * z, 0.315392F * (3.0F * z * z - 1.0F),
+                          1.092548F * x * z, 0.546274F * (x * x - y * y)};
+  const auto opts = color.options().dtype(at::kFloat);
+  auto Yt = torch::tensor(Y, opts);                       // [9]
+  auto sh = color.to(at::kFloat).reshape({3, 1}) * Yt.unsqueeze(0);  // [3,9]
+  sh.select(1, 0) += ambient;                             // ambient on the l=0 term
+  return sh;
+}
+
 InverseRenderResult solve_inverse_render(const Tensor& obs, const Tensor& normals,
                                          const Tensor& weights, const InverseRenderConfig& cfg) {
   NCG_CHECK(obs.dim() == 3 && obs.size(2) == 3, "solve_inverse_render: obs must be [N,V,3]");
