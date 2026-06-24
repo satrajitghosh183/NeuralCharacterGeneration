@@ -15,6 +15,7 @@
 #include <ncg/nerf/nerf.hpp>
 #include <ncg/recon/appearance.hpp>
 #include <ncg/recon/init_from_body.hpp>
+#include <ncg/recon/inverse_render.hpp>
 #include <ncg/record/recorder.hpp>
 #include <ncg/rig/rig.hpp>
 #include <ncg/runtime/camera.hpp>
@@ -23,6 +24,7 @@
 
 #include <torch/torch.h>
 
+#include <cmath>
 #include <cstdio>
 #include <exception>
 #include <sstream>
@@ -413,6 +415,52 @@ int cmd_nerf(const ncg::app::Args& args) {
   return 0;
 }
 
+// Relighting demo: render the body under an orbiting directional light to show it relight
+// (uses the recovered/assigned albedo + SH shading from the inverse-rendering module).
+//   ncg_cli relight --smplx smplx.safetensors [--albedo 0.78 --frames 24 --run relight]
+int cmd_relight(const ncg::app::Args& args) {
+  NCG_CHECK(ncg::cuda_available(), "relight requires a CUDA device");
+  const auto device = at::Device(at::kCUDA, 0);
+  auto model = ncg::body::SmplxModel::load(args.require("smplx"), device);
+  NCG_CHECK(model.has_faces(),
+            "relight needs a SMPL-X model with faces — reconvert with tools/convert_smplx.py");
+  const auto verts = model.forward(model.neutral_params(1)).vertices.squeeze(0);  // [V,3]
+
+  ncg::mesh::TriMesh mesh;
+  mesh.vertices = verts.to(at::kCPU);
+  mesh.faces = model.faces().to(at::kCPU);
+  const auto normals = ncg::mesh::compute_vertex_normals(mesh).to(device);  // [V,3]
+  const auto albedo = torch::full({verts.size(0), 3}, args.get_float("albedo", 0.78F),
+                                  verts.options());
+
+  auto rec = ncg::record::Recorder::create("runs", args.get("run", "relight"));
+  const int frames = args.get_int("frames", 24);
+  const int width = args.get_int("width", 512);
+  const int height = args.get_int("height", 512);
+  const auto pvs = ncg::recon::per_vertex_scale(verts, args.get_float("scale_mult", 0.75F));
+  const auto cam = ncg::runtime::Camera::orbit(verts.mean(0), args.get_float("radius", 2.5F),
+                                               args.get_float("azimuth", 20.0F),
+                                               args.get_float("elevation", 10.0F), 50.0F, width,
+                                               height, device);
+  const float el = args.get_float("light_elevation", 25.0F) * static_cast<float>(M_PI) / 180.0F;
+  const auto white = torch::tensor({1.0F, 1.0F, 1.0F}, verts.options());
+  for (int i = 0; i < frames; ++i) {
+    const float az = 2.0F * static_cast<float>(M_PI) * static_cast<float>(i) / frames;
+    const auto dir = torch::tensor(
+        {std::cos(el) * std::cos(az), std::sin(el), std::cos(el) * std::sin(az)}, verts.options());
+    const auto light = ncg::recon::sh_directional_light(dir, white, args.get_float("ambient", 0.25F));
+    const auto colors = ncg::recon::shade_sh(albedo, light, normals).clamp(0.0, 1.0);
+    auto cloud = ncg::recon::gaussians_on_body(verts, 0.012F, colors, pvs);
+    cloud.to_(device);
+    const auto out = ncg::runtime::render_gaussians(cloud, cam);
+    char name[32];
+    std::snprintf(name, sizeof(name), "light_%03d", i);
+    rec.log_image("relight", name, out.image);
+  }
+  NCG_LOG_INFO("relight: {} frames (orbiting light) -> {}", frames, rec.dir().string());
+  return 0;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -420,7 +468,7 @@ int main(int argc, char** argv) {
   if (argc < 2) {
     std::fprintf(stderr,
                  "usage: ncg_cli "
-                 "<pipeline|render|turntable|select|fitimg|fit|fuse|nerf> [--flags]\n");
+                 "<pipeline|render|turntable|select|fitimg|fit|fuse|relight|nerf> [--flags]\n");
     return 2;
   }
   const std::string cmd = argv[1];
@@ -433,6 +481,7 @@ int main(int argc, char** argv) {
     if (cmd == "fitimg") return cmd_fitimg(args);
     if (cmd == "fit") return cmd_fit(args);
     if (cmd == "fuse") return cmd_fuse(args);
+    if (cmd == "relight") return cmd_relight(args);
     if (cmd == "nerf") return cmd_nerf(args);
     std::fprintf(stderr, "unknown command '%s'\n", cmd.c_str());
     return 2;

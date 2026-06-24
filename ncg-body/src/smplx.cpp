@@ -52,6 +52,9 @@ SmplxModel SmplxModel::load(const std::string& path, at::Device device) {
   m.J_regressor_ = need("J_regressor").to(at::kFloat);
   m.lbs_weights_ = need("lbs_weights").to(at::kFloat);
   m.parents_ = need("parents").to(at::kLong);
+  if (st.has("faces")) {
+    m.faces_ = st.view("faces").clone().to(device).to(at::kLong);  // [F,3] (optional)
+  }
 
   NCG_CHECK(m.v_template_.dim() == 2 && m.v_template_.size(1) == 3, "SmplxModel: bad v_template");
   NCG_CHECK(m.parents_.dim() == 1, "SmplxModel: bad parents");

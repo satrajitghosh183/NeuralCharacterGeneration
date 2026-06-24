@@ -41,6 +41,11 @@ public:
   Tensor lbs_weights() const { return lbs_weights_; }
   Tensor parents() const { return parents_; }
 
+  /// Mesh triangles [F,3] int64 (present iff the converted model included faces). Needed for
+  /// vertex normals (relighting) and mesh/glTF export. Undefined for the dummy UV-sphere model.
+  Tensor faces() const { return faces_; }
+  bool has_faces() const { return faces_.defined() && faces_.numel() > 0; }
+
   /// Zero shape + T-pose params (batch B) on this model's device — the slice default.
   SmplxParams neutral_params(int64_t batch = 1) const;
 
@@ -51,6 +56,7 @@ private:
   Tensor J_regressor_;  // [J,V]
   Tensor lbs_weights_;  // [V,J]
   Tensor parents_;      // [J] int64
+  Tensor faces_;        // [F,3] int64 (optional)
 };
 
 }  // namespace ncg::body

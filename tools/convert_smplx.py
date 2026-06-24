@@ -60,6 +60,8 @@ def main() -> int:
         "lbs_weights": lbs_weights,
         "parents": parents,
     }
+    if "f" in m:  # mesh triangles -> needed for vertex normals (relighting) + glTF export
+        tensors["faces"] = np.ascontiguousarray(np.asarray(m["f"]), dtype=np.int64)
     for k, v in tensors.items():
         print(f"  {k}: {v.shape} {v.dtype}")
     save_file(tensors, args.out, metadata={"__ncg__": f"SMPL-X from {args.inp}"})
