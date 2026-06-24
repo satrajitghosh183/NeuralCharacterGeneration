@@ -118,6 +118,26 @@ per-channel gain** $a\!\to\!\kappa a,\ L\!\to\!\kappa^{-1}L$, removable by one s
 > Idealized so far (synthetic Lambertian normals); the real-geometry + error-vs-N sweep and the
 > real-photo relighting render are the next experiments.
 
+> **Benchmark on real SMPL-X geometry (V=10,475, `ncg_cli benchmark`, 2026-06-24):**
+> | #photos N | albedo err | relight err (novel light) |
+> |---|---|---|
+> | 1 | 0.096 | 0.227 |
+> | 3 | 0.058 | 0.132 |
+> | 5 | 0.049 | 0.097 |
+> | 8 | 0.035 | 0.073 |
+> | 12 | 0.029 | 0.052 |
+>
+> | corruption | robust (C2) | naive |
+> |---|---|---|
+> | 0% | 0.023 | 0.015 |
+> | 20% | 0.024 | 0.056 |
+> | 35% | 0.028 | 0.082 |
+> | 50% | 0.029 | 0.106 |
+>
+> Monotone improvement with lighting diversity (C1), and robustness stays ~flat while naive
+> averaging degrades ~7× under corruption (C2). The small clean-data cost of robustness (0% row)
+> is expected and motivates the auto-scaled kernel / "clean album ⇒ less down-weighting".
+
 Honest caveats: this is a DOF-counting + cross-illumination argument, not yet a theorem under a
 formal genericity assumption; degenerate albums (all photos same light) collapse to the
 single-image case — detectable from the conditioning of the L-step normal equations and reportable
