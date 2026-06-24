@@ -67,12 +67,19 @@ relights it under novel lights (see `server_artifacts/rock_delit.png`, relit fra
 regions (face/skin) delight cleanly; inconsistent regions (different outfits across the album) show
 the expected robustness behaviour — the casual-input failure mode the method is designed for.
 
+## Leg #3 — quality/coverage-aware view selection
+
+`select_views` (submodular coverage maximization) selects, from a candidate pool, the views that
+maximize surface coverage — provably picking the diverse views and rejecting redundant/junk
+uploads. Unit-tested: from 12 candidates (4 diverse bands + 4 redundant + 4 junk) it selects the 4
+diverse views for full coverage and never a junk view. Greedy is within (1−1/e) of optimal.
+
 ## Test coverage
 
-`ctest --preset h100`: **47 tests, all pass** (2 skip by design — real-data SMPL-X golden and the
+`ctest --preset h100`: **49 tests, all pass** (2 skip by design — real-data SMPL-X golden and the
 obsolete per-layer NLF golden). Includes: inverse-render C1/C2/relight/C3, glTF static+skinned
-validity, appearance sampling/visibility/fusion, adaptive scale, SMPL-X LBS invariants, custom
-CUDA-kernel vs LibTorch parity, NeRF, fit, golden harness self-test.
+validity, appearance sampling/visibility/fusion, adaptive scale, view selection, SMPL-X LBS
+invariants, custom CUDA-kernel vs LibTorch parity, NeRF, fit, golden harness self-test.
 
 ## Reproduce
 
