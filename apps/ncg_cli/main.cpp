@@ -24,6 +24,7 @@
 
 #include <torch/torch.h>
 
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <exception>
@@ -632,68 +633,136 @@ int cmd_benchmark(const ncg::app::Args& args) {
   const auto normals = ncg::mesh::compute_vertex_normals(mesh).to(device);  // [V,3]
   const int64_t V = verts.size(0);
   const auto opts = verts.options();
-  torch::manual_seed(args.get_int("seed", 0));
-  const auto a_true = torch::rand({V, 3}, opts) * 0.7F + 0.2F;
-  const auto basis = ncg::recon::sh_basis(normals);  // [V,9]
-
-  auto lights = [&](int N) {
-    auto L = torch::randn({N, 3, 9}, opts) * 0.25F;
-    L.select(2, 0) += 1.2F;
-    return L;
-  };
-  auto observe = [&](const torch::Tensor& L) {
-    return (a_true.unsqueeze(0) * torch::einsum("nck,vk->nvc", {L, basis})).clamp_min(0.0);
-  };
-  auto serr = [&](const torch::Tensor& a) {
-    const auto s = (a * a_true).sum(0) / (a * a).sum(0).clamp_min(1e-8);
-    return (a_true - a * s).abs().mean().item<double>();
-  };
+  const int seeds = args.get_int("seeds", 5);
+  const auto basis = ncg::recon::sh_basis(normals);  // [V,9] (geometry only)
   const auto Lnovel = ncg::recon::sh_directional_light(torch::tensor({0.4F, -0.7F, 0.6F}, opts),
                                                        torch::ones({3}, opts), 0.25F);
-  auto relight_err = [&](const torch::Tensor& a) {
-    const auto a2 = a * ((a * a_true).sum(0) / (a * a).sum(0).clamp_min(1e-8));
-    const auto gt = ncg::recon::shade_sh(a_true, Lnovel, normals);
-    return (gt - ncg::recon::shade_sh(a2, Lnovel, normals)).norm().item<double>() /
-           gt.norm().clamp_min(1e-8).item<double>();
+  using clk = std::chrono::high_resolution_clock;
+  auto ms_since = [](clk::time_point t) {
+    return std::chrono::duration<double, std::milli>(clk::now() - t).count();
   };
-
+  auto stat = [](const std::vector<double>& xs) {
+    double m = 0.0;
+    for (double x : xs) m += x;
+    m /= static_cast<double>(xs.size());
+    double v = 0.0;
+    for (double x : xs) v += (x - m) * (x - m);
+    v /= static_cast<double>(xs.size() > 1 ? xs.size() - 1 : 1);
+    return std::make_pair(m, std::sqrt(v));
+  };
   auto rec = ncg::record::Recorder::create("runs", args.get("run", "benchmark"));
-  const auto nv_of = [&](int N) { return normals.unsqueeze(0).expand({N, V, 3}).contiguous(); };
+  NCG_LOG_INFO("=== Benchmark: V={} real geometry, {} seeds (mean ± std) ===", V, seeds);
 
-  NCG_LOG_INFO("=== C1: albedo & relight error vs #photos (V={} real geometry) ===", V);
+  // C1 — albedo & relight error + solve time vs #photos.
+  NCG_LOG_INFO("--- C1: albedo / relight error vs #photos ---");
   for (int N : {1, 2, 3, 5, 8, 12}) {
-    const auto obs = observe(lights(N));
-    ncg::recon::InverseRenderConfig cfg;
-    cfg.iterations = 60;
-    const auto r = ncg::recon::solve_inverse_render(obs, nv_of(N), torch::ones({N, V}, opts), cfg);
-    const double e = serr(r.albedo);
-    const double re = relight_err(r.albedo);
-    NCG_LOG_INFO("  N={:2d}  albedo_err={:.4f}  relight_err={:.4f}", N, e, re);
-    rec.log_scalar("bench_vs_N", "N", static_cast<double>(N));
-    rec.log_scalar("bench_vs_N", "albedo_err", e);
-    rec.log_scalar("bench_vs_N", "relight_err", re);
+    std::vector<double> ae;
+    std::vector<double> re;
+    std::vector<double> ms;
+    for (int s = 0; s < seeds; ++s) {
+      torch::manual_seed(1000 + s);
+      const auto a_true = torch::rand({V, 3}, opts) * 0.7F + 0.2F;
+      auto L = torch::randn({N, 3, 9}, opts) * 0.25F;
+      L.select(2, 0) += 1.2F;
+      const auto obs = (a_true.unsqueeze(0) * torch::einsum("nck,vk->nvc", {L, basis})).clamp_min(0.0);
+      const auto nv = normals.unsqueeze(0).expand({N, V, 3}).contiguous();
+      ncg::recon::InverseRenderConfig cfg;
+      cfg.iterations = 60;
+      const auto t0 = clk::now();
+      const auto r = ncg::recon::solve_inverse_render(obs, nv, torch::ones({N, V}, opts), cfg);
+      const double sync = r.albedo.sum().item<double>();  // force GPU completion
+      ms.push_back(ms_since(t0));
+      (void)sync;
+      const auto sc = (r.albedo * a_true).sum(0) / (r.albedo * r.albedo).sum(0).clamp_min(1e-8);
+      ae.push_back((a_true - r.albedo * sc).abs().mean().item<double>());
+      const auto gt = ncg::recon::shade_sh(a_true, Lnovel, normals);
+      re.push_back((gt - ncg::recon::shade_sh(r.albedo * sc, Lnovel, normals)).norm().item<double>() /
+                   gt.norm().clamp_min(1e-8).item<double>());
+    }
+    const auto [am, as] = stat(ae);
+    const auto [rm, rs] = stat(re);
+    const auto [tm, ts] = stat(ms);
+    NCG_LOG_INFO("  N={:2d}  albedo={:.4f}±{:.4f}  relight={:.4f}±{:.4f}  solve={:6.1f}±{:.1f}ms", N,
+                 am, as, rm, rs, tm, ts);
   }
 
-  NCG_LOG_INFO("=== C2: albedo error vs corruption, robust vs plain (N=8) ===");
-  const int N = 8;
-  const auto clean = observe(lights(N));
-  const auto nv = nv_of(N);
-  const auto w = torch::ones({N, V}, opts);
+  // C2 — robust vs plain albedo error vs corruption rate (N=8).
+  NCG_LOG_INFO("--- C2: albedo error vs corruption (robust vs plain), N=8 ---");
+  const int Nc = 8;
   for (double rho : {0.0, 0.1, 0.2, 0.35, 0.5}) {
-    const auto corrupt = torch::rand({N, V}, opts) < rho;
-    const auto obs = torch::where(corrupt.unsqueeze(-1), torch::rand({N, V, 3}, opts), clean);
-    ncg::recon::InverseRenderConfig rc;
-    rc.iterations = 80;
-    rc.robust = true;
-    ncg::recon::InverseRenderConfig pc = rc;
-    pc.robust = false;
-    const double er = serr(ncg::recon::solve_inverse_render(obs, nv, w, rc).albedo);
-    const double ep = serr(ncg::recon::solve_inverse_render(obs, nv, w, pc).albedo);
-    NCG_LOG_INFO("  corrupt={:3.0f}%  robust={:.4f}  plain={:.4f}", rho * 100, er, ep);
-    rec.log_scalar("bench_robust", "corrupt", rho);
-    rec.log_scalar("bench_robust", "robust", er);
-    rec.log_scalar("bench_robust", "plain", ep);
+    std::vector<double> er;
+    std::vector<double> ep;
+    for (int s = 0; s < seeds; ++s) {
+      torch::manual_seed(2000 + s);
+      const auto a_true = torch::rand({V, 3}, opts) * 0.7F + 0.2F;
+      auto L = torch::randn({Nc, 3, 9}, opts) * 0.25F;
+      L.select(2, 0) += 1.2F;
+      const auto clean = (a_true.unsqueeze(0) * torch::einsum("nck,vk->nvc", {L, basis})).clamp_min(0.0);
+      const auto corrupt = torch::rand({Nc, V}, opts) < rho;
+      const auto obs = torch::where(corrupt.unsqueeze(-1), torch::rand({Nc, V, 3}, opts), clean);
+      const auto nv = normals.unsqueeze(0).expand({Nc, V, 3}).contiguous();
+      const auto w = torch::ones({Nc, V}, opts);
+      ncg::recon::InverseRenderConfig rc;
+      rc.iterations = 80;
+      rc.robust = true;
+      ncg::recon::InverseRenderConfig pc = rc;
+      pc.robust = false;
+      auto serr = [&](const torch::Tensor& a) {
+        const auto sc = (a * a_true).sum(0) / (a * a).sum(0).clamp_min(1e-8);
+        return (a_true - a * sc).abs().mean().item<double>();
+      };
+      er.push_back(serr(ncg::recon::solve_inverse_render(obs, nv, w, rc).albedo));
+      ep.push_back(serr(ncg::recon::solve_inverse_render(obs, nv, w, pc).albedo));
+    }
+    const auto [rm, rs] = stat(er);
+    const auto [pm, ps] = stat(ep);
+    NCG_LOG_INFO("  corrupt={:3.0f}%  robust={:.4f}±{:.4f}  plain={:.4f}±{:.4f}", rho * 100, rm, rs,
+                 pm, ps);
   }
+
+  // C3 — animate/relight commutation error + transport timing.
+  {
+    torch::manual_seed(7);
+    auto nn = torch::randn({V, 3}, opts);
+    nn = nn / nn.norm(2, -1, true);
+    const auto a = torch::rand({V, 3}, opts) * 0.6F + 0.3F;
+    const float th = 0.7F;
+    const auto R = torch::tensor({{std::cos(th), 0.0F, std::sin(th)},
+                                  {0.0F, 1.0F, 0.0F},
+                                  {-std::sin(th), 0.0F, std::cos(th)}},
+                                 opts);
+    const auto d = torch::tensor({0.3F, -0.6F, 0.7F}, opts);
+    const auto t0 = clk::now();
+    const auto nposed = ncg::recon::transport_normals(nn, torch::ones({V, 1}, opts), R.unsqueeze(0));
+    const double tms = ms_since(t0) + 0.0 * nposed.sum().item<double>();
+    const auto cA = ncg::recon::shade_sh(a, ncg::recon::sh_directional_light(d, torch::ones({3}, opts), 0.2F), nposed);
+    const auto cB = ncg::recon::shade_sh(
+        a, ncg::recon::sh_directional_light(torch::matmul(R.t(), d), torch::ones({3}, opts), 0.2F), nn);
+    NCG_LOG_INFO("--- C3: animate∘relight vs relight∘animate ---");
+    NCG_LOG_INFO("  max commutation error = {:.2e}  (transport {:.2f}ms / {} verts)",
+                 (cA - cB).abs().max().item<double>(), tms, V);
+  }
+
+  // Render throughput on the real body (forward splat).
+  {
+    auto cloud = ncg::recon::gaussians_on_body(verts, 0.012F, torch::full({V, 3}, 0.7F, opts),
+                                               ncg::recon::per_vertex_scale(verts, 0.75F));
+    cloud.to_(device);
+    const auto cam = ncg::runtime::Camera::orbit(verts.mean(0), 2.5F, 20.0F, 10.0F, 50.0F, 512, 512,
+                                                 device);
+    (void)ncg::runtime::render_gaussians(cloud, cam).image.sum().item<double>();  // warm up
+    std::vector<double> fr;
+    for (int i = 0; i < 30; ++i) {
+      const auto t0 = clk::now();
+      const auto img = ncg::runtime::render_gaussians(cloud, cam).image;
+      (void)img.sum().item<double>();
+      fr.push_back(ms_since(t0));
+    }
+    const auto [fm, fs] = stat(fr);
+    NCG_LOG_INFO("--- render throughput (512x512, {} gaussians) ---", V);
+    NCG_LOG_INFO("  forward splat = {:.2f}±{:.2f}ms  ({:.0f} FPS)", fm, fs, 1000.0 / fm);
+  }
+
   NCG_LOG_INFO("benchmark complete -> {}", rec.dir().string());
   return 0;
 }
