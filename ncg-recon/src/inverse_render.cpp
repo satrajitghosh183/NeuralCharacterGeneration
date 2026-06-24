@@ -49,6 +49,17 @@ Tensor sh_directional_light(const Tensor& direction, const Tensor& color, float 
   return sh;
 }
 
+Tensor transport_normals(const Tensor& normals_can, const Tensor& skin_weights,
+                         const Tensor& bone_rotations) {
+  NCG_CHECK(normals_can.dim() == 2 && normals_can.size(1) == 3, "transport_normals: normals [V,3]");
+  NCG_CHECK(bone_rotations.dim() == 3 && bone_rotations.size(1) == 3 && bone_rotations.size(2) == 3,
+            "transport_normals: bone_rotations [J,3,3]");
+  // Rn[v,j,:] = R_j @ n_can[v]; then blend over bones by skin weights.
+  const auto rn = torch::einsum("jab,vb->vja", {bone_rotations, normals_can});  // [V,J,3]
+  const auto blended = torch::einsum("vj,vja->va", {skin_weights, rn});          // [V,3]
+  return blended / blended.norm(2, -1, /*keepdim=*/true).clamp_min(1e-8);
+}
+
 InverseRenderResult solve_inverse_render(const Tensor& obs, const Tensor& normals,
                                          const Tensor& weights, const InverseRenderConfig& cfg) {
   NCG_CHECK(obs.dim() == 3 && obs.size(2) == 3, "solve_inverse_render: obs must be [N,V,3]");

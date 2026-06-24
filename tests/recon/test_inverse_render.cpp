@@ -11,6 +11,7 @@ using ncg::recon::shade_sh;
 using ncg::recon::sh_basis;
 using ncg::recon::sh_directional_light;
 using ncg::recon::solve_inverse_render;
+using ncg::recon::transport_normals;
 
 // Ambient-only SH lighting => uniform irradiance over all normals (sanity for the basis/shading).
 TEST_CASE("SH ambient lighting shades uniformly", "[recon][inverse]") {
@@ -146,4 +147,35 @@ TEST_CASE("recovered albedo relights correctly under a novel light", "[recon][in
   // ~7% relighting error to an unseen light from casual input, no light stage — it tracks the
   // albedo-recovery error and tightens with more views / iterations.
   REQUIRE(rel_err < 0.08);
+}
+
+// C3 (docs/method.md §8): normals transported by the (blended) bone rotation make relighting and
+// animation commute. (1) a single full-weight bone rotates normals exactly by R; (2) shading the
+// posed normals under a world light equals shading the canonical normals under the light pulled
+// back by R — so posing then relighting == relighting then posing.
+TEST_CASE("animate and relight commute via normal transport (C3)", "[recon][inverse]") {
+  torch::manual_seed(3);
+  const int V = 200;
+  auto n = torch::randn({V, 3});
+  n = n / n.norm(2, -1, true);
+  const auto albedo = torch::rand({V, 3}) * 0.6F + 0.3F;
+
+  const float t = 0.7F;  // 40deg about Y
+  const auto R = torch::tensor({{std::cos(t), 0.0F, std::sin(t)},
+                                {0.0F, 1.0F, 0.0F},
+                                {-std::sin(t), 0.0F, std::cos(t)}});
+  const auto W = torch::ones({V, 1});      // single bone, full weight
+  const auto bones = R.unsqueeze(0);       // [1,3,3]
+
+  const auto n_posed = transport_normals(n, W, bones);
+  REQUIRE(torch::allclose(n_posed, torch::matmul(n, R.t()), 1e-4, 1e-4));  // == R n
+
+  const auto d = torch::tensor({0.3F, -0.6F, 0.7F});
+  const auto white = torch::ones({3});
+  // posed body, world light d  vs  canonical body, light pulled back by R (== R^T d)
+  const auto colorsA = shade_sh(albedo, sh_directional_light(d, white, 0.2F), n_posed);
+  const auto colorsB = shade_sh(albedo, sh_directional_light(torch::matmul(R.t(), d), white, 0.2F), n);
+  const double err = (colorsA - colorsB).abs().max().item<double>();
+  INFO("max |animate∘relight − relight∘animate| = " << err);
+  REQUIRE(torch::allclose(colorsA, colorsB, 1e-3, 1e-3));
 }

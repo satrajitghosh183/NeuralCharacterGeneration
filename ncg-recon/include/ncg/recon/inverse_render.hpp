@@ -18,6 +18,15 @@ Tensor shade_sh(const Tensor& albedo, const Tensor& sh, const Tensor& normals);
 /// inverse-rendering decomposition): shade_sh(albedo, sh_directional_light(d,c,a), normals).
 Tensor sh_directional_light(const Tensor& direction, const Tensor& color, float ambient = 0.2F);
 
+/// Transport canonical surface normals into a posed frame under linear-blend skinning:
+///   n_out[v] = normalize( sum_j skin_weights[v,j] * bone_rotations[j] @ normals_can[v] ).
+/// This is the C3 contribution (docs/method.md §8): the shading frame must rotate with the bones,
+/// or relighting becomes wrong once the avatar is posed — the reason naive splat avatars can't be
+/// animated AND relit. With correctly transported normals, relight and animate commute.
+///   normals_can [V,3], skin_weights [V,J], bone_rotations [J,3,3].
+Tensor transport_normals(const Tensor& normals_can, const Tensor& skin_weights,
+                         const Tensor& bone_rotations);
+
 struct InverseRenderConfig {
   int iterations = 40;       // L/A alternations
   float albedo_ridge = 1e-4F;

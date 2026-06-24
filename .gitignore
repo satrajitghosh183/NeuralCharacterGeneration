@@ -32,3 +32,4 @@ out.png
 
 # Experiment run outputs (ncg-record)
 /runs/
+server_artifacts/
