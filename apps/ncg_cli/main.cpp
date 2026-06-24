@@ -520,6 +520,102 @@ int cmd_export(const ncg::app::Args& args) {
   return 0;
 }
 
+// Real multi-photo delighting + relighting (the method on real photos): several casual photos
+// of one person -> recover a single canonical albedo (per-photo SH lighting solved away, robust
+// to inconsistency) -> render delit albedo + relit under novel lights.
+//   ncg_cli delight --images a.jpg,b.jpg,c.jpg --smplx smplx.safetensors --weights nlf.torchscript --out delit.png
+int cmd_delight(const ncg::app::Args& args) {
+  NCG_CHECK(ncg::cuda_available(), "delight requires a CUDA device");
+  const auto device = at::Device(at::kCUDA, 0);
+  const auto paths = split_csv(args.require("images"));
+  NCG_CHECK(!paths.empty(), "delight: --images is empty");
+  auto nlf = ncg::body::Nlf::load(args.require("weights"), device);
+  auto model = ncg::body::SmplxModel::load(args.require("smplx"), device);
+  NCG_CHECK(model.has_faces(), "delight needs a SMPL-X model with faces");
+  const auto faces_cpu = model.faces().to(at::kCPU);
+  const int64_t V = model.num_verts();
+
+  std::vector<torch::Tensor> obs_l;
+  std::vector<torch::Tensor> nrm_l;
+  std::vector<torch::Tensor> w_l;
+  torch::Tensor betas0;
+  for (size_t i = 0; i < paths.size(); ++i) {
+    const auto image = ncg::io::load_image(paths[i], 3);
+    ncg::body::NlfPrediction pred;
+    try {
+      pred = nlf.detect(image);
+    } catch (const std::exception& e) {
+      NCG_LOG_WARN("delight: skipping '{}' ({})", paths[i], e.what());
+      continue;
+    }
+    if (pred.vertices2d.size(0) != V) {
+      NCG_LOG_WARN("delight: skipping '{}' (verts {} != {})", paths[i], pred.vertices2d.size(0), V);
+      continue;
+    }
+    if (!betas0.defined()) betas0 = pred.params.betas.to(device);
+    const auto v2d = pred.vertices2d.to(device);
+    ncg::mesh::TriMesh m;  // per-photo posed normals from NLF's camera-space mesh
+    m.vertices = pred.vertices3d.to(at::kCPU);
+    m.faces = faces_cpu;
+    nrm_l.push_back(ncg::mesh::compute_vertex_normals(m).to(device));
+    obs_l.push_back(ncg::recon::sample_vertex_colors(image.to(device), v2d).clamp(0.0, 1.0));
+    w_l.push_back(ncg::recon::vertex_visibility(v2d, pred.vertices3d.select(1, 2).to(device),
+                                                static_cast<int64_t>(image.size(1)),
+                                                static_cast<int64_t>(image.size(2))));
+    NCG_LOG_INFO("delight: view {}/{} '{}'", i + 1, paths.size(), paths[i]);
+  }
+  NCG_CHECK(!obs_l.empty(), "delight: no usable views");
+  const int N = static_cast<int>(obs_l.size());
+
+  ncg::recon::InverseRenderConfig cfg;
+  cfg.iterations = args.get_int("iters", 80);
+  cfg.robust = (N >= 2);
+  const auto res = ncg::recon::solve_inverse_render(torch::stack(obs_l, 0), torch::stack(nrm_l, 0),
+                                                    torch::stack(w_l, 0), cfg);
+  NCG_LOG_INFO("delight: recovered canonical albedo from {} view(s)", N);
+
+  // Canonical rest-pose body for rendering the recovered albedo.
+  ncg::body::SmplxParams p;
+  p.betas = betas0;
+  p.pose_aa = torch::zeros({1, model.num_joints(), 3}, betas0.options());
+  p.transl = torch::zeros({1, 3}, betas0.options());
+  const auto verts = model.forward(p).vertices.squeeze(0);
+  ncg::mesh::TriMesh cm;
+  cm.vertices = verts.to(at::kCPU);
+  cm.faces = faces_cpu;
+  const auto cnrm = ncg::mesh::compute_vertex_normals(cm).to(device);
+  const auto pvs = ncg::recon::per_vertex_scale(verts, 0.75F);
+  const auto cam = ncg::runtime::Camera::orbit(verts.mean(0), 2.5F, 20.0F, 10.0F, 50.0F, 512, 512,
+                                               device);
+  auto rec = ncg::record::Recorder::create("runs", args.get("run", "delight"));
+
+  // (a) recovered flat albedo (delit).
+  auto albedo_cloud = ncg::recon::gaussians_on_body(verts, 0.012F, res.albedo.clamp(0.0, 1.0), pvs);
+  albedo_cloud.to_(device);
+  const auto albedo_img = ncg::runtime::render_gaussians(albedo_cloud, cam).image;
+  rec.log_image("delight", "albedo", albedo_img);
+  ncg::io::save_png(args.get("out", "delit_albedo.png"), albedo_img);
+
+  // (b) relit under an orbiting novel light.
+  const auto white = torch::ones({3}, verts.options());
+  const float el = 25.0F * static_cast<float>(M_PI) / 180.0F;
+  for (int k = 0; k < 8; ++k) {
+    const float az = 2.0F * static_cast<float>(M_PI) * static_cast<float>(k) / 8.0F;
+    const auto dir = torch::tensor(
+        {std::cos(el) * std::cos(az), std::sin(el), std::cos(el) * std::sin(az)}, verts.options());
+    const auto L = ncg::recon::sh_directional_light(dir, white, 0.25F);
+    const auto colors = ncg::recon::shade_sh(res.albedo, L, cnrm).clamp(0.0, 1.0);
+    auto cloud = ncg::recon::gaussians_on_body(verts, 0.012F, colors, pvs);
+    cloud.to_(device);
+    char nm[32];
+    std::snprintf(nm, sizeof(nm), "relit_%03d", k);
+    rec.log_image("delight", nm, ncg::runtime::render_gaussians(cloud, cam).image);
+  }
+  NCG_LOG_INFO("delight done -> {} + relit frames in {}", args.get("out", "delit_albedo.png"),
+               rec.dir().string());
+  return 0;
+}
+
 // Benchmark the inverse-rendering method on real SMPL-X geometry (the paper's figures):
 // albedo error vs #photos (C1) and vs corruption rate, robust vs non-robust (C2), + relighting
 // error under a novel light. Synthetic ground-truth albedo so error is measurable.
@@ -626,6 +722,7 @@ int main(int argc, char** argv) {
     if (cmd == "relight") return cmd_relight(args);
     if (cmd == "export") return cmd_export(args);
     if (cmd == "benchmark") return cmd_benchmark(args);
+    if (cmd == "delight") return cmd_delight(args);
     if (cmd == "nerf") return cmd_nerf(args);
     std::fprintf(stderr, "unknown command '%s'\n", cmd.c_str());
     return 2;
