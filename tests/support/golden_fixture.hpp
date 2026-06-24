@@ -50,19 +50,23 @@ inline GoldenManifest load_manifest(const std::string& model) {
 
   GoldenManifest m;
   m.model = j.value("model", model);
-  m.weights = j.at("weights").get<std::string>();
-  m.input = j.at("input").get<std::string>();
+  // Tolerant: a per-layer golden has weights/input/stages; other golden dumps (e.g. the
+  // TorchScript NLF I/O dump) won't — callers SKIP when these are empty.
+  m.weights = j.value("weights", std::string());
+  m.input = j.value("input", std::string());
   if (j.contains("tolerance")) {
     m.rtol = j["tolerance"].value("rtol", m.rtol);
     m.atol = j["tolerance"].value("atol", m.atol);
   }
-  for (const auto& s : j.at("stages")) {
-    GoldenStage st;
-    st.name = s.at("name").get<std::string>();
-    st.ref_file = s.at("ref").get<std::string>();
-    st.rtol = s.value("rtol", m.rtol);
-    st.atol = s.value("atol", m.atol);
-    m.stages.push_back(st);
+  if (j.contains("stages")) {
+    for (const auto& s : j.at("stages")) {
+      GoldenStage st;
+      st.name = s.at("name").get<std::string>();
+      st.ref_file = s.at("ref").get<std::string>();
+      st.rtol = s.value("rtol", m.rtol);
+      st.atol = s.value("atol", m.atol);
+      m.stages.push_back(st);
+    }
   }
   return m;
 }
