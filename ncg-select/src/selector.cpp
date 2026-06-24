@@ -3,9 +3,42 @@
 #include <ncg/core/error.hpp>
 #include <ncg/io/image.hpp>
 
+#include <torch/torch.h>
+
 #include <algorithm>
+#include <cstdint>
+#include <vector>
 
 namespace ncg::select {
+
+std::vector<int64_t> select_views(const Tensor& coverage, int64_t k) {
+  NCG_CHECK(coverage.dim() == 2, "select_views: coverage must be [M,V]");
+  const auto cov = coverage.to(at::kCPU, at::kFloat).clamp_min(0.0).contiguous();
+  const int64_t M = cov.size(0);
+  k = std::min(k, M);
+  auto acc = torch::zeros({cov.size(1)}, cov.options());  // summed coverage of selected views
+  double base = 0.0;                                      // sum_v log(1 + acc[v]), 0 initially
+  std::vector<int64_t> chosen;
+  std::vector<char> used(static_cast<size_t>(M), 0);
+  for (int64_t step = 0; step < k; ++step) {
+    int64_t best = -1;
+    double best_gain = 0.0;
+    for (int64_t i = 0; i < M; ++i) {
+      if (used[static_cast<size_t>(i)]) continue;
+      const double gain = torch::log1p(acc + cov[i]).sum().item<double>() - base;
+      if (best < 0 || gain > best_gain) {
+        best_gain = gain;
+        best = i;
+      }
+    }
+    if (best < 0) break;
+    used[static_cast<size_t>(best)] = 1;
+    chosen.push_back(best);
+    acc = acc + cov[best];
+    base += best_gain;
+  }
+  return chosen;
+}
 
 double sharpness_score(const Tensor& image_chw) {
   NCG_CHECK(image_chw.dim() == 3, "sharpness_score: expected CHW image");
