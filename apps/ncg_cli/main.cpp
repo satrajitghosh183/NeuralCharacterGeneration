@@ -472,6 +472,7 @@ int cmd_export(const ncg::app::Args& args) {
 
   torch::Tensor verts;
   torch::Tensor colors;
+  torch::Tensor joints;
   if (want_color) {
     NCG_CHECK(ncg::cuda_available(), "export with --image needs a CUDA device (NLF)");
     auto nlf = ncg::body::Nlf::load(args.require("weights"), device);
@@ -482,7 +483,9 @@ int cmd_export(const ncg::app::Args& args) {
     p.pose_aa = pred.params.pose_aa.to(device);
     p.transl = pred.params.transl.to(device);
     p.pose_aa.zero_();  // clean canonical rest pose
-    verts = model.forward(p).vertices.squeeze(0);
+    const auto body = model.forward(p);
+    verts = body.vertices.squeeze(0);
+    joints = body.joints.squeeze(0);
     if (pred.vertices2d.size(0) == verts.size(0)) {
       const auto v2d = pred.vertices2d.to(device);
       colors = ncg::recon::sample_vertex_colors(image.to(device), v2d).clamp(0.0, 1.0);
@@ -492,7 +495,9 @@ int cmd_export(const ncg::app::Args& args) {
       colors = torch::where(vis.unsqueeze(1) > 0, colors, torch::full_like(colors, 0.6F));
     }
   } else {
-    verts = model.forward(model.neutral_params(1)).vertices.squeeze(0);
+    const auto body = model.forward(model.neutral_params(1));
+    verts = body.vertices.squeeze(0);
+    joints = body.joints.squeeze(0);
     colors = torch::full({verts.size(0), 3}, 0.75F, verts.options());
   }
 
@@ -500,10 +505,100 @@ int cmd_export(const ncg::app::Args& args) {
   mesh.vertices = verts.to(at::kCPU);
   mesh.faces = model.faces().to(at::kCPU);
   const auto normals = ncg::mesh::compute_vertex_normals(mesh);
-  ncg::mesh::write_glb(mesh.vertices, mesh.faces, normals, colors.to(at::kCPU),
-                       args.get("out", "avatar.glb"));
-  NCG_LOG_INFO("export -> {} ({} verts, {} faces)", args.get("out", "avatar.glb"), verts.size(0),
-               mesh.faces.size(0));
+  const auto out_path = args.get("out", "avatar.glb");
+
+  if (args.get_int("rigged", 1) != 0) {  // default: export a rigged (animatable) character
+    ncg::mesh::write_glb_skinned(mesh.vertices, mesh.faces, normals, colors.to(at::kCPU),
+                                 joints.to(at::kCPU), model.parents().to(at::kCPU),
+                                 model.lbs_weights().to(at::kCPU), out_path);
+    NCG_LOG_INFO("export (rigged) -> {} ({} verts, {} faces, {} joints)", out_path, verts.size(0),
+                 mesh.faces.size(0), model.num_joints());
+  } else {
+    ncg::mesh::write_glb(mesh.vertices, mesh.faces, normals, colors.to(at::kCPU), out_path);
+    NCG_LOG_INFO("export -> {} ({} verts, {} faces)", out_path, verts.size(0), mesh.faces.size(0));
+  }
+  return 0;
+}
+
+// Benchmark the inverse-rendering method on real SMPL-X geometry (the paper's figures):
+// albedo error vs #photos (C1) and vs corruption rate, robust vs non-robust (C2), + relighting
+// error under a novel light. Synthetic ground-truth albedo so error is measurable.
+//   ncg_cli benchmark --smplx smplx.safetensors [--seed 0 --run benchmark]
+int cmd_benchmark(const ncg::app::Args& args) {
+  NCG_CHECK(ncg::cuda_available(), "benchmark requires a CUDA device");
+  const auto device = at::Device(at::kCUDA, 0);
+  auto model = ncg::body::SmplxModel::load(args.require("smplx"), device);
+  NCG_CHECK(model.has_faces(), "benchmark needs a SMPL-X model with faces");
+  const auto verts = model.forward(model.neutral_params(1)).vertices.squeeze(0);
+  ncg::mesh::TriMesh mesh;
+  mesh.vertices = verts.to(at::kCPU);
+  mesh.faces = model.faces().to(at::kCPU);
+  const auto normals = ncg::mesh::compute_vertex_normals(mesh).to(device);  // [V,3]
+  const int64_t V = verts.size(0);
+  const auto opts = verts.options();
+  torch::manual_seed(args.get_int("seed", 0));
+  const auto a_true = torch::rand({V, 3}, opts) * 0.7F + 0.2F;
+  const auto basis = ncg::recon::sh_basis(normals);  // [V,9]
+
+  auto lights = [&](int N) {
+    auto L = torch::randn({N, 3, 9}, opts) * 0.25F;
+    L.select(2, 0) += 1.2F;
+    return L;
+  };
+  auto observe = [&](const torch::Tensor& L) {
+    return (a_true.unsqueeze(0) * torch::einsum("nck,vk->nvc", {L, basis})).clamp_min(0.0);
+  };
+  auto serr = [&](const torch::Tensor& a) {
+    const auto s = (a * a_true).sum(0) / (a * a).sum(0).clamp_min(1e-8);
+    return (a_true - a * s).abs().mean().item<double>();
+  };
+  const auto Lnovel = ncg::recon::sh_directional_light(torch::tensor({0.4F, -0.7F, 0.6F}, opts),
+                                                       torch::ones({3}, opts), 0.25F);
+  auto relight_err = [&](const torch::Tensor& a) {
+    const auto a2 = a * ((a * a_true).sum(0) / (a * a).sum(0).clamp_min(1e-8));
+    const auto gt = ncg::recon::shade_sh(a_true, Lnovel, normals);
+    return (gt - ncg::recon::shade_sh(a2, Lnovel, normals)).norm().item<double>() /
+           gt.norm().clamp_min(1e-8).item<double>();
+  };
+
+  auto rec = ncg::record::Recorder::create("runs", args.get("run", "benchmark"));
+  const auto nv_of = [&](int N) { return normals.unsqueeze(0).expand({N, V, 3}).contiguous(); };
+
+  NCG_LOG_INFO("=== C1: albedo & relight error vs #photos (V={} real geometry) ===", V);
+  for (int N : {1, 2, 3, 5, 8, 12}) {
+    const auto obs = observe(lights(N));
+    ncg::recon::InverseRenderConfig cfg;
+    cfg.iterations = 60;
+    const auto r = ncg::recon::solve_inverse_render(obs, nv_of(N), torch::ones({N, V}, opts), cfg);
+    const double e = serr(r.albedo);
+    const double re = relight_err(r.albedo);
+    NCG_LOG_INFO("  N={:2d}  albedo_err={:.4f}  relight_err={:.4f}", N, e, re);
+    rec.log_scalar("bench_vs_N", "N", static_cast<double>(N));
+    rec.log_scalar("bench_vs_N", "albedo_err", e);
+    rec.log_scalar("bench_vs_N", "relight_err", re);
+  }
+
+  NCG_LOG_INFO("=== C2: albedo error vs corruption, robust vs plain (N=8) ===");
+  const int N = 8;
+  const auto clean = observe(lights(N));
+  const auto nv = nv_of(N);
+  const auto w = torch::ones({N, V}, opts);
+  for (double rho : {0.0, 0.1, 0.2, 0.35, 0.5}) {
+    const auto corrupt = torch::rand({N, V}, opts) < rho;
+    const auto obs = torch::where(corrupt.unsqueeze(-1), torch::rand({N, V, 3}, opts), clean);
+    ncg::recon::InverseRenderConfig rc;
+    rc.iterations = 80;
+    rc.robust = true;
+    ncg::recon::InverseRenderConfig pc = rc;
+    pc.robust = false;
+    const double er = serr(ncg::recon::solve_inverse_render(obs, nv, w, rc).albedo);
+    const double ep = serr(ncg::recon::solve_inverse_render(obs, nv, w, pc).albedo);
+    NCG_LOG_INFO("  corrupt={:3.0f}%  robust={:.4f}  plain={:.4f}", rho * 100, er, ep);
+    rec.log_scalar("bench_robust", "corrupt", rho);
+    rec.log_scalar("bench_robust", "robust", er);
+    rec.log_scalar("bench_robust", "plain", ep);
+  }
+  NCG_LOG_INFO("benchmark complete -> {}", rec.dir().string());
   return 0;
 }
 
@@ -514,8 +609,8 @@ int main(int argc, char** argv) {
   if (argc < 2) {
     std::fprintf(stderr,
                  "usage: ncg_cli "
-                 "<pipeline|render|turntable|select|fitimg|fit|fuse|relight|export|nerf> "
-                 "[--flags]\n");
+                 "<pipeline|render|turntable|select|fitimg|fit|fuse|relight|export|benchmark|"
+                 "nerf> [--flags]\n");
     return 2;
   }
   const std::string cmd = argv[1];
@@ -530,6 +625,7 @@ int main(int argc, char** argv) {
     if (cmd == "fuse") return cmd_fuse(args);
     if (cmd == "relight") return cmd_relight(args);
     if (cmd == "export") return cmd_export(args);
+    if (cmd == "benchmark") return cmd_benchmark(args);
     if (cmd == "nerf") return cmd_nerf(args);
     std::fprintf(stderr, "unknown command '%s'\n", cmd.c_str());
     return 2;

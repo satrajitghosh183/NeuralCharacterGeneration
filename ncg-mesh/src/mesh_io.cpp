@@ -2,9 +2,11 @@
 
 #include <ncg/core/error.hpp>
 
+#include <algorithm>
 #include <cstdint>
 #include <fstream>
 #include <sstream>
+#include <string>
 #include <vector>
 
 namespace ncg::mesh {
@@ -167,6 +169,183 @@ void write_ply(const TriMesh& mesh, const std::string& path) {
     os << "3 " << fp[i * 3 + 0] << ' ' << fp[i * 3 + 1] << ' ' << fp[i * 3 + 2] << '\n';
   }
   NCG_CHECK(os.good(), "write_ply: write error for '{}'", path);
+}
+
+void write_glb_skinned(const Tensor& vertices, const Tensor& faces, const Tensor& normals_in,
+                       const Tensor& colors_in, const Tensor& joints_in, const Tensor& parents_in,
+                       const Tensor& skin_weights_in, const std::string& path) {
+  const auto v = vertices.to(at::kCPU, at::kFloat).contiguous();
+  const auto f = faces.to(at::kCPU, at::kInt).contiguous();
+  const auto jpos = joints_in.to(at::kCPU, at::kFloat).contiguous();
+  const auto parents = parents_in.to(at::kCPU, at::kLong).contiguous();
+  const int64_t V = v.size(0);
+  const int64_t F = f.size(0);
+  const int64_t J = jpos.size(0);
+  const bool hasN = normals_in.defined() && normals_in.numel() > 0;
+  const bool hasC = colors_in.defined() && colors_in.numel() > 0;
+  const auto n = hasN ? normals_in.to(at::kCPU, at::kFloat).contiguous() : Tensor();
+  const auto c = hasC ? colors_in.to(at::kCPU, at::kFloat).contiguous() : Tensor();
+
+  // Reduce skinning to glTF's 4 influences/vertex; renormalize.
+  const auto sw = skin_weights_in.to(at::kCPU, at::kFloat);
+  auto topk = sw.topk(std::min<int64_t>(4, J), /*dim=*/1);
+  auto wval = std::get<0>(topk).contiguous();          // [V,k]
+  auto widx = std::get<1>(topk).to(at::kInt).contiguous();  // [V,k]
+  if (wval.size(1) < 4) {  // pad to 4
+    wval = torch::constant_pad_nd(wval, {0, 4 - wval.size(1)}, 0.0);
+    widx = torch::constant_pad_nd(widx, {0, 4 - widx.size(1)}, 0);
+  }
+  wval = wval / wval.sum(1, true).clamp_min(1e-8F);
+  const auto* wv = wval.data_ptr<float>();
+  const auto* wi = widx.data_ptr<int32_t>();
+
+  // --- BIN: pos|norm|col|JOINTS(u16x4)|WEIGHTS(f32x4)|IBM(f32x16)|indices(u32) ---
+  std::vector<char> bin;
+  std::vector<size_t> off;
+  auto mark = [&]() { off.push_back(bin.size()); };
+  mark();
+  append_bytes(bin, v.data_ptr<float>(), static_cast<size_t>(V) * 3 * sizeof(float));
+  if (hasN) {
+    mark();
+    append_bytes(bin, n.data_ptr<float>(), static_cast<size_t>(V) * 3 * sizeof(float));
+  }
+  if (hasC) {
+    mark();
+    append_bytes(bin, c.data_ptr<float>(), static_cast<size_t>(V) * 3 * sizeof(float));
+  }
+  const size_t jointsOff = bin.size();
+  for (int64_t i = 0; i < V * 4; ++i) {
+    const uint16_t u = static_cast<uint16_t>(wi[i]);
+    bin.push_back(static_cast<char>(u & 0xff));
+    bin.push_back(static_cast<char>((u >> 8) & 0xff));
+  }
+  const size_t weightsOff = bin.size();
+  append_bytes(bin, wv, static_cast<size_t>(V) * 4 * sizeof(float));
+  // Inverse bind matrices: rest rotation is identity, so IBM = translate(-joint_world).
+  const size_t ibmOff = bin.size();
+  const auto* jp = jpos.data_ptr<float>();
+  for (int64_t j = 0; j < J; ++j) {
+    float m[16] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0,
+                   -jp[j * 3 + 0], -jp[j * 3 + 1], -jp[j * 3 + 2], 1};  // column-major
+    append_bytes(bin, m, sizeof(m));
+  }
+  const size_t idxOff = bin.size();
+  {
+    const auto* fp = f.data_ptr<int32_t>();
+    std::vector<uint32_t> idx(static_cast<size_t>(F) * 3);
+    for (size_t i = 0; i < idx.size(); ++i) idx[i] = static_cast<uint32_t>(fp[i]);
+    append_bytes(bin, idx.data(), idx.size() * sizeof(uint32_t));
+  }
+  while (bin.size() % 4 != 0) bin.push_back(0);
+
+  const auto vmin = std::get<0>(v.min(0));
+  const auto vmax = std::get<0>(v.max(0));
+  const auto* mn = vmin.data_ptr<float>();
+  const auto* mx = vmax.data_ptr<float>();
+
+  // Joint node local translations + child lists from the parent hierarchy.
+  const auto* pp = parents.data_ptr<int64_t>();
+  std::vector<std::vector<int64_t>> children(static_cast<size_t>(J));
+  for (int64_t j = 1; j < J; ++j) children[static_cast<size_t>(pp[j])].push_back(j);
+
+  std::ostringstream js;
+  js << "{\"asset\":{\"version\":\"2.0\",\"generator\":\"NeuralCharGen\"},\"scene\":0,"
+     << "\"scenes\":[{\"nodes\":[0," << J << "]}],\"nodes\":[";
+  for (int64_t j = 0; j < J; ++j) {
+    const int64_t par = (j == 0) ? -1 : pp[j];
+    const float lx = jp[j * 3 + 0] - (par < 0 ? 0.0F : jp[par * 3 + 0]);
+    const float ly = jp[j * 3 + 1] - (par < 0 ? 0.0F : jp[par * 3 + 1]);
+    const float lz = jp[j * 3 + 2] - (par < 0 ? 0.0F : jp[par * 3 + 2]);
+    js << "{\"translation\":[" << lx << "," << ly << "," << lz << "]";
+    if (!children[static_cast<size_t>(j)].empty()) {
+      js << ",\"children\":[";
+      for (size_t k = 0; k < children[static_cast<size_t>(j)].size(); ++k)
+        js << (k ? "," : "") << children[static_cast<size_t>(j)][k];
+      js << "]";
+    }
+    js << "},";
+  }
+  js << "{\"mesh\":0,\"skin\":0}],";  // node index J = the skinned mesh
+
+  // bufferViews + accessors (order: pos,[norm],[col],joints,weights,ibm,indices)
+  int bv = 0;
+  std::ostringstream bvs;
+  std::ostringstream accs;
+  auto add = [&](size_t boff, int64_t bytes, int target) {
+    bvs << (bv ? "," : "") << "{\"buffer\":0,\"byteOffset\":" << boff << ",\"byteLength\":" << bytes
+        << (target ? (",\"target\":" + std::to_string(target)) : "") << "}";
+    return bv++;
+  };
+  int oi = 0;
+  const int bvPos = add(off[oi++], V * 12, 34962);
+  const int bvN = hasN ? add(off[oi++], V * 12, 34962) : -1;
+  const int bvC = hasC ? add(off[oi++], V * 12, 34962) : -1;
+  const int bvJ = add(jointsOff, V * 8, 34962);
+  const int bvW = add(weightsOff, V * 16, 34962);
+  const int bvIBM = add(ibmOff, J * 64, 0);
+  const int bvIdx = add(idxOff, F * 12, 34963);
+
+  accs << "{\"bufferView\":" << bvPos << ",\"componentType\":5126,\"count\":" << V
+       << ",\"type\":\"VEC3\",\"min\":[" << mn[0] << "," << mn[1] << "," << mn[2] << "],\"max\":["
+       << mx[0] << "," << mx[1] << "," << mx[2] << "]}";
+  int acc = 1;
+  int accN = -1, accC = -1;
+  if (hasN) {
+    accN = acc++;
+    accs << ",{\"bufferView\":" << bvN << ",\"componentType\":5126,\"count\":" << V
+         << ",\"type\":\"VEC3\"}";
+  }
+  if (hasC) {
+    accC = acc++;
+    accs << ",{\"bufferView\":" << bvC << ",\"componentType\":5126,\"count\":" << V
+         << ",\"type\":\"VEC3\"}";
+  }
+  const int accJ = acc++;
+  accs << ",{\"bufferView\":" << bvJ << ",\"componentType\":5123,\"count\":" << V
+       << ",\"type\":\"VEC4\"}";
+  const int accW = acc++;
+  accs << ",{\"bufferView\":" << bvW << ",\"componentType\":5126,\"count\":" << V
+       << ",\"type\":\"VEC4\"}";
+  const int accIBM = acc++;
+  accs << ",{\"bufferView\":" << bvIBM << ",\"componentType\":5126,\"count\":" << J
+       << ",\"type\":\"MAT4\"}";
+  const int accIdx = acc++;
+  accs << ",{\"bufferView\":" << bvIdx << ",\"componentType\":5125,\"count\":" << F * 3
+       << ",\"type\":\"SCALAR\"}";
+
+  js << "\"bufferViews\":[" << bvs.str() << "],\"accessors\":[" << accs.str() << "],";
+  js << "\"meshes\":[{\"primitives\":[{\"attributes\":{\"POSITION\":0";
+  if (hasN) js << ",\"NORMAL\":" << accN;
+  if (hasC) js << ",\"COLOR_0\":" << accC;
+  js << ",\"JOINTS_0\":" << accJ << ",\"WEIGHTS_0\":" << accW << "},\"indices\":" << accIdx
+     << ",\"material\":0}]}],";
+  js << "\"skins\":[{\"inverseBindMatrices\":" << accIBM << ",\"skeleton\":0,\"joints\":[";
+  for (int64_t j = 0; j < J; ++j) js << (j ? "," : "") << j;
+  js << "]}],\"materials\":[{\"pbrMetallicRoughness\":{\"baseColorFactor\":[1,1,1,1],"
+        "\"metallicFactor\":0,\"roughnessFactor\":1}}],\"buffers\":[{\"byteLength\":"
+     << bin.size() << "}]}";
+  std::string json = js.str();
+  while (json.size() % 4 != 0) json.push_back(' ');
+
+  std::vector<char> glb;
+  put_u32(glb, 0x46546C67);
+  put_u32(glb, 2);
+  put_u32(glb, 0);
+  put_u32(glb, static_cast<uint32_t>(json.size()));
+  put_u32(glb, 0x4E4F534A);
+  append_bytes(glb, json.data(), json.size());
+  put_u32(glb, static_cast<uint32_t>(bin.size()));
+  put_u32(glb, 0x004E4942);
+  append_bytes(glb, bin.data(), bin.size());
+  const uint32_t total = static_cast<uint32_t>(glb.size());
+  glb[8] = static_cast<char>(total & 0xff);
+  glb[9] = static_cast<char>((total >> 8) & 0xff);
+  glb[10] = static_cast<char>((total >> 16) & 0xff);
+  glb[11] = static_cast<char>((total >> 24) & 0xff);
+
+  std::ofstream os(path, std::ios::binary);
+  NCG_CHECK(os.good(), "write_glb_skinned: cannot open '{}'", path);
+  os.write(glb.data(), static_cast<std::streamsize>(glb.size()));
 }
 
 }  // namespace ncg::mesh

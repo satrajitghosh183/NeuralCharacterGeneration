@@ -40,4 +40,12 @@ void write_ply(const TriMesh& mesh, const std::string& path);
 void write_glb(const Tensor& vertices, const Tensor& faces, const Tensor& normals,
                const Tensor& colors, const std::string& path);
 
+/// Export a *rigged* binary glTF (.glb): the mesh plus a skeleton + per-vertex skinning, so the
+/// character animates in Unity/Unreal. Skin weights are reduced to the glTF-standard top-4
+/// influences per vertex and renormalized.
+///   joints [J,3] rest-pose joint positions, parents [J] int64 hierarchy, skin_weights [V,J].
+void write_glb_skinned(const Tensor& vertices, const Tensor& faces, const Tensor& normals,
+                       const Tensor& colors, const Tensor& joints, const Tensor& parents,
+                       const Tensor& skin_weights, const std::string& path);
+
 }  // namespace ncg::mesh
