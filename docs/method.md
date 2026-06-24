@@ -215,6 +215,12 @@ violate this — which is *why* current plugins can't animate+relight. The corre
 its differentiable form, so $a_g$ is learned through it in §5) is the representational
 contribution.
 
+> **Empirical support (2026-06-24, `tests/recon/test_inverse_render.cpp`, green on H100):**
+> `transport_normals` rotates a full-weight bone's normals exactly by $R$, and shading the posed
+> normals under a world light equals shading canonical normals under the pulled-back light to
+> **max error $2.4\times10^{-7}$** — animate and relight commute (the SH addition-theorem identity
+> $\sum_m Y_{lm}(d)Y_{lm}(Rn)=\sum_m Y_{lm}(R^\top d)Y_{lm}(n)$ holds in code).
+
 ---
 
 ## 9. Novelty vs. prior art
