@@ -17,13 +17,17 @@ struct InverseRenderConfig {
   int iterations = 40;       // L/A alternations
   float albedo_ridge = 1e-4F;
   float light_ridge = 1e-3F;  // stabilizes the 9x9 SH normal equations
+  bool robust = true;         // infer a per-observation consistency weight (C2) to reject
+                              // inconsistent observations (clothing swaps, occlusion, junk)
+  float robust_scale = 0.0F;  // Welsch kernel scale; 0 => auto (1.4826 * MAD of residuals)
 };
 
 /// Recovered canonical appearance + per-photo lighting + uncertainty (see docs/method.md §5–6).
 struct InverseRenderResult {
-  Tensor albedo;     // [V,3]  canonical albedo on the body manifold
-  Tensor lights;     // [N,3,9] per-photo SH lighting (per channel)
-  Tensor precision;  // [V,3]  per-vertex Gauss-Newton precision (∝ inverse posterior variance)
+  Tensor albedo;       // [V,3]  canonical albedo on the body manifold
+  Tensor lights;       // [N,3,9] per-photo SH lighting (per channel)
+  Tensor precision;    // [V,3]  per-vertex Gauss-Newton precision (∝ inverse posterior variance)
+  Tensor consistency;  // [N,V]  inferred per-observation consistency weight (1=trusted, 0=rejected)
 };
 
 /// Multi-illumination inverse rendering (the paper's core, §3–§5 of docs/method.md): given the

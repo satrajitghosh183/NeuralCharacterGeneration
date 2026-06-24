@@ -58,3 +58,54 @@ TEST_CASE("multi-illumination recovers albedo; diversity helps (C1)", "[recon][i
   REQUIRE(e5 < 0.05);  // diverse multi-illumination recovers albedo well
   REQUIRE(e5 < e1);    // lighting diversity strictly helps (the C1 effect)
 }
+
+// C2 (docs/method.md §3): with a fraction of observations corrupted (clothing swap / occlusion /
+// junk uploads), the robust consistency E-step must recover albedo far better than the
+// non-robust solve — and must actually identify (down-weight) the corrupted observations.
+TEST_CASE("robust consistency rejects corrupted observations (C2)", "[recon][inverse]") {
+  torch::manual_seed(1);
+  const int V = 300;
+  const int N = 8;
+  auto normals = torch::randn({V, 3});
+  normals = normals / normals.norm(2, -1, true);
+  const auto a_true = torch::rand({V, 3}) * 0.7F + 0.2F;
+  const auto b = sh_basis(normals);
+
+  auto L = torch::randn({N, 3, 9}) * 0.2F;
+  L.select(2, 0) += 1.2F;
+  const auto E = torch::einsum("nck,vk->nvc", {L, b});
+  const auto clean = (a_true.unsqueeze(0) * E).clamp_min(0.0);          // [N,V,3]
+  const auto nv = normals.unsqueeze(0).expand({N, V, 3}).contiguous();
+
+  // Corrupt 35% of observations with junk (the inconsistent casual-photo case).
+  const auto corrupt = (torch::rand({N, V}) < 0.35F);                   // [N,V]
+  const auto junk = torch::rand({N, V, 3});
+  const auto obs = torch::where(corrupt.unsqueeze(-1), junk, clean);
+  const auto w = torch::ones({N, V});
+
+  auto scaled_err = [&](const torch::Tensor& a_rec) {
+    const auto scale = (a_rec * a_true).sum(0) / (a_rec * a_rec).sum(0).clamp_min(1e-8);
+    return (a_true - a_rec * scale).abs().mean().item<double>();
+  };
+
+  InverseRenderConfig robust_cfg;
+  robust_cfg.iterations = 80;
+  robust_cfg.robust = true;
+  InverseRenderConfig plain_cfg = robust_cfg;
+  plain_cfg.robust = false;
+
+  const auto rob = solve_inverse_render(obs, nv, w, robust_cfg);
+  const double e_rob = scaled_err(rob.albedo);
+  const double e_plain = scaled_err(solve_inverse_render(obs, nv, w, plain_cfg).albedo);
+
+  // The inferred consistency should be low on corrupted obs, high on clean ones.
+  const auto cons = rob.consistency;  // [N,V]
+  const double mean_corrupt = cons.masked_select(corrupt).mean().item<double>();
+  const double mean_clean = cons.masked_select(corrupt.logical_not()).mean().item<double>();
+
+  INFO("err robust=" << e_rob << " plain=" << e_plain << " | consistency corrupt="
+                     << mean_corrupt << " clean=" << mean_clean);
+  REQUIRE(e_rob < e_plain);             // robustness helps under corruption
+  REQUIRE(e_rob < 0.06);                // and still recovers albedo well
+  REQUIRE(mean_corrupt < mean_clean);   // it actually identifies the bad observations
+}

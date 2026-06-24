@@ -4,6 +4,7 @@
 
 #include <torch/torch.h>
 
+#include <algorithm>
 #include <vector>
 
 namespace ncg::recon {
@@ -44,31 +45,51 @@ InverseRenderResult solve_inverse_render(const Tensor& obs, const Tensor& normal
   const auto w = weights.unsqueeze(-1);             // [N,V,1]
   const auto eye9 = torch::eye(9, opts);
 
+  // Effective weight = visibility (input) x consistency (inferred, C2). Consistency starts at 1
+  // and is re-estimated each iteration by a robust kernel on the photometric residual, so
+  // observations that no shared albedo can explain (clothing swap / occlusion / junk) are
+  // down-weighted automatically — the robust core of §3.
+  auto cons = torch::ones_like(weights);  // [N,V]
+
   // Init albedo: visibility-weighted mean of observations (the naive-fuse warm start).
   auto albedo = ((w * obs).sum(0) / w.sum(0).clamp_min(1e-6)).clamp(0.0, 1.5);  // [V,3]
   Tensor lights = torch::zeros({obs.size(0), 3, 9}, opts);
   Tensor precision = torch::ones_like(albedo);
 
   for (int it = 0; it < cfg.iterations; ++it) {
+    const auto ew = (weights * cons).unsqueeze(-1);  // [N,V,1] effective weight
+
     // L-step: per photo i, per channel c, weighted 9x9 SH normal equations (closed form).
     const auto bb = b.unsqueeze(-1) * b.unsqueeze(-2);            // [N,V,9,9]
-    const auto wa2 = weights.unsqueeze(-1) * albedo.pow(2).unsqueeze(0);  // [N,V,3]
+    const auto wa2 = ew * albedo.pow(2).unsqueeze(0);            // [N,V,3]
     auto M = torch::einsum("nvc,nvjk->ncjk", {wa2, bb});         // [N,3,9,9]
     M = M + cfg.light_ridge * eye9;
-    const auto war = weights.unsqueeze(-1) * albedo.unsqueeze(0) * obs;   // [N,V,3]
+    const auto war = ew * albedo.unsqueeze(0) * obs;            // [N,V,3]
     const auto rhs = torch::einsum("nvc,nvk->nck", {war, b});    // [N,3,9]
     lights = torch::linalg_solve(M, rhs.unsqueeze(-1)).squeeze(-1);       // [N,3,9]
 
     // A-step: per vertex v, per channel c, closed-form scalar solve (parallel over V).
     const auto s = torch::einsum("nck,nvk->nvc", {lights, b});   // [N,V,3] shading
-    const auto ws = weights.unsqueeze(-1) * s;                   // [N,V,3]
+    const auto ws = ew * s;                                      // [N,V,3]
     const auto num = (ws * obs).sum(0);                          // [V,3]
     const auto den = (ws * s).sum(0) + cfg.albedo_ridge;         // [V,3] = GN precision
     albedo = (num / den).clamp(0.0, 1.5);
     precision = den;
+
+    // E-step: re-estimate consistency from the photometric residual (Welsch kernel).
+    if (cfg.robust) {
+      const auto resid = (obs - albedo.unsqueeze(0) * s).norm(2, -1);  // [N,V]
+      float scale = cfg.robust_scale;
+      if (scale <= 0.0F) {
+        const auto seen = resid.masked_select(weights > 0.5F);
+        const auto mad = seen.numel() > 0 ? seen.median().item<float>() : 1.0F;
+        scale = std::max(1e-3F, 1.4826F * mad);
+      }
+      cons = torch::exp(-(resid * resid) / (2.0F * scale * scale));  // [N,V] in (0,1]
+    }
   }
 
-  return {albedo, lights, precision};
+  return {albedo, lights, precision, weights * cons};
 }
 
 }  // namespace ncg::recon
