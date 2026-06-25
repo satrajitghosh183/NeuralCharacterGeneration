@@ -287,3 +287,50 @@ Metrics: albedo PSNR/Δ, relit-PSNR/SSIM/LPIPS under held-out light, identity (A
 
 Step 6 is built *first* alongside step 2, because the synthetic harness is how we know the math is
 right before chasing real-photo polish.
+
+---
+
+## 13. C4 — motion identity: the same principle on the pose manifold
+
+The appearance half (C1/C2) says: *identity is the invariant that explains inconsistent
+observations across nuisance diversity.* The motion half is the **same statement on the pose
+manifold**, with **action** playing the role **lighting** played for appearance.
+
+**Generative model.** A person $p$ has a latent **style** $z_p$ (gait phase, limb timing, posture,
+hand idiosyncrasy). Each casual clip $c$ of them performing some **content** (action) $u_c(t)$
+produces a pose sequence
+$$\theta_{c}(t) = g\big(u_c(t),\, z_p\big) + \varepsilon ,$$
+where $g$ composes content and style on $SO(3)^J$. Casual monocular video is noisy and cut-ridden,
+so $\varepsilon$ is heavy-tailed with structured outliers — *exactly* the appearance setting.
+
+**Recovery (robust factorization).** Estimate the shared $z_p$ and per-clip content $\{u_c\}$:
+$$\min_{z_p,\{u_c\},\{w_{ct}\}} \sum_{c,t} w_{ct}\,\rho\!\big(\theta_c(t)-g(u_c(t),z_p)\big) + \Psi(w) + \mathcal R(z_p)+\mathcal R(u),$$
+with the **same half-quadratic robust weights $w_{ct}$** as §3 — they down-weight cut frames and
+bad NLF poses (the jumpy-casual-video problem turned into the contribution). Solved by alternation:
+fix style → recover each clip's content (a per-clip fit); fix content → update the shared style
+(pooled across clips); reweight $w$.
+
+**Proposition (informal, parallel to §4).** $z_p$ is identifiable up to a gauge if $p$ is observed
+across $\ge 2$ **distinct** actions (content not a common reparameterization), because the *shared*
+style must explain *all* clips under *different* content — the cross-action constraint breaks the
+style/content ambiguity that a single clip cannot. **Discovery:** the *action diversity* of a
+casual album makes personal motion style identifiable, just as *lighting diversity* makes albedo
+identifiable. Same theorem shape, different manifold.
+
+**Transfer (the payoff).** Given a new action request $u^\star(t)$ (from gameplay) and the recovered
+$z_p$: $\theta^\star(t)=g(u^\star(t),z_p)$ — that action **in their style**, in any scenario. The
+style is an *intrinsic property* of the avatar, not a clip. (The real-time *generative* controller
+that maps live game inputs → $u^\star$ is the systems extension; the factorization + identifiability
+is the contribution.)
+
+**C4 claims (to validate in code, mirroring C1/C2):** (a) style recovery improves with **action
+diversity**; (b) **robust** factorization beats naive pooling on **noisy/cut** casual clips; (c)
+recovered style **transfers** to a held-out action. Synthetic ground-truth harness: generate
+motions with known $(z_p,\{u_c\})$, corrupt with noise + cut-frames, recover, measure — exactly the
+appearance benchmark, on motion.
+
+**Why this is the "fire."** It unifies *appearance* and *motion* personal identity under **one**
+recovery principle, from **casual** data, with **identifiability** on both manifolds, rendered by a
+**commuting animate+relight** real-time runtime. Prior motion-style work uses clean labeled mocap;
+none recovers style from noisy casual video *and* unifies it with relightable appearance into one
+personalized avatar. That intersection is new.
