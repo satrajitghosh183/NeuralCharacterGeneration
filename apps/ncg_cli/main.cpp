@@ -720,6 +720,41 @@ int cmd_benchmark(const ncg::app::Args& args) {
                  pm, ps);
   }
 
+  // Comparison — relightability vs a radiance baseline (what NeRF / vanilla 3DGS recover: one
+  // baked appearance per vertex, no lighting model). Both evaluated under a NOVEL light. The
+  // baseline is given its best global scale to GT, so this is its best case.
+  NCG_LOG_INFO("--- Comparison: relight error (novel light), ours vs radiance baseline (NeRF/3DGS) ---");
+  {
+    const int Ncmp = 8;
+    std::vector<double> eo;
+    std::vector<double> eb;
+    for (int s = 0; s < seeds; ++s) {
+      torch::manual_seed(3000 + s);
+      const auto a_true = torch::rand({V, 3}, opts) * 0.7F + 0.2F;
+      auto L = torch::randn({Ncmp, 3, 9}, opts) * 0.25F;
+      L.select(2, 0) += 1.2F;
+      const auto obs = (a_true.unsqueeze(0) * torch::einsum("nck,vk->nvc", {L, basis})).clamp_min(0.0);
+      const auto nv = normals.unsqueeze(0).expand({Ncmp, V, 3}).contiguous();
+      const auto gt = ncg::recon::shade_sh(a_true, Lnovel, normals);  // GT under the novel light
+      const double gtn = gt.norm().clamp_min(1e-8).item<double>();
+      // Ours: recover albedo, relight under the novel light.
+      ncg::recon::InverseRenderConfig cfg;
+      cfg.iterations = 60;
+      const auto ra = ncg::recon::solve_inverse_render(obs, nv, torch::ones({Ncmp, V}, opts), cfg).albedo;
+      const auto sc = (ra * a_true).sum(0) / (ra * ra).sum(0).clamp_min(1e-8);
+      eo.push_back((ncg::recon::shade_sh(ra * sc, Lnovel, normals) - gt).norm().item<double>() / gtn);
+      // Radiance baseline (NeRF/3DGS): one baked color per vertex = mean radiance; it cannot
+      // relight, so its output under the novel light is that baked image (best global scale).
+      const auto baked = obs.mean(0);
+      const auto scb = (baked * gt).sum() / (baked * baked).sum().clamp_min(1e-8);
+      eb.push_back((baked * scb - gt).norm().item<double>() / gtn);
+    }
+    const auto [om, os] = stat(eo);
+    const auto [bm, bs] = stat(eb);
+    NCG_LOG_INFO("  ours (relightable) = {:.4f}±{:.4f}   radiance baseline (baked) = {:.4f}±{:.4f}",
+                 om, os, bm, bs);
+  }
+
   // C3 — animate/relight commutation error + transport timing.
   {
     torch::manual_seed(7);
