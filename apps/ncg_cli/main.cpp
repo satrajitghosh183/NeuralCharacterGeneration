@@ -473,7 +473,8 @@ int cmd_relight(const ncg::app::Args& args) {
 // rest-posed from a photo) + vertex normals + per-vertex color (sampled from the photo).
 //   ncg_cli export --smplx smplx.safetensors [--image me.jpg --weights nlf.torchscript] --out avatar.glb
 int cmd_export(const ncg::app::Args& args) {
-  const bool want_color = args.has("image") && args.has("weights");
+  const bool multi = args.has("images") && args.has("weights");  // several photos -> fused albedo
+  const bool want_color = !multi && args.has("image") && args.has("weights");
   const auto device = ncg::cuda_available() ? at::Device(at::kCUDA, 0) : at::Device(at::kCPU);
   auto model = ncg::body::SmplxModel::load(args.require("smplx"), device);
   NCG_CHECK(model.has_faces(), "export needs a SMPL-X model with faces — reconvert it");
@@ -481,7 +482,52 @@ int cmd_export(const ncg::app::Args& args) {
   torch::Tensor verts;
   torch::Tensor colors;
   torch::Tensor joints;
-  if (want_color) {
+  if (multi) {
+    NCG_CHECK(ncg::cuda_available(), "export --images needs a CUDA device (NLF)");
+    auto nlf = ncg::body::Nlf::load(args.require("weights"), device);
+    const auto faces_cpu = model.faces().to(at::kCPU);
+    const int64_t V = model.num_verts();
+    std::vector<torch::Tensor> obs_l;
+    std::vector<torch::Tensor> nrm_l;
+    std::vector<torch::Tensor> w_l;
+    torch::Tensor betas0;
+    for (const auto& path : split_csv(args.require("images"))) {
+      const auto image = ncg::io::load_image(path, 3);
+      ncg::body::NlfPrediction pred;
+      try {
+        pred = nlf.detect(image);
+      } catch (const std::exception& e) {
+        NCG_LOG_WARN("export: skipping '{}' ({})", path, e.what());
+        continue;
+      }
+      if (pred.vertices2d.size(0) != V) continue;
+      if (!betas0.defined()) betas0 = pred.params.betas.to(device);
+      const auto v2d = pred.vertices2d.to(device);
+      ncg::mesh::TriMesh m;
+      m.vertices = pred.vertices3d.to(at::kCPU);
+      m.faces = faces_cpu;
+      nrm_l.push_back(ncg::mesh::compute_vertex_normals(m).to(device));
+      obs_l.push_back(ncg::recon::sample_vertex_colors(image.to(device), v2d).clamp(0.0, 1.0));
+      w_l.push_back(ncg::recon::vertex_visibility(v2d, pred.vertices3d.select(1, 2).to(device),
+                                                  static_cast<int64_t>(image.size(1)),
+                                                  static_cast<int64_t>(image.size(2))));
+    }
+    NCG_CHECK(!obs_l.empty(), "export --images: no usable views");
+    ncg::recon::InverseRenderConfig cfg;
+    cfg.iterations = args.get_int("iters", 80);
+    cfg.robust = (obs_l.size() >= 2);
+    colors = ncg::recon::solve_inverse_render(torch::stack(obs_l, 0), torch::stack(nrm_l, 0),
+                                              torch::stack(w_l, 0), cfg)
+                 .albedo.clamp(0.0, 1.0);
+    ncg::body::SmplxParams p;
+    p.betas = betas0;
+    p.pose_aa = torch::zeros({1, model.num_joints(), 3}, betas0.options());
+    p.transl = torch::zeros({1, 3}, betas0.options());
+    const auto body = model.forward(p);
+    verts = body.vertices.squeeze(0);
+    joints = body.joints.squeeze(0);
+    NCG_LOG_INFO("export: fused albedo from {} photo(s)", obs_l.size());
+  } else if (want_color) {
     NCG_CHECK(ncg::cuda_available(), "export with --image needs a CUDA device (NLF)");
     auto nlf = ncg::body::Nlf::load(args.require("weights"), device);
     const auto image = ncg::io::load_image(args.require("image"), 3);

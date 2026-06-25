@@ -23,20 +23,22 @@ done
 
 tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT
-first=""
+remotes=""
 i=0
 for f in "${IMGS[@]}"; do
   jpg="$tmp/up_$i.jpg"
   sips -s format jpeg -Z 1600 "$f" --out "$jpg" >/dev/null 2>&1 || cp "$f" "$jpg"
   scp -q "$jpg" "$HOST:$REPO/data/photos/up_$i.jpg"
-  [ -z "$first" ] && first="data/photos/up_$i.jpg"
+  remotes="${remotes:+$remotes,}data/photos/up_$i.jpg"
   i=$((i + 1))
 done
-echo "uploaded $i image(s); building the avatar on the H100 (NLF takes ~30s)…"
+# 1 photo -> direct color sample; several -> fuse a clean albedo via the inverse-render solver.
+if [ "$i" -gt 1 ]; then SRC="--images $remotes"; else SRC="--image $remotes"; fi
+echo "uploaded $i image(s); building the avatar on the H100 (NLF ~30s/photo)…"
 
 ssh "$HOST" "cd $REPO && export LD_LIBRARY_PATH=$TORCHLIB:\$LD_LIBRARY_PATH && \
   ./build/h100-release/apps/ncg_cli export \
-    --smplx data/smplx_neutral.safetensors --image $first \
+    --smplx data/smplx_neutral.safetensors $SRC \
     --weights models/nlf_l_multi.torchscript --detection 0 --animate --out _make.glb"
 
 scp -q "$HOST:$REPO/_make.glb" "$OUT"
