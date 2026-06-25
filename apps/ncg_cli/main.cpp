@@ -17,6 +17,7 @@
 #include <ncg/recon/appearance.hpp>
 #include <ncg/recon/init_from_body.hpp>
 #include <ncg/recon/inverse_render.hpp>
+#include <ncg/recon/motion_style.hpp>
 #include <ncg/record/recorder.hpp>
 #include <ncg/rig/rig.hpp>
 #include <ncg/runtime/camera.hpp>
@@ -968,6 +969,40 @@ int cmd_benchmark(const ncg::app::Args& args) {
   return 0;
 }
 
+// C4 — recover a person's motion STYLE from several extracted clips (different actions) and apply
+// it to a target action (projecting the target onto the recovered style subspace = "this action,
+// in their style", and regularizing the noisy casual motion). Pure motion math (CPU); writes the
+// styled motion .npy for `export --motion`.
+//   ncg_cli style --motions a.npy,b.npy,c.npy [--target a.npy] --rank 8 --out_motion styled.npy
+int cmd_style(const ncg::app::Args& args) {
+  const auto mpaths = split_csv(args.require("motions"));
+  NCG_CHECK(!mpaths.empty(), "style: --motions is empty");
+  std::vector<torch::Tensor> clips;
+  int64_t J = 0;
+  for (const auto& p : mpaths) {
+    const auto m = ncg::io::load_npy(p).to(at::kFloat);  // [T,J,3]
+    NCG_CHECK(m.dim() == 3 && m.size(2) == 3, "style: each motion .npy must be [T,J,3]");
+    J = m.size(1);
+    clips.push_back(m.reshape({m.size(0), -1}).contiguous());  // [T, J*3]
+  }
+  ncg::recon::MotionStyleConfig cfg;
+  cfg.rank = args.get_int("rank", 8);
+  cfg.iterations = args.get_int("iters", 60);
+  const auto res = ncg::recon::solve_motion_style(clips, cfg);
+  NCG_LOG_INFO("style: recovered rank-{} style from {} clips", cfg.rank, clips.size());
+
+  const auto tgt = ncg::io::load_npy(args.has("target") ? args.require("target") : mpaths[0])
+                       .to(at::kFloat);  // [T,J,3]
+  const auto styled = ncg::recon::apply_motion_style(tgt.reshape({tgt.size(0), -1}), res.style)
+                          .reshape({tgt.size(0), J, 3})
+                          .contiguous();
+  const auto out = args.get("out_motion", "styled_motion.npy");
+  ncg::io::save_npy(out, styled);
+  NCG_LOG_INFO("style: styled motion ({} frames) -> {} (feed to export --motion)", styled.size(0),
+               out);
+  return 0;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -994,6 +1029,7 @@ int main(int argc, char** argv) {
     if (cmd == "benchmark") return cmd_benchmark(args);
     if (cmd == "delight") return cmd_delight(args);
     if (cmd == "runtime") return cmd_runtime(args);
+    if (cmd == "style") return cmd_style(args);
     if (cmd == "nerf") return cmd_nerf(args);
     std::fprintf(stderr, "unknown command '%s'\n", cmd.c_str());
     return 2;
