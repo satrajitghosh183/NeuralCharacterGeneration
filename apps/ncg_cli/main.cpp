@@ -729,16 +729,25 @@ int cmd_runtime(const ncg::app::Args& args) {
   const auto white = torch::ones({3}, opts);
   const float el = 25.0F * static_cast<float>(M_PI) / 180.0F;
 
+  torch::Tensor motion;  // [T,J,3] optional extracted-motion playback
+  if (args.has("motion")) {
+    motion = ncg::io::load_npy(args.require("motion")).to(opts);
+    if (args.get_int("inplace", 1) != 0) motion.select(1, 0).zero_();
+  }
   auto rec = ncg::record::Recorder::create("runs", args.get("run", "runtime"));
-  const int frames = args.get_int("frames", 60);
+  const int frames = motion.defined() ? static_cast<int>(motion.size(0)) : args.get_int("frames", 60);
   using clk = std::chrono::high_resolution_clock;
   std::vector<double> ft;
   for (int i = 0; i < frames; ++i) {
     const float ph = 2.0F * static_cast<float>(M_PI) * static_cast<float>(i) / frames;
-    const float ang = 0.6F * std::sin(ph);
     auto pose = pose0.clone();
-    pose[0][16][2] = ang;    // swing the shoulders (LBS articulation)
-    pose[0][17][2] = -ang;
+    if (motion.defined()) {
+      pose = motion[i].unsqueeze(0);  // play the extracted pose for this frame
+    } else {
+      const float ang = 0.6F * std::sin(ph);
+      pose[0][16][2] = ang;    // swing the shoulders (LBS articulation)
+      pose[0][17][2] = -ang;
+    }
     ncg::body::SmplxParams p{neutral.betas, pose, neutral.transl};
 
     const auto t0 = clk::now();
