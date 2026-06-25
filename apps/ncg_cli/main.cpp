@@ -34,6 +34,13 @@
 
 namespace {
 
+// Axis-angle [...,3] -> glTF quaternion [...,4] (x,y,z,w).
+torch::Tensor aa_to_quat(const torch::Tensor& aa) {
+  const auto angle = aa.norm(2, -1, true);
+  const auto axis = aa / angle.clamp_min(1e-8);
+  return torch::cat({axis * torch::sin(angle * 0.5), torch::cos(angle * 0.5)}, -1);
+}
+
 std::vector<std::string> split_csv(const std::string& s) {
   std::vector<std::string> out;
   std::stringstream ss(s);
@@ -507,8 +514,30 @@ int cmd_export(const ncg::app::Args& args) {
   mesh.faces = model.faces().to(at::kCPU);
   const auto normals = ncg::mesh::compute_vertex_normals(mesh);
   const auto out_path = args.get("out", "avatar.glb");
+  const int64_t J = model.num_joints();
 
-  if (args.get_int("rigged", 1) != 0) {  // default: export a rigged (animatable) character
+  if (args.has("animate") && J > 17) {
+    // Bake a gentle looping idle (breathing sway + slight head turn) so the avatar moves on import.
+    const int T = 30;
+    const float fps = 30.0F;
+    const auto opts = verts.options();
+    const auto ph = torch::arange(T, opts) * (2.0 * M_PI / T);  // [T]
+    const auto s = torch::sin(ph);
+    auto motion = torch::zeros({T, J, 3}, opts);  // axis-angle local pose per frame
+    motion.select(1, 3).select(1, 2).copy_(0.04 * s);    // spine sway (z)
+    motion.select(1, 6).select(1, 2).copy_(0.03 * s);    // spine2
+    motion.select(1, 15).select(1, 1).copy_(0.06 * s);   // head turn (y)
+    motion.select(1, 16).select(1, 2).copy_(0.05 * s);   // shoulders
+    motion.select(1, 17).select(1, 2).copy_(-0.05 * s);
+    const auto quats = aa_to_quat(motion);               // [T,J,4]
+    const auto times = torch::arange(T, opts) / fps;     // [T] seconds
+    ncg::mesh::write_glb_animated(mesh.vertices, mesh.faces, normals, colors.to(at::kCPU),
+                                  joints.to(at::kCPU), model.parents().to(at::kCPU),
+                                  model.lbs_weights().to(at::kCPU), quats.to(at::kCPU),
+                                  times.to(at::kCPU), out_path);
+    NCG_LOG_INFO("export (rigged + idle animation) -> {} ({} verts, {} joints, {} frames)", out_path,
+                 verts.size(0), J, T);
+  } else if (args.get_int("rigged", 1) != 0) {  // rigged (animatable) character
     ncg::mesh::write_glb_skinned(mesh.vertices, mesh.faces, normals, colors.to(at::kCPU),
                                  joints.to(at::kCPU), model.parents().to(at::kCPU),
                                  model.lbs_weights().to(at::kCPU), out_path);

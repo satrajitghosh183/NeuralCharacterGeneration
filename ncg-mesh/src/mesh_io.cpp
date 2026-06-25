@@ -348,4 +348,153 @@ void write_glb_skinned(const Tensor& vertices, const Tensor& faces, const Tensor
   os.write(glb.data(), static_cast<std::streamsize>(glb.size()));
 }
 
+void write_glb_animated(const Tensor& vertices, const Tensor& faces, const Tensor& normals,
+                        const Tensor& colors, const Tensor& joints_in, const Tensor& parents_in,
+                        const Tensor& skin_weights_in, const Tensor& rot_quats, const Tensor& times,
+                        const std::string& path) {
+  const auto v = vertices.to(at::kCPU, at::kFloat).contiguous();
+  const auto nrm = normals.to(at::kCPU, at::kFloat).contiguous();
+  const auto col = colors.to(at::kCPU, at::kFloat).contiguous();
+  const auto f = faces.to(at::kCPU, at::kInt).contiguous();
+  const auto jpos = joints_in.to(at::kCPU, at::kFloat).contiguous();
+  const auto parents = parents_in.to(at::kCPU, at::kLong).contiguous();
+  const auto quats = rot_quats.to(at::kCPU, at::kFloat).contiguous();   // [T,J,4]
+  const auto ts = times.to(at::kCPU, at::kFloat).contiguous();          // [T]
+  const int64_t V = v.size(0);
+  const int64_t F = f.size(0);
+  const int64_t J = jpos.size(0);
+  const int64_t T = ts.size(0);
+  NCG_CHECK(quats.dim() == 3 && quats.size(0) == T && quats.size(1) == J && quats.size(2) == 4,
+            "write_glb_animated: rot_quats must be [T,J,4]");
+
+  // top-4 skin weights
+  const auto sw = skin_weights_in.to(at::kCPU, at::kFloat);
+  auto tk = sw.topk(std::min<int64_t>(4, J), 1);
+  auto wval = std::get<0>(tk).contiguous();
+  auto widx = std::get<1>(tk).to(at::kInt).contiguous();
+  if (wval.size(1) < 4) {
+    wval = torch::constant_pad_nd(wval, {0, 4 - wval.size(1)}, 0.0);
+    widx = torch::constant_pad_nd(widx, {0, 4 - widx.size(1)}, 0);
+  }
+  wval = wval / wval.sum(1, true).clamp_min(1e-8F);
+
+  std::vector<char> bin;
+  std::ostringstream bvs;
+  std::ostringstream accs;
+  int idx = 0;
+  auto emit = [&](const void* data, size_t bytes, int comp, const char* type, int64_t count,
+                  int target, const std::string& extra) -> int {
+    const size_t off = bin.size();
+    append_bytes(bin, data, bytes);
+    while (bin.size() % 4 != 0) bin.push_back(0);
+    bvs << (idx ? "," : "") << "{\"buffer\":0,\"byteOffset\":" << off << ",\"byteLength\":" << bytes
+        << (target ? (",\"target\":" + std::to_string(target)) : "") << "}";
+    accs << (idx ? "," : "") << "{\"bufferView\":" << idx << ",\"componentType\":" << comp
+         << ",\"count\":" << count << ",\"type\":\"" << type << "\"" << extra << "}";
+    return idx++;
+  };
+
+  const auto vmin = std::get<0>(v.min(0));
+  const auto vmax = std::get<0>(v.max(0));
+  const auto* mn = vmin.data_ptr<float>();
+  const auto* mx = vmax.data_ptr<float>();
+  std::ostringstream pos_extra;
+  pos_extra << ",\"min\":[" << mn[0] << "," << mn[1] << "," << mn[2] << "],\"max\":[" << mx[0] << ","
+            << mx[1] << "," << mx[2] << "]";
+  const int aPos = emit(v.data_ptr<float>(), V * 12, 5126, "VEC3", V, 34962, pos_extra.str());
+  const int aNrm = emit(nrm.data_ptr<float>(), V * 12, 5126, "VEC3", V, 34962, "");
+  const int aCol = emit(col.data_ptr<float>(), V * 12, 5126, "VEC3", V, 34962, "");
+  {
+    std::vector<uint16_t> ji(static_cast<size_t>(V) * 4);
+    const auto* wi = widx.data_ptr<int32_t>();
+    for (size_t i = 0; i < ji.size(); ++i) ji[i] = static_cast<uint16_t>(wi[i]);
+    (void)emit(ji.data(), ji.size() * 2, 5123, "VEC4", V, 34962, "");
+  }
+  const int aW = emit(wval.contiguous().data_ptr<float>(), V * 16, 5126, "VEC4", V, 34962, "");
+  std::vector<float> ibm;
+  ibm.reserve(static_cast<size_t>(J) * 16);
+  const auto* jp = jpos.data_ptr<float>();
+  for (int64_t j = 0; j < J; ++j) {
+    const float m[16] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0,
+                         -jp[j * 3 + 0], -jp[j * 3 + 1], -jp[j * 3 + 2], 1};
+    for (float x : m) ibm.push_back(x);
+  }
+  const int aIBM = emit(ibm.data(), ibm.size() * 4, 5126, "MAT4", J, 0, "");
+  std::ostringstream t_extra;
+  t_extra << ",\"min\":[" << ts.min().item<float>() << "],\"max\":[" << ts.max().item<float>() << "]";
+  const int aTime = emit(ts.data_ptr<float>(), T * 4, 5126, "SCALAR", T, 0, t_extra.str());
+  std::vector<int> aQuat(static_cast<size_t>(J));
+  for (int64_t j = 0; j < J; ++j) {
+    const auto qj = quats.select(1, j).contiguous();  // [T,4]
+    aQuat[static_cast<size_t>(j)] = emit(qj.data_ptr<float>(), T * 16, 5126, "VEC4", T, 0, "");
+  }
+  int aIdx;
+  {
+    const auto* fp = f.data_ptr<int32_t>();
+    std::vector<uint32_t> ind(static_cast<size_t>(F) * 3);
+    for (size_t i = 0; i < ind.size(); ++i) ind[i] = static_cast<uint32_t>(fp[i]);
+    aIdx = emit(ind.data(), ind.size() * 4, 5125, "SCALAR", F * 3, 34963, "");
+  }
+
+  // nodes (joints + mesh) and animation channels
+  const auto* pp = parents.data_ptr<int64_t>();
+  std::vector<std::vector<int64_t>> children(static_cast<size_t>(J));
+  for (int64_t j = 1; j < J; ++j) children[static_cast<size_t>(pp[j])].push_back(j);
+  std::ostringstream js;
+  js << "{\"asset\":{\"version\":\"2.0\",\"generator\":\"NeuralCharGen\"},\"scene\":0,"
+     << "\"scenes\":[{\"nodes\":[0," << J << "]}],\"nodes\":[";
+  for (int64_t j = 0; j < J; ++j) {
+    const int64_t par = (j == 0) ? -1 : pp[j];
+    js << "{\"translation\":[" << jp[j * 3 + 0] - (par < 0 ? 0.0F : jp[par * 3 + 0]) << ","
+       << jp[j * 3 + 1] - (par < 0 ? 0.0F : jp[par * 3 + 1]) << ","
+       << jp[j * 3 + 2] - (par < 0 ? 0.0F : jp[par * 3 + 2]) << "]";
+    if (!children[static_cast<size_t>(j)].empty()) {
+      js << ",\"children\":[";
+      for (size_t k = 0; k < children[static_cast<size_t>(j)].size(); ++k)
+        js << (k ? "," : "") << children[static_cast<size_t>(j)][k];
+      js << "]";
+    }
+    js << "},";
+  }
+  js << "{\"mesh\":0,\"skin\":0}],";
+  js << "\"bufferViews\":[" << bvs.str() << "],\"accessors\":[" << accs.str() << "],";
+  js << "\"meshes\":[{\"primitives\":[{\"attributes\":{\"POSITION\":" << aPos << ",\"NORMAL\":"
+     << aNrm << ",\"COLOR_0\":" << aCol << ",\"JOINTS_0\":3,\"WEIGHTS_0\":" << aW
+     << "},\"indices\":" << aIdx << ",\"material\":0}]}],";
+  js << "\"skins\":[{\"inverseBindMatrices\":" << aIBM << ",\"skeleton\":0,\"joints\":[";
+  for (int64_t j = 0; j < J; ++j) js << (j ? "," : "") << j;
+  js << "]}],\"animations\":[{\"name\":\"clip\",\"samplers\":[";
+  for (int64_t j = 0; j < J; ++j)
+    js << (j ? "," : "") << "{\"input\":" << aTime << ",\"output\":" << aQuat[static_cast<size_t>(j)]
+       << ",\"interpolation\":\"LINEAR\"}";
+  js << "],\"channels\":[";
+  for (int64_t j = 0; j < J; ++j)
+    js << (j ? "," : "") << "{\"sampler\":" << j << ",\"target\":{\"node\":" << j
+       << ",\"path\":\"rotation\"}}";
+  js << "]}],\"materials\":[{\"pbrMetallicRoughness\":{\"baseColorFactor\":[1,1,1,1],"
+        "\"metallicFactor\":0,\"roughnessFactor\":1}}],\"buffers\":[{\"byteLength\":"
+     << bin.size() << "}]}";
+  std::string json = js.str();
+  while (json.size() % 4 != 0) json.push_back(' ');
+
+  std::vector<char> glb;
+  put_u32(glb, 0x46546C67);
+  put_u32(glb, 2);
+  put_u32(glb, 0);
+  put_u32(glb, static_cast<uint32_t>(json.size()));
+  put_u32(glb, 0x4E4F534A);
+  append_bytes(glb, json.data(), json.size());
+  put_u32(glb, static_cast<uint32_t>(bin.size()));
+  put_u32(glb, 0x004E4942);
+  append_bytes(glb, bin.data(), bin.size());
+  const uint32_t total = static_cast<uint32_t>(glb.size());
+  glb[8] = static_cast<char>(total & 0xff);
+  glb[9] = static_cast<char>((total >> 8) & 0xff);
+  glb[10] = static_cast<char>((total >> 16) & 0xff);
+  glb[11] = static_cast<char>((total >> 24) & 0xff);
+  std::ofstream os(path, std::ios::binary);
+  NCG_CHECK(os.good(), "write_glb_animated: cannot open '{}'", path);
+  os.write(glb.data(), static_cast<std::streamsize>(glb.size()));
+}
+
 }  // namespace ncg::mesh

@@ -63,3 +63,27 @@ TEST_CASE("write_glb_skinned embeds a skin + joints", "[mesh][glb]") {
   REQUIRE(json.find("WEIGHTS_0") != std::string::npos);
   REQUIRE(json.find("inverseBindMatrices") != std::string::npos);
 }
+
+TEST_CASE("write_glb_animated embeds a skeletal animation", "[mesh][glb]") {
+  auto [v, f] = tetra();
+  const auto joints = torch::tensor({{0.0F, 0.0F, 0.0F}, {0.0F, 0.5F, 0.0F}});
+  const auto parents = torch::tensor({0, 0}, torch::kLong);
+  const auto skin = torch::rand({4, 2});
+  const int T = 5;
+  const int J = 2;
+  const auto quats = torch::zeros({T, J, 4});
+  quats.select(2, 3).fill_(1.0);  // identity quaternions (x,y,z,w)=(0,0,0,1)
+  const auto times = torch::arange(T, torch::kFloat) / 30.0F;
+  const auto path = (std::filesystem::temp_directory_path() / "ncg_test_anim.glb").string();
+  ncg::mesh::write_glb_animated(v, f, torch::rand({4, 3}), torch::rand({4, 3}), joints, parents,
+                                skin, quats, times, path);
+
+  const auto b = read_file(path);
+  REQUIRE(std::string(b.data(), 4) == "glTF");
+  REQUIRE(u32_at(b, 8) == b.size());
+  const std::string json(b.data() + 20, u32_at(b, 12));
+  REQUIRE(json.find("\"animations\"") != std::string::npos);
+  REQUIRE(json.find("\"samplers\"") != std::string::npos);
+  REQUIRE(json.find("\"path\":\"rotation\"") != std::string::npos);
+  REQUIRE(json.find("\"skins\"") != std::string::npos);
+}

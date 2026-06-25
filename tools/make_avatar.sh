@@ -37,7 +37,7 @@ echo "uploaded $i image(s); building the avatar on the H100 (NLF takes ~30s)…"
 ssh "$HOST" "cd $REPO && export LD_LIBRARY_PATH=$TORCHLIB:\$LD_LIBRARY_PATH && \
   ./build/h100-release/apps/ncg_cli export \
     --smplx data/smplx_neutral.safetensors --image $first \
-    --weights models/nlf_l_multi.torchscript --detection 0 --out _make.glb"
+    --weights models/nlf_l_multi.torchscript --detection 0 --animate --out _make.glb"
 
 scp -q "$HOST:$REPO/_make.glb" "$OUT"
 echo "✅ done → $OUT"

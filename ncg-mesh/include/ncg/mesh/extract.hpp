@@ -48,4 +48,12 @@ void write_glb_skinned(const Tensor& vertices, const Tensor& faces, const Tensor
                        const Tensor& colors, const Tensor& joints, const Tensor& parents,
                        const Tensor& skin_weights, const std::string& path);
 
+/// Rigged glTF (.glb) WITH a baked skeletal animation — the avatar plays it on import in
+/// Unity/Unreal. `rot_quats` [T,J,4] are per-frame local joint rotations as glTF quaternions
+/// (x,y,z,w); `times` [T] are keyframe times in seconds. Requires normals + colors.
+void write_glb_animated(const Tensor& vertices, const Tensor& faces, const Tensor& normals,
+                        const Tensor& colors, const Tensor& joints, const Tensor& parents,
+                        const Tensor& skin_weights, const Tensor& rot_quats, const Tensor& times,
+                        const std::string& path);
+
 }  // namespace ncg::mesh
