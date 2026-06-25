@@ -51,14 +51,33 @@ Machine-precision commutation: posing then relighting equals relighting then pos
 normals are transported by the blended bone rotation. This is the property naive splat avatars
 violate (they bake shading), and the reason no engine plugin does animate+relight.
 
+## Comparison — relightability vs NeRF / vanilla 3DGS (the key ablation)
+
+NeRF and 3DGS reconstruct **radiance** — they bake the capture lighting and *cannot* relight. Ours
+recovers **albedo**. Evaluated under a novel, never-seen light (the radiance baseline is given its
+best global scale to the target, i.e. its best case):
+
+| method | relight error under novel light |
+|---|---|
+| **ours (relightable inverse rendering)** | **0.086 ± 0.022** |
+| radiance baseline (NeRF / 3DGS, baked) | 0.528 ± 0.044 |
+
+Ours is **6.2× more accurate** under relighting. The baseline's error is essentially the entire
+lighting variation it cannot represent — the quantified reason a relightable method is needed.
+
 ## Throughput
 
 | op | time | rate |
 |---|---|---|
-| forward-splat render (512×512, 10,475 gaussians) | 3.09 ± 0.03 ms | **324 FPS** (real-time) |
+| **animate + relight runtime** (LBS pose → normal transport → SH relight → splat, 512×512) | 6.78 ms/frame | **147 FPS** (real-time) |
+| forward-splat render alone (512×512, 10,475 gaussians) | 3.09 ± 0.03 ms | **324 FPS** |
 | inverse-render solve (N=8, 60 iters, V=10,475) | ~62 ms | — |
 | NLF forward (image → SMPL-X, with test-time aug) | ~28 s | — (one-time, ported) |
 | per-subject 3DGS refine (600px, 4000 iters) | ~14 min | — (offline, optional) |
+
+The 147 FPS animate+relight runtime is the deployable forward path (the systems leg). Its
+differentiable counterpart for training is `render_soft`; an optimized tiled fwd+bwd rasterizer is
+further engineering.
 
 ## Qualitative — real photos
 
