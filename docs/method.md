@@ -334,3 +334,10 @@ recovery principle, from **casual** data, with **identifiability** on both manif
 **commuting animate+relight** real-time runtime. Prior motion-style work uses clean labeled mocap;
 none recovers style from noisy casual video *and* unifies it with relightable appearance into one
 personalized avatar. That intersection is new.
+
+> **Empirical support (2026-06-25, `tests/recon/test_motion_style.cpp`, green on H100):** with the
+> robust ALS solver, held-out-action transfer error is **0.004 at 6 actions vs 0.580 at 2 actions**
+> — the full style is identifiable only with action diversity, exactly the C1 effect on the pose
+> manifold. Under **30% cut/outlier frames**, robust = **0.004 vs naive 0.735** — robust recovery
+> is essentially exact where naive pooling collapses. (Synthetic ground-truth factors; real-video
+> + a generative real-time controller are the next steps.)

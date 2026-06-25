@@ -65,6 +65,23 @@ best global scale to the target, i.e. its best case):
 Ours is **6.2× more accurate** under relighting. The baseline's error is essentially the entire
 lighting variation it cannot represent — the quantified reason a relightable method is needed.
 
+## C4 — motion-style identity (the pose-manifold analog of C1/C2)
+
+Recovering a person's motion **style** (shared low-rank subspace) from several casual clips, where
+each *action* exercises only part of the style. Metric: held-out-action transfer error (project a
+new action's poses onto the recovered style; lower = style subspace recovered).
+
+| setting | transfer error |
+|---|---|
+| **6 actions** (diverse) | **0.004** |
+| 2 actions (few) | 0.580 |
+| **robust**, 30% cut frames | **0.004** |
+| naive, 30% cut frames | 0.735 |
+
+Action diversity recovers the full style (0.4%) where too few actions cannot (58%) — the C1 effect
+on motion. Robust factorization is essentially exact under heavy cut/outlier corruption where naive
+pooling collapses — the C2 effect on motion. *Same principle, second manifold.*
+
 ## Throughput
 
 | op | time | rate |
