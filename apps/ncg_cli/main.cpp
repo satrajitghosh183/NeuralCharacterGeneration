@@ -1011,7 +1011,7 @@ int main(int argc, char** argv) {
     std::fprintf(stderr,
                  "usage: ncg_cli "
                  "<pipeline|render|turntable|select|fitimg|fit|fuse|relight|export|benchmark|"
-                 "nerf> [--flags]\n");
+                 "runtime|nerf|style> [--flags]\n");
     return 2;
   }
   const std::string cmd = argv[1];
