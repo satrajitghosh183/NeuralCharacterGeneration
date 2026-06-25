@@ -617,6 +617,76 @@ int cmd_delight(const ncg::app::Args& args) {
   return 0;
 }
 
+// Real-time animate+relight runtime (the deployable forward path, the systems leg): per frame,
+// pose the body (LBS), transport the shading normals with the bones (C3), relight under a moving
+// light (SH), and splat — all on the GPU. Reports FPS. The differentiable counterpart for
+// training is render_soft; a tiled fwd+bwd production rasterizer is further work.
+//   ncg_cli runtime --smplx smplx.safetensors [--frames 60 --albedo 0.78]
+int cmd_runtime(const ncg::app::Args& args) {
+  NCG_CHECK(ncg::cuda_available(), "runtime requires a CUDA device");
+  const auto device = at::Device(at::kCUDA, 0);
+  auto model = ncg::body::SmplxModel::load(args.require("smplx"), device);
+  NCG_CHECK(model.has_faces(), "runtime needs a SMPL-X model with faces");
+  const int64_t J = model.num_joints();
+  const auto neutral = model.neutral_params(1);
+  const auto vcanon = model.forward(neutral).vertices.squeeze(0);  // [V,3]
+  ncg::mesh::TriMesh cm;
+  cm.vertices = vcanon.to(at::kCPU);
+  cm.faces = model.faces().to(at::kCPU);
+  const auto ncanon = ncg::mesh::compute_vertex_normals(cm).to(device);     // [V,3]
+  const auto pvs = ncg::recon::per_vertex_scale(vcanon, 0.75F);             // precompute once
+  const auto albedo = torch::full({vcanon.size(0), 3}, args.get_float("albedo", 0.78F),
+                                  vcanon.options());
+  const auto pose0 = neutral.pose_aa.reshape({1, J, 3});
+  const auto opts = vcanon.options();
+  const auto white = torch::ones({3}, opts);
+  const float el = 25.0F * static_cast<float>(M_PI) / 180.0F;
+
+  auto rec = ncg::record::Recorder::create("runs", args.get("run", "runtime"));
+  const int frames = args.get_int("frames", 60);
+  using clk = std::chrono::high_resolution_clock;
+  std::vector<double> ft;
+  for (int i = 0; i < frames; ++i) {
+    const float ph = 2.0F * static_cast<float>(M_PI) * static_cast<float>(i) / frames;
+    const float ang = 0.6F * std::sin(ph);
+    auto pose = pose0.clone();
+    pose[0][16][2] = ang;    // swing the shoulders (LBS articulation)
+    pose[0][17][2] = -ang;
+    ncg::body::SmplxParams p{neutral.betas, pose, neutral.transl};
+
+    const auto t0 = clk::now();
+    const auto body = model.forward(p);                     // LBS animate
+    const auto verts = body.vertices.squeeze(0);
+    const auto VT = body.vertex_transforms.squeeze(0);      // [V,4,4]
+    const auto Rv = VT.narrow(1, 0, 3).narrow(2, 0, 3);     // [V,3,3] per-vertex rotation
+    auto nt = torch::einsum("vab,vb->va", {Rv, ncanon});    // transport normals (C3)
+    nt = nt / nt.norm(2, -1, true).clamp_min(1e-8);
+    const auto az = ph;                                     // light orbits with the animation
+    const auto dir = torch::tensor(
+        {std::cos(el) * std::cos(az), std::sin(el), std::cos(el) * std::sin(az)}, opts);
+    const auto colors =
+        ncg::recon::shade_sh(albedo, ncg::recon::sh_directional_light(dir, white, 0.25F), nt)
+            .clamp(0.0, 1.0);
+    auto cloud = ncg::recon::gaussians_on_body(verts, 0.012F, colors, pvs);
+    cloud.to_(device);
+    const auto cam = ncg::runtime::Camera::orbit(verts.mean(0), 2.5F, 20.0F, 10.0F, 50.0F, 512, 512,
+                                                 device);
+    const auto img = ncg::runtime::render_gaussians(cloud, cam).image;
+    const double sync = img.sum().item<double>();
+    ft.push_back(std::chrono::duration<double, std::milli>(clk::now() - t0).count());
+    (void)sync;
+    char nm[32];
+    std::snprintf(nm, sizeof(nm), "frame_%03d", i);
+    rec.log_image("runtime", nm, img);
+  }
+  double m = 0.0;
+  for (double x : ft) m += x;
+  m /= static_cast<double>(ft.size());
+  NCG_LOG_INFO("runtime: animate+relight {} frames @ {:.2f} ms/frame ({:.0f} FPS) -> {}", frames, m,
+               1000.0 / m, rec.dir().string());
+  return 0;
+}
+
 // Benchmark the inverse-rendering method on real SMPL-X geometry (the paper's figures):
 // albedo error vs #photos (C1) and vs corruption rate, robust vs non-robust (C2), + relighting
 // error under a novel light. Synthetic ground-truth albedo so error is measurable.
@@ -827,6 +897,7 @@ int main(int argc, char** argv) {
     if (cmd == "export") return cmd_export(args);
     if (cmd == "benchmark") return cmd_benchmark(args);
     if (cmd == "delight") return cmd_delight(args);
+    if (cmd == "runtime") return cmd_runtime(args);
     if (cmd == "nerf") return cmd_nerf(args);
     std::fprintf(stderr, "unknown command '%s'\n", cmd.c_str());
     return 2;
