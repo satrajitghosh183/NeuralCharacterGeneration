@@ -21,3 +21,9 @@ ncg_add_test(test_inverse_render
   SOURCES test_inverse_render.cpp
   DEPS    ncg::recon
   LABELS  "recon")
+
+# C4 — robust cross-action motion-style factorization (CPU).
+ncg_add_test(test_motion_style
+  SOURCES test_motion_style.cpp
+  DEPS    ncg::recon
+  LABELS  "recon")
