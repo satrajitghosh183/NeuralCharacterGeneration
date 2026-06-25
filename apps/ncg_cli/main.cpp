@@ -11,6 +11,7 @@
 #include <ncg/core/logging.hpp>
 #include <ncg/fit/fit_image.hpp>
 #include <ncg/io/image.hpp>
+#include <ncg/io/npy.hpp>
 #include <ncg/mesh/extract.hpp>
 #include <ncg/nerf/nerf.hpp>
 #include <ncg/recon/appearance.hpp>
@@ -562,27 +563,38 @@ int cmd_export(const ncg::app::Args& args) {
   const auto out_path = args.get("out", "avatar.glb");
   const int64_t J = model.num_joints();
 
-  if (args.has("animate") && J > 17) {
-    // Bake a gentle looping idle (breathing sway + slight head turn) so the avatar moves on import.
-    const int T = 30;
-    const float fps = 30.0F;
+  if ((args.has("animate") || args.has("motion")) && J > 17) {
     const auto opts = verts.options();
-    const auto ph = torch::arange(T, opts) * (2.0 * M_PI / T);  // [T]
-    const auto s = torch::sin(ph);
-    auto motion = torch::zeros({T, J, 3}, opts);  // axis-angle local pose per frame
-    motion.select(1, 3).select(1, 2).copy_(0.04 * s);    // spine sway (z)
-    motion.select(1, 6).select(1, 2).copy_(0.03 * s);    // spine2
-    motion.select(1, 15).select(1, 1).copy_(0.06 * s);   // head turn (y)
-    motion.select(1, 16).select(1, 2).copy_(0.05 * s);   // shoulders
-    motion.select(1, 17).select(1, 2).copy_(-0.05 * s);
-    const auto quats = aa_to_quat(motion);               // [T,J,4]
-    const auto times = torch::arange(T, opts) / fps;     // [T] seconds
+    const float fps = args.get_float("fps", 30.0F);
+    torch::Tensor motion;  // [T,J,3] axis-angle local pose per frame
+    const char* kind = "idle";
+    if (args.has("motion")) {
+      // Drive the avatar with an extracted SMPL-X motion sequence (tools/extract_motion.py).
+      motion = ncg::io::load_npy(args.require("motion")).to(opts);
+      NCG_CHECK(motion.dim() == 3 && motion.size(1) == J && motion.size(2) == 3,
+                "export: --motion .npy must be [T,{},3]", J);
+      if (args.get_int("inplace", 1) != 0) motion.select(1, 0).zero_();  // drop global orient
+      kind = "mocap";
+    } else {
+      // Gentle looping idle (breathing sway + head turn) so the avatar moves on import.
+      const int T = 30;
+      const auto s = torch::sin(torch::arange(T, opts) * (2.0 * M_PI / T));
+      motion = torch::zeros({T, J, 3}, opts);
+      motion.select(1, 3).select(1, 2).copy_(0.04 * s);
+      motion.select(1, 6).select(1, 2).copy_(0.03 * s);
+      motion.select(1, 15).select(1, 1).copy_(0.06 * s);
+      motion.select(1, 16).select(1, 2).copy_(0.05 * s);
+      motion.select(1, 17).select(1, 2).copy_(-0.05 * s);
+    }
+    const int64_t T = motion.size(0);
+    const auto quats = aa_to_quat(motion);            // [T,J,4]
+    const auto times = torch::arange(T, opts) / fps;  // [T] seconds
     ncg::mesh::write_glb_animated(mesh.vertices, mesh.faces, normals, colors.to(at::kCPU),
                                   joints.to(at::kCPU), model.parents().to(at::kCPU),
                                   model.lbs_weights().to(at::kCPU), quats.to(at::kCPU),
                                   times.to(at::kCPU), out_path);
-    NCG_LOG_INFO("export (rigged + idle animation) -> {} ({} verts, {} joints, {} frames)", out_path,
-                 verts.size(0), J, T);
+    NCG_LOG_INFO("export (rigged + {} animation) -> {} ({} verts, {} joints, {} frames)", kind,
+                 out_path, verts.size(0), J, T);
   } else if (args.get_int("rigged", 1) != 0) {  // rigged (animatable) character
     ncg::mesh::write_glb_skinned(mesh.vertices, mesh.faces, normals, colors.to(at::kCPU),
                                  joints.to(at::kCPU), model.parents().to(at::kCPU),
