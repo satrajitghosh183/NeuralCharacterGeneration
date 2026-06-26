@@ -1,0 +1,189 @@
+<!DOCTYPE html>
+<!--
+  Rock Walker — a tiny browser game that plays the rigged, textured avatar produced by
+  `ncg_cli avatar` (rock_*.glb / rock_*_textured.glb). Zero setup: open this file in a browser and
+  drop a .glb on it (or place one named `rock.glb` next to it). WASD to walk, mouse-drag to look,
+  Space to jump, collect the glowing coins.
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Rock Walker</title>
+<style>
+  html,body{margin:0;height:100%;overflow:hidden;background:#0b0e14;font-family:system-ui,sans-serif;color:#cfe}
+  #hud{position:fixed;top:12px;left:12px;z-index:10;font-size:14px;line-height:1.5;
+       background:rgba(0,0,0,.45);padding:10px 14px;border-radius:8px;pointer-events:none}
+  #hud b{color:#ffd36b}
+  #drop{position:fixed;inset:0;display:flex;align-items:center;justify-content:center;z-index:20;
+        background:rgba(5,8,14,.92);font-size:18px;text-align:center}
+  #drop.hide{display:none}
+  #drop .box{border:2px dashed #3a5;border-radius:14px;padding:40px 60px}
+  kbd{background:#1c2330;border:1px solid #2c3950;border-radius:4px;padding:1px 6px}
+</style>
+</head>
+<body>
+<div id="hud">
+  <div><b>Rock Walker</b></div>
+  <div>Score: <b id="score">0</b> &nbsp;|&nbsp; Coins: <b id="coins">0</b>/<b id="total">0</b></div>
+  <div><kbd>W</kbd><kbd>A</kbd><kbd>S</kbd><kbd>D</kbd> walk · <kbd>Space</kbd> jump · drag to look</div>
+</div>
+<div id="drop"><div class="box">Drop a <b>.glb</b> here<br/><small>(rock_textured.glb / rock_char.glb)</small><br/><br/>
+  <small>…or place one named <code>rock.glb</code> beside this file</small></div></div>
+
+<script type="importmap">
+{ "imports": {
+  "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+  "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+}}
+</script>
+<script type="module">
+import * as THREE from 'three';
+import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setSize(innerWidth, innerHeight);
+renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+renderer.outputColorSpace = THREE.SRGBColorSpace;
+renderer.shadowMap.enabled = true;
+document.body.appendChild(renderer.domElement);
+
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x0b0e14);
+scene.fog = new THREE.Fog(0x0b0e14, 18, 55);
+
+const camera = new THREE.PerspectiveCamera(55, innerWidth / innerHeight, 0.05, 200);
+
+// Lights
+const hemi = new THREE.HemisphereLight(0xbcd6ff, 0x202830, 1.0); scene.add(hemi);
+const sun = new THREE.DirectionalLight(0xffffff, 2.2);
+sun.position.set(6, 12, 4); sun.castShadow = true;
+sun.shadow.mapSize.set(2048, 2048); sun.shadow.camera.near = 1; sun.shadow.camera.far = 50;
+sun.shadow.camera.left = -20; sun.shadow.camera.right = 20; sun.shadow.camera.top = 20; sun.shadow.camera.bottom = -20;
+scene.add(sun);
+
+// Ground
+const ground = new THREE.Mesh(
+  new THREE.CircleGeometry(60, 64),
+  new THREE.MeshStandardMaterial({ color: 0x1a2230, roughness: 1 }));
+ground.rotation.x = -Math.PI / 2; ground.receiveShadow = true; scene.add(ground);
+const grid = new THREE.GridHelper(120, 120, 0x2e3a52, 0x202a3c);
+grid.position.y = 0.01; scene.add(grid);
+
+// Coins
+const coinMat = new THREE.MeshStandardMaterial({ color: 0xffd36b, emissive: 0x6b4a00, metalness: 0.6, roughness: 0.3 });
+const coins = [];
+function spawnCoins(n) {
+  coins.forEach(c => scene.remove(c)); coins.length = 0;
+  for (let i = 0; i < n; i++) {
+    const c = new THREE.Mesh(new THREE.TorusGeometry(0.35, 0.13, 12, 24), coinMat);
+    const a = Math.random() * Math.PI * 2, r = 4 + Math.random() * 22;
+    c.position.set(Math.cos(a) * r, 1.0, Math.sin(a) * r);
+    c.castShadow = true; scene.add(c); coins.push(c);
+  }
+  document.getElementById('total').textContent = n;
+}
+spawnCoins(12);
+
+// Player state
+const player = new THREE.Group(); scene.add(player);
+let mixer = null, model = null;
+let velY = 0, onGround = true, score = 0, collected = 0;
+let yaw = 0, camYaw = 2.4, camPitch = 0.35, camDist = 4.5;
+
+const keys = {};
+addEventListener('keydown', e => { keys[e.code] = true; });
+addEventListener('keyup', e => { keys[e.code] = false; });
+let dragging = false, lx = 0, ly = 0;
+renderer.domElement.addEventListener('mousedown', e => { dragging = true; lx = e.clientX; ly = e.clientY; });
+addEventListener('mouseup', () => dragging = false);
+addEventListener('mousemove', e => {
+  if (!dragging) return;
+  camYaw += (e.clientX - lx) * 0.005; camPitch = Math.max(-0.2, Math.min(1.2, camPitch + (e.clientY - ly) * 0.005));
+  lx = e.clientX; ly = e.clientY;
+});
+addEventListener('wheel', e => { camDist = Math.max(2, Math.min(12, camDist + e.deltaY * 0.003)); });
+addEventListener('resize', () => {
+  camera.aspect = innerWidth / innerHeight; camera.updateProjectionMatrix();
+  renderer.setSize(innerWidth, innerHeight);
+});
+
+function loadGLB(url, revoke) {
+  new GLTFLoader().load(url, gltf => {
+    if (model) player.remove(model);
+    model = gltf.scene;
+    model.traverse(o => { if (o.isMesh) { o.castShadow = true; o.frustumCulled = false; } });
+    // normalize: drop the character's feet to y=0 and scale to ~1.8m tall
+    const box = new THREE.Box3().setFromObject(model);
+    const size = new THREE.Vector3(); box.getSize(size);
+    const s = 1.8 / (size.y || 1); model.scale.setScalar(s);
+    const box2 = new THREE.Box3().setFromObject(model);
+    model.position.y -= box2.min.y; model.position.x -= (box2.min.x + box2.max.x) / 2 * 0 + 0;
+    player.add(model);
+    mixer = gltf.animations.length ? new THREE.AnimationMixer(model) : null;
+    if (mixer) mixer.clipAction(gltf.animations[0]).play();
+    document.getElementById('drop').classList.add('hide');
+    if (revoke) URL.revokeObjectURL(url);
+  }, undefined, err => { console.warn('load failed', err); });
+}
+
+// drag & drop
+const drop = document.getElementById('drop');
+addEventListener('dragover', e => e.preventDefault());
+addEventListener('drop', e => {
+  e.preventDefault();
+  const f = e.dataTransfer.files[0];
+  if (f && f.name.endsWith('.glb')) loadGLB(URL.createObjectURL(f), true);
+});
+// try a sibling rock.glb by default
+loadGLB('rock.glb', false);
+
+const clock = new THREE.Clock();
+function tick() {
+  const dt = Math.min(clock.getDelta(), 0.05);
+  // movement relative to camera yaw
+  const f = new THREE.Vector3(Math.sin(camYaw), 0, Math.cos(camYaw));
+  const r = new THREE.Vector3(f.z, 0, -f.x);
+  const mv = new THREE.Vector3();
+  if (keys['KeyW']) mv.sub(f); if (keys['KeyS']) mv.add(f);
+  if (keys['KeyA']) mv.sub(r); if (keys['KeyD']) mv.add(r);
+  const moving = mv.lengthSq() > 1e-4;
+  if (moving) { mv.normalize(); player.position.addScaledVector(mv, 3.2 * dt); yaw = Math.atan2(mv.x, mv.z); }
+  // face heading (smooth)
+  player.rotation.y += (yaw - player.rotation.y) * Math.min(1, dt * 12);
+  // jump + gravity
+  if (keys['Space'] && onGround) { velY = 4.6; onGround = false; }
+  velY -= 12 * dt; player.position.y += velY * dt;
+  if (player.position.y <= 0) { player.position.y = 0; velY = 0; onGround = true; }
+
+  // animation speed scales with movement
+  if (mixer) mixer.update(dt * (moving ? 1.6 : 1.0));
+
+  // coins
+  for (const c of coins) {
+    if (!c.visible) continue;
+    c.rotation.y += dt * 2; c.position.y = 1.0 + Math.sin(performance.now() * 0.003 + c.position.x) * 0.15;
+    if (c.position.distanceTo(player.position.clone().setY(1.0)) < 1.1) {
+      c.visible = false; collected++; score += 100;
+      document.getElementById('score').textContent = score;
+      document.getElementById('coins').textContent = collected;
+      if (collected === coins.length) setTimeout(() => { collected = 0; document.getElementById('coins').textContent = 0; spawnCoins(12); }, 600);
+    }
+  }
+
+  // third-person camera
+  const target = player.position.clone().add(new THREE.Vector3(0, 1.2, 0));
+  const eye = target.clone().add(new THREE.Vector3(
+    Math.cos(camPitch) * Math.sin(camYaw) * camDist,
+    Math.sin(camPitch) * camDist + 0.4,
+    Math.cos(camPitch) * Math.cos(camYaw) * camDist));
+  camera.position.lerp(eye, Math.min(1, dt * 8));
+  camera.lookAt(target);
+
+  renderer.render(scene, camera);
+  requestAnimationFrame(tick);
+}
+tick();
+</script>
+</body>
+</html>
