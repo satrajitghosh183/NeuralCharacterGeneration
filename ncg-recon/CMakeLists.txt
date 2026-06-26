@@ -8,6 +8,7 @@ ncg_add_library(ncg-recon
     src/appearance.cpp
     src/inverse_render.cpp
     src/motion_style.cpp
+    src/uv_texture.cpp
   PUBLIC_DEPS
     ncg::core
     torch)

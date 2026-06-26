@@ -27,3 +27,9 @@ ncg_add_test(test_motion_style
   SOURCES test_motion_style.cpp
   DEPS    ncg::recon
   LABELS  "recon")
+
+# UV rasterizer + bake — per-texel albedo foundation (CPU).
+ncg_add_test(test_uv_texture
+  SOURCES test_uv_texture.cpp
+  DEPS    ncg::recon
+  LABELS  "recon")
