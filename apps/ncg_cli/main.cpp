@@ -1099,7 +1099,10 @@ int cmd_avatar(const ncg::app::Args& args) {
   cfg.per_view_exposure = args.get_int("exposure", 1) != 0;
   cfg.log_every = 50;
   cfg.dump_every = args.get_int("dump-every", 500);
-  const auto canonical = ncg::fit::fit_avatar(model, betas0, frames, init_colors, cfg, &rec);
+  cfg.densify = args.get_int("densify", 0) != 0;
+  const auto result = ncg::fit::fit_avatar(model, betas0, frames, init_colors, cfg, &rec);
+  const auto& canonical = result.canonical;
+  const auto& binding = result.binding;
 
   // Fit-check: render the avatar at frame 0's pose/camera next to the target.
   const auto prefix = args.get("out-prefix", "avatar");
@@ -1109,7 +1112,7 @@ int cmd_avatar(const ncg::app::Args& args) {
     p0.pose_aa = frames[0].pose_aa.unsqueeze(0);
     p0.transl = frames[0].transl.unsqueeze(0);
     const auto vt0 = model.forward(p0).vertex_transforms.squeeze(0);
-    const auto posed = ncg::fit::deform_avatar(canonical, vt0);
+    const auto posed = ncg::fit::deform_avatar(canonical, vt0, binding);
     const auto out0 = ncg::runtime::render_soft_aniso(posed, frames[0].camera);
     const auto fit = out0.image.detach();
     ncg::io::save_png(prefix + "_fit0.png", fit);
