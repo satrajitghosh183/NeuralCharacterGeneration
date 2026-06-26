@@ -31,17 +31,38 @@ struct AvatarFitConfig {
   float init_scale = 0.015F;        // canonical Gaussian std-dev (world units)
   bool use_mask = true;             // supervise inside each frame's posed body silhouette
   bool per_view_exposure = true;    // casual frames vary in exposure / white balance
+
+  // Adaptive density control (off by default). Densified Gaussians inherit their parent's vertex
+  // binding, so they still skin. Requires lr_position > 0 to produce a position-gradient signal.
+  bool densify = false;
+  int densify_from = 500;
+  int densify_until = 2500;
+  int densify_every = 200;
+  double densify_grad = 5e-5;      // mean accumulated position-gradient norm to densify
+  double densify_scale_frac = 0.4;  // split (vs clone) when scale exceeds this fraction of init_scale
+  double prune_opacity = 0.05;
+  int64_t max_gaussians = 800000;
+
   int log_every = 100;
   int dump_every = 0;
 };
 
-/// Skins a canonical Gaussian cloud (bound 1:1 to SMPL-X vertices, so N == V) to a pose given that
-/// pose's per-vertex rest→posed transforms `vertex_transforms` ([V,4,4]). Positions are rigidly
-/// transformed; orientations are rotated by the transform's rotation (so the anisotropic splats
-/// follow the body); scales/opacity/color are pose-invariant. Returns the posed cloud, ready to
-/// render. This is the deployable deformation used both in training and at runtime.
+/// Skins a canonical Gaussian cloud to a pose given that pose's per-vertex rest→posed transforms
+/// `vertex_transforms` ([V,4,4]). Positions are rigidly transformed; orientations are rotated by
+/// the transform's rotation (so the anisotropic splats follow the body); scales/opacity/color are
+/// pose-invariant. `binding` ([N] int64) maps each Gaussian to the SMPL-X vertex whose transform
+/// skins it — required once densification breaks the 1:1 correspondence; if empty, a 1:1 binding
+/// (N == V) is assumed. Returns the posed cloud, ready to render. Deployable at training + runtime.
 recon::GaussianCloud deform_avatar(const recon::GaussianCloud& canonical,
-                                   const Tensor& vertex_transforms);
+                                   const Tensor& vertex_transforms, const Tensor& binding = {});
+
+/// Result of an avatar fit: the canonical (rest-pose) cloud and, when densification ran, the
+/// per-Gaussian SMPL-X vertex binding needed to skin it (pass to deform_avatar). `binding` is
+/// empty for a 1:1 (non-densified) fit, where deform_avatar needs no binding.
+struct AvatarFitResult {
+  recon::GaussianCloud canonical;
+  Tensor binding;  // [N] int64, or empty for 1:1
+};
 
 /// Trains an animatable Gaussian avatar from posed video frames. Canonical Gaussians (one per
 /// SMPL-X vertex, seeded at the rest body and colored by `init_colors` [V,3]) are optimized so
@@ -49,9 +70,9 @@ recon::GaussianCloud deform_avatar(const recon::GaussianCloud& canonical,
 /// reproduce the frames (L1 + D-SSIM, per-frame exposure, body-masked). Because every frame
 /// constrains the same canonical appearance, multi-pose casual video becomes multi-view evidence
 /// for one avatar — the route from a textured mannequin to a real likeness. Returns the canonical
-/// (rest-pose) cloud; animate it with deform_avatar or the runtime.
-recon::GaussianCloud fit_avatar(const body::SmplxModel& model, const Tensor& betas,
-                                const std::vector<AvatarFrame>& frames, const Tensor& init_colors,
-                                const AvatarFitConfig& cfg, record::Recorder* recorder = nullptr);
+/// (rest-pose) cloud + its vertex binding; animate it with deform_avatar or the runtime.
+AvatarFitResult fit_avatar(const body::SmplxModel& model, const Tensor& betas,
+                           const std::vector<AvatarFrame>& frames, const Tensor& init_colors,
+                           const AvatarFitConfig& cfg, record::Recorder* recorder = nullptr);
 
 }  // namespace ncg::fit

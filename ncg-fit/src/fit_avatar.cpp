@@ -58,14 +58,17 @@ Tensor quat_mul(const Tensor& a, const Tensor& b) {
 
 }  // namespace
 
-recon::GaussianCloud deform_avatar(const recon::GaussianCloud& canonical, const Tensor& vt) {
-  NCG_CHECK(vt.dim() == 3 && vt.size(1) == 4 && vt.size(2) == 4,
+recon::GaussianCloud deform_avatar(const recon::GaussianCloud& canonical, const Tensor& vt_in,
+                                   const Tensor& binding) {
+  NCG_CHECK(vt_in.dim() == 3 && vt_in.size(1) == 4 && vt_in.size(2) == 4,
             "deform_avatar: vertex_transforms must be [V,4,4]");
+  // Select each Gaussian's skinning transform: 1:1 when no binding, else gather by vertex index.
+  const auto vt = binding.defined() && binding.numel() > 0 ? vt_in.index_select(0, binding) : vt_in;
   NCG_CHECK(canonical.size() == vt.size(0),
-            "deform_avatar: cloud size must equal vertex count (1:1 binding)");
+            "deform_avatar: cloud size must match transforms (provide --binding after densify)");
   using torch::indexing::Slice;
-  const auto Rm = vt.index({Slice(), Slice(0, 3), Slice(0, 3)});  // [V,3,3]
-  const auto tm = vt.index({Slice(), Slice(0, 3), 3});            // [V,3]
+  const auto Rm = vt.index({Slice(), Slice(0, 3), Slice(0, 3)});  // [N,3,3]
+  const auto tm = vt.index({Slice(), Slice(0, 3), 3});            // [N,3]
 
   recon::GaussianCloud g;
   g.positions = torch::matmul(Rm, canonical.positions.unsqueeze(2)).squeeze(2) + tm;  // [V,3]
@@ -76,9 +79,9 @@ recon::GaussianCloud deform_avatar(const recon::GaussianCloud& canonical, const 
   return g;
 }
 
-recon::GaussianCloud fit_avatar(const body::SmplxModel& model, const Tensor& betas_in,
-                                const std::vector<AvatarFrame>& frames, const Tensor& init_colors,
-                                const AvatarFitConfig& cfg, record::Recorder* rec) {
+AvatarFitResult fit_avatar(const body::SmplxModel& model, const Tensor& betas_in,
+                           const std::vector<AvatarFrame>& frames, const Tensor& init_colors,
+                           const AvatarFitConfig& cfg, record::Recorder* rec) {
   NCG_CHECK(!frames.empty(), "fit_avatar: no frames");
   const auto device = model.device();
   const auto opts = at::TensorOptions().dtype(at::kFloat).device(device);
@@ -108,16 +111,19 @@ recon::GaussianCloud fit_avatar(const body::SmplxModel& model, const Tensor& bet
     transforms[f] = model.forward(p).vertex_transforms.squeeze(0).detach();  // [V,4,4]
   }
 
-  // Optimizable canonical leaves.
-  auto positions = rest_verts.clone().set_requires_grad(cfg.lr_position > 0);
-  auto log_scales =
-      torch::full({V, 3}, std::log(cfg.init_scale), opts).set_requires_grad(true);
+  // Densification needs a position-gradient signal, so positions must be trainable then (even at a
+  // tiny lr they barely move; the gradient drives clone/split decisions).
+  const double lr_pos = (cfg.densify && cfg.lr_position <= 0) ? 1e-4 : cfg.lr_position;
+
+  // Optimizable canonical leaves (reassigned wholesale when densification changes the count).
+  auto positions = rest_verts.clone().set_requires_grad(lr_pos > 0);
+  auto log_scales = torch::full({V, 3}, std::log(cfg.init_scale), opts).set_requires_grad(true);
   auto quats = torch::zeros({V, 4}, opts);
   quats.select(1, 0).fill_(1.0);
   quats = quats.set_requires_grad(true);
   auto color_logits = inv_sigmoid(init_colors.to(opts)).set_requires_grad(true);
-  auto opacity_logits =
-      inv_sigmoid(torch::full({V, 1}, 0.9F, opts)).set_requires_grad(true);
+  auto opacity_logits = inv_sigmoid(torch::full({V, 1}, 0.9F, opts)).set_requires_grad(true);
+  auto binding = torch::arange(V, at::TensorOptions().dtype(at::kLong).device(device));  // [N]→vert
   auto gain = torch::ones({F, 3}, opts).set_requires_grad(cfg.per_view_exposure);
   auto bias = torch::zeros({F, 3}, opts).set_requires_grad(cfg.per_view_exposure);
 
@@ -135,12 +141,36 @@ recon::GaussianCloud fit_avatar(const body::SmplxModel& model, const Tensor& bet
     g.colors = torch::sigmoid(color_logits);
     return g;
   };
-  std::vector<Tensor> clip_leaves{log_scales, quats, color_logits, opacity_logits};
-  if (cfg.lr_position > 0) clip_leaves.push_back(positions);
-  if (cfg.per_view_exposure) {
-    clip_leaves.push_back(gain);
-    clip_leaves.push_back(bias);
-  }
+
+  using torch::optim::Adam;
+  using torch::optim::AdamOptions;
+  using torch::optim::OptimizerParamGroup;
+  std::vector<Tensor> clip_leaves;
+  auto make_opt = [&]() {
+    auto grp = [](std::vector<Tensor> p, double lr) {
+      OptimizerParamGroup g(std::move(p));
+      g.set_options(std::make_unique<AdamOptions>(lr));
+      return g;
+    };
+    std::vector<OptimizerParamGroup> groups;
+    groups.push_back(grp({log_scales}, cfg.lr_scale));
+    groups.push_back(grp({quats}, cfg.lr_rotation));
+    groups.push_back(grp({color_logits}, cfg.lr_color));
+    groups.push_back(grp({opacity_logits}, cfg.lr_opacity));
+    if (lr_pos > 0) groups.push_back(grp({positions}, lr_pos));
+    if (cfg.per_view_exposure) {
+      groups.push_back(grp({gain}, 1e-3));
+      groups.push_back(grp({bias}, 1e-3));
+    }
+    clip_leaves = {log_scales, quats, color_logits, opacity_logits};
+    if (lr_pos > 0) clip_leaves.push_back(positions);
+    if (cfg.per_view_exposure) {
+      clip_leaves.push_back(gain);
+      clip_leaves.push_back(bias);
+    }
+    return std::make_unique<Adam>(groups, AdamOptions(cfg.lr_color));
+  };
+  auto optimizer = make_opt();
 
   // Per-frame body masks from the posed init render.
   std::vector<Tensor> targets(F);
@@ -151,38 +181,21 @@ recon::GaussianCloud fit_avatar(const body::SmplxModel& model, const Tensor& bet
     for (int64_t f = 0; f < F; ++f) {
       targets[f] = frames[f].target.to(opts);
       if (cfg.use_mask) {
-        const auto a0 = runtime::render_soft_aniso(deform_avatar(c0, transforms[f]),
-                                                   frames[f].camera)
-                            .alpha;
+        const auto a0 =
+            runtime::render_soft_aniso(deform_avatar(c0, transforms[f], binding), frames[f].camera)
+                .alpha;
         masks[f] = (a0 > 0.05).to(at::kFloat);
       }
     }
   }
 
-  using torch::optim::Adam;
-  using torch::optim::AdamOptions;
-  using torch::optim::OptimizerParamGroup;
-  auto grp = [](std::vector<Tensor> p, double lr) {
-    OptimizerParamGroup g(std::move(p));
-    g.set_options(std::make_unique<AdamOptions>(lr));
-    return g;
-  };
-  std::vector<OptimizerParamGroup> groups;
-  groups.push_back(grp({log_scales}, cfg.lr_scale));
-  groups.push_back(grp({quats}, cfg.lr_rotation));
-  groups.push_back(grp({color_logits}, cfg.lr_color));
-  groups.push_back(grp({opacity_logits}, cfg.lr_opacity));
-  if (cfg.lr_position > 0) groups.push_back(grp({positions}, cfg.lr_position));
-  if (cfg.per_view_exposure) {
-    groups.push_back(grp({gain}, 1e-3));
-    groups.push_back(grp({bias}, 1e-3));
-  }
-  Adam optimizer(groups, AdamOptions(cfg.lr_color));
+  auto grad_accum = torch::zeros({positions.size(0)}, opts);
+  int accum_count = 0;
 
   for (int it = 0; it < cfg.iterations; ++it) {
     const int64_t f = torch::randint(0, F, {1}, at::kLong).item<int64_t>();
-    optimizer.zero_grad();
-    const auto posed = deform_avatar(canonical(), transforms[f]);
+    optimizer->zero_grad();
+    const auto posed = deform_avatar(canonical(), transforms[f], binding);
     auto pred = runtime::render_soft_aniso(posed, frames[f].camera).image;
     if (cfg.per_view_exposure) {
       pred = (pred * gain[f].view({3, 1, 1}) + bias[f].view({3, 1, 1})).clamp(0.0, 1.0);
@@ -196,7 +209,7 @@ recon::GaussianCloud fit_avatar(const body::SmplxModel& model, const Tensor& bet
     const auto loss = (1.0 - cfg.lambda_dssim) * l1 + cfg.lambda_dssim * (1.0 - ssim(pred, tgt));
     // Skip a non-finite step rather than poison Adam's moments with NaN.
     if (!std::isfinite(loss.item<double>())) {
-      optimizer.zero_grad();
+      optimizer->zero_grad();
       continue;
     }
     loss.backward();
@@ -206,13 +219,81 @@ recon::GaussianCloud fit_avatar(const body::SmplxModel& model, const Tensor& bet
       if (p.grad().defined()) p.mutable_grad() = torch::nan_to_num(p.grad());
     }
     torch::nn::utils::clip_grad_norm_(clip_leaves, 1.0);  // tame remaining gradient spikes
-    optimizer.step();
+    {
+      torch::NoGradGuard ng;
+      if (lr_pos > 0 && positions.grad().defined()) {
+        grad_accum = grad_accum + positions.grad().norm(2, /*dim=*/1);
+        accum_count += 1;
+      }
+    }
+    optimizer->step();
+
+    // ---- adaptive density control (clone/split high-gradient Gaussians; children inherit binding) ----
+    const bool in_densify = cfg.densify && it >= cfg.densify_from && it < cfg.densify_until;
+    if (in_densify && it % cfg.densify_every == 0 && accum_count > 0 &&
+        positions.size(0) < cfg.max_gaussians) {
+      torch::NoGradGuard ng;
+      const auto avg = grad_accum / static_cast<double>(accum_count);
+      const auto scales = torch::exp(log_scales).clamp(smin, smax);
+      const auto max_scale = std::get<0>(scales.max(1));                      // [N]
+      const auto sel = avg > cfg.densify_grad;                                // [N]
+      const auto big = max_scale > cfg.densify_scale_frac * cfg.init_scale;   // [N]
+      const auto clone_idx = (sel & big.logical_not()).nonzero().squeeze(1);
+      const auto split_idx = (sel & big).nonzero().squeeze(1);
+      const int64_t n_now = positions.size(0);
+      auto gather = [](const Tensor& s, const Tensor& i) { return s.index_select(0, i); };
+
+      std::vector<Tensor> pos{positions}, ls{log_scales}, qs{quats}, cl{color_logits},
+          op{opacity_logits}, bd{binding};
+      auto keep = torch::ones({n_now}, at::kBool).to(device);
+      if (clone_idx.numel() > 0) {
+        pos.push_back(gather(positions, clone_idx));
+        ls.push_back(gather(log_scales, clone_idx));
+        qs.push_back(gather(quats, clone_idx));
+        cl.push_back(gather(color_logits, clone_idx));
+        op.push_back(gather(opacity_logits, clone_idx));
+        bd.push_back(gather(binding, clone_idx));
+      }
+      if (split_idx.numel() > 0) {
+        keep.index_put_({split_idx}, false);  // parents replaced by 2 children each
+        for (int child = 0; child < 2; ++child) {
+          const auto ps = gather(scales, split_idx);
+          pos.push_back(gather(positions, split_idx) + torch::randn_like(ps) * ps);
+          ls.push_back((gather(scales, split_idx) / 1.6).clamp_min(smin).log());
+          qs.push_back(gather(quats, split_idx));
+          cl.push_back(gather(color_logits, split_idx));
+          op.push_back(gather(opacity_logits, split_idx));
+          bd.push_back(gather(binding, split_idx));
+        }
+      }
+      auto pos_n = torch::cat(pos, 0);
+      auto ls_n = torch::cat(ls, 0);
+      auto qs_n = torch::cat(qs, 0);
+      auto cl_n = torch::cat(cl, 0);
+      auto op_n = torch::cat(op, 0);
+      auto bd_n = torch::cat(bd, 0);
+      const auto appended = torch::ones({pos_n.size(0) - n_now}, at::kBool).to(device);
+      const auto op_keep = torch::sigmoid(op_n).squeeze(1) > cfg.prune_opacity;
+      const auto final_keep = (torch::cat({keep, appended}, 0) & op_keep).nonzero().squeeze(1);
+
+      positions = pos_n.index_select(0, final_keep).set_requires_grad(lr_pos > 0);
+      log_scales = ls_n.index_select(0, final_keep).set_requires_grad(true);
+      quats = qs_n.index_select(0, final_keep).set_requires_grad(true);
+      color_logits = cl_n.index_select(0, final_keep).set_requires_grad(true);
+      opacity_logits = op_n.index_select(0, final_keep).set_requires_grad(true);
+      binding = bd_n.index_select(0, final_keep);
+      grad_accum = torch::zeros({positions.size(0)}, opts);
+      accum_count = 0;
+      optimizer = make_opt();
+    }
 
     if (rec != nullptr && (it % cfg.log_every == 0 || it == cfg.iterations - 1)) {
       rec->log_scalar("avatar", "loss", loss.item<double>());
-      NCG_LOG_INFO("avatar it={} frame={} loss={:.5f}", it, f, loss.item<double>());
+      rec->log_scalar("avatar", "gaussians", static_cast<double>(positions.size(0)));
+      NCG_LOG_INFO("avatar it={} frame={} N={} loss={:.5f}", it, f, positions.size(0),
+                   loss.item<double>());
       if (cfg.dump_every > 0 && it % cfg.dump_every == 0) {
-        const auto im = runtime::render_soft_aniso(deform_avatar(canonical(), transforms[0]),
+        const auto im = runtime::render_soft_aniso(deform_avatar(canonical(), transforms[0], binding),
                                                    frames[0].camera)
                             .image.detach();
         rec->log_image("avatar", "frame0", im);
@@ -229,7 +310,7 @@ recon::GaussianCloud fit_avatar(const body::SmplxModel& model, const Tensor& bet
   g.opacities = torch::nan_to_num(g.opacities.detach());
   g.colors = torch::nan_to_num(g.colors.detach());
   g.validate();
-  return g;
+  return {g, binding.detach()};
 }
 
 }  // namespace ncg::fit
