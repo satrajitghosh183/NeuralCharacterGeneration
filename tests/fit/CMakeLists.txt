@@ -14,4 +14,9 @@ if(NCG_WITH_CUDA)
     SOURCES test_avatar.cpp
     DEPS    ncg::fit ncg::recon
     LABELS  "cuda;fit")
+
+  ncg_add_test(test_gs_skinning
+    SOURCES test_gs_skinning.cpp
+    DEPS    ncg::fit ncg::recon
+    LABELS  "cuda;fit")
 endif()

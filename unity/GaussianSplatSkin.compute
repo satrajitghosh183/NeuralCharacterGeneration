@@ -1,0 +1,61 @@
+// Per-splat linear-blend skinning for a Gaussian-splat avatar. Implements exactly the algorithm
+// validated in tests/fit/test_gs_skinning.cpp (== ncg::fit::deform_avatar): each splat is moved by
+// Σ_k weight_k · boneMatrix[joint_k], and its orientation is rotated by that blended matrix.
+#pragma kernel SkinSplats
+
+StructuredBuffer<float3>   _RestPos;       // [N] canonical splat means
+StructuredBuffer<float4>   _RestRot;       // [N] canonical splat quaternions (x,y,z,w)
+StructuredBuffer<uint4>    _Joints;        // [N] top-4 bone indices (from .ply.skin)
+StructuredBuffer<float4>   _Weights;       // [N] top-4 weights (sum to 1)
+StructuredBuffer<float4x4> _BoneMatrices;  // [J] boneLocalToRoot[j] * bindpose[j]
+
+RWStructuredBuffer<float3> _OutPos;        // [N] skinned means
+RWStructuredBuffer<float4> _OutRot;        // [N] skinned quaternions (x,y,z,w)
+
+uint _Count;
+
+// Rotation matrix (assumed orthonormal) -> quaternion (x,y,z,w), branchless (Shepperd).
+float4 MatToQuat(float3x3 m)
+{
+    float t = m._m00 + m._m11 + m._m22;
+    float4 q;
+    q.w = 0.5 * sqrt(max(0.0, 1.0 + t));
+    q.x = 0.5 * sqrt(max(0.0, 1.0 + m._m00 - m._m11 - m._m22)) * sign(m._m21 - m._m12);
+    q.y = 0.5 * sqrt(max(0.0, 1.0 - m._m00 + m._m11 - m._m22)) * sign(m._m02 - m._m20);
+    q.z = 0.5 * sqrt(max(0.0, 1.0 - m._m00 - m._m11 + m._m22)) * sign(m._m10 - m._m01);
+    return normalize(q);
+}
+
+float4 QMul(float4 a, float4 b) // Hamilton product, (x,y,z,w)
+{
+    return float4(
+        a.w*b.x + a.x*b.w + a.y*b.z - a.z*b.y,
+        a.w*b.y - a.x*b.z + a.y*b.w + a.z*b.x,
+        a.w*b.z + a.x*b.y - a.y*b.x + a.z*b.w,
+        a.w*b.w - a.x*b.x - a.y*b.y - a.z*b.z);
+}
+
+[numthreads(256,1,1)]
+void SkinSplats(uint3 id : SV_DispatchThreadID)
+{
+    uint i = id.x;
+    if (i >= _Count) return;
+
+    uint4 J = _Joints[i];
+    float4 W = _Weights[i];
+    float4x4 skin =
+        W.x * _BoneMatrices[J.x] + W.y * _BoneMatrices[J.y] +
+        W.z * _BoneMatrices[J.z] + W.w * _BoneMatrices[J.w];
+
+    _OutPos[i] = mul(skin, float4(_RestPos[i], 1.0)).xyz;
+
+    // Orthonormalize the upper-3x3 (LBS blends are near-rigid) then compose with the rest rotation.
+    float3 c0 = normalize(float3(skin._m00, skin._m10, skin._m20));
+    float3 c1 = float3(skin._m01, skin._m11, skin._m21);
+    c1 = normalize(c1 - c0 * dot(c0, c1));
+    float3 c2 = cross(c0, c1);
+    float3x3 R = float3x3(c0.x, c1.x, c2.x,
+                          c0.y, c1.y, c2.y,
+                          c0.z, c1.z, c2.z);
+    _OutRot[i] = QMul(MatToQuat(R), _RestRot[i]);
+}
