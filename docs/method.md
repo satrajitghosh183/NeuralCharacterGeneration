@@ -428,3 +428,12 @@ recovered from data too inconsistent for any averaging method. *That intersectio
 > either a per-vertex displacement field or, more in keeping with the thesis, **per-texel photometric
 > normals** solved from the same multi-illumination observations (photometric stereo on the UV map),
 > which adds high-frequency facial detail as a normal map without leaving the robust parameter domain.
+>
+> **Update — photometric normals implemented.** Under the order-1 part of each frame's recovered SH
+> light, `O/albedo = a_f + g_f·n`, so stacking frames×channels gives a weighted 3×3 normal equation
+> per texel, solved in closed form (`avatar --identity --uv-texture`). On the incoherent Rock pile it
+> recovers per-texel face normals with real structure (the multi-illumination diversity is exactly
+> what makes the normal observable — the thesis). The map is currently **object-space**; the one
+> finishing step for a correct glTF `normalTexture` is a **tangent-space conversion** (per-texel
+> tangent frame from the UV gradient). Textured-+-animated glTF (combine the UV texture with a baked
+> clip) is the other small finishing step for an animated, photoreal game character.
