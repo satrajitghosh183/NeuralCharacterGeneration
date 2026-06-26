@@ -1128,10 +1128,16 @@ int cmd_avatar(const ncg::app::Args& args) {
                                                      torch::stack(id_w, 0), ic);
     // Gauge-fix the albedo (identifiable up to a per-channel scale): match its mean to the robust
     // mean observed color so it displays at a sensible brightness.
-    auto albedo = ir.albedo.clamp_min(0.0F);
+    auto albedo = torch::nan_to_num(ir.albedo).clamp_min(0.0F);
     const auto obs_mean = torch::stack(id_obs, 0).mean(0).mean(0).clamp_min(1e-3F);  // [3]
     const auto alb_mean = albedo.mean(0).clamp_min(1e-3F);                          // [3]
     albedo = (albedo * (obs_mean / alb_mean).view({1, 3})).clamp(0.0F, 1.0F);
+    // Use the solver's per-vertex uncertainty: poorly-constrained vertices (rarely/never seen
+    // consistently in incoherent data) have garbage albedo and produce bright spikes. Blend their
+    // albedo toward the neutral mean and fade their opacity by a confidence ∝ precision.
+    auto conf = torch::nan_to_num(ir.precision).mean(1, true).clamp_min(0.0F);       // [V,1]
+    conf = conf / (conf + conf.median().clamp_min(1e-8F));                           // [V,1] in [0,1)
+    albedo = albedo * conf + obs_mean.view({1, 3}) * (1.0F - conf);
     NCG_LOG_INFO("avatar --identity: recovered canonical albedo from {} frames (mean consistency {:.2f})",
                  id_obs.size(), ir.consistency.mean().item<double>());
 
@@ -1141,9 +1147,11 @@ int cmd_avatar(const ncg::app::Args& args) {
     rp.pose_aa = torch::zeros({1, model.num_joints(), 3}, betas0.options());
     rp.transl = torch::zeros({1, 3}, betas0.options());
     const auto rest_v = model.forward(rp).vertices.squeeze(0);
-    const auto pvs = ncg::recon::per_vertex_scale(rest_v, args.get_float("scale_mult", 0.75F));
-    canonical = ncg::recon::gaussians_on_body(rest_v, args.get_float("scale", 0.012F), albedo, pvs);
+    auto pvs = ncg::recon::per_vertex_scale(rest_v, args.get_float("scale_mult", 0.75F));
+    pvs = torch::nan_to_num(pvs).clamp(0.004F, 0.02F);  // bound scale: no giant/degenerate splats
+    canonical = ncg::recon::gaussians_on_body(rest_v, args.get_float("scale", 0.01F), albedo, pvs);
     canonical.to_(device);
+    canonical.opacities = (0.2F + 0.8F * conf.to(device)).clamp(0.0F, 1.0F);  // fade uncertain verts
     binding = torch::arange(model.num_verts(), at::TensorOptions().dtype(at::kLong).device(device));
   } else {
     ncg::fit::AvatarFitConfig cfg;
