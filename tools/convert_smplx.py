@@ -62,6 +62,12 @@ def main() -> int:
     }
     if "f" in m:  # mesh triangles -> needed for vertex normals (relighting) + glTF export
         tensors["faces"] = np.ascontiguousarray(np.asarray(m["f"]), dtype=np.int64)
+    # UV layout (texture coords + texture-face indices) -> per-texel albedo + textured glTF export.
+    # `vt` [n_uv,2] are UV coords; `ft` [F,3] index into `vt` (separate from geometry `f` at seams).
+    if "vt" in m:
+        tensors["uv_coords"] = np.ascontiguousarray(np.asarray(m["vt"]), dtype=np.float32)
+    if "ft" in m:
+        tensors["uv_faces"] = np.ascontiguousarray(np.asarray(m["ft"]), dtype=np.int64)
     for k, v in tensors.items():
         print(f"  {k}: {v.shape} {v.dtype}")
     save_file(tensors, args.out, metadata={"__ncg__": f"SMPL-X from {args.inp}"})

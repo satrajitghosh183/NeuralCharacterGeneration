@@ -46,6 +46,13 @@ public:
   Tensor faces() const { return faces_; }
   bool has_faces() const { return faces_.defined() && faces_.numel() > 0; }
 
+  /// UV texture layout (present iff the converted model included `vt`/`ft`): `uv_coords` [n_uv,2]
+  /// texture coordinates, `uv_faces` [F,3] indices into `uv_coords` (separate from geometry `faces`
+  /// at UV seams). Needed for per-texel albedo recovery and textured glTF export.
+  Tensor uv_coords() const { return uv_coords_; }
+  Tensor uv_faces() const { return uv_faces_; }
+  bool has_uv() const { return uv_coords_.defined() && uv_coords_.numel() > 0; }
+
   /// Zero shape + T-pose params (batch B) on this model's device — the slice default.
   SmplxParams neutral_params(int64_t batch = 1) const;
 
@@ -57,6 +64,8 @@ private:
   Tensor lbs_weights_;  // [V,J]
   Tensor parents_;      // [J] int64
   Tensor faces_;        // [F,3] int64 (optional)
+  Tensor uv_coords_;    // [n_uv,2] f32 (optional)
+  Tensor uv_faces_;     // [F,3] int64 (optional)
 };
 
 }  // namespace ncg::body

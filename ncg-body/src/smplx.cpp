@@ -55,6 +55,12 @@ SmplxModel SmplxModel::load(const std::string& path, at::Device device) {
   if (st.has("faces")) {
     m.faces_ = st.view("faces").clone().to(device).to(at::kLong);  // [F,3] (optional)
   }
+  if (st.has("uv_coords")) {
+    m.uv_coords_ = st.view("uv_coords").clone().to(device).to(at::kFloat);  // [n_uv,2] (optional)
+  }
+  if (st.has("uv_faces")) {
+    m.uv_faces_ = st.view("uv_faces").clone().to(device).to(at::kLong);  // [F,3] (optional)
+  }
 
   NCG_CHECK(m.v_template_.dim() == 2 && m.v_template_.size(1) == 3, "SmplxModel: bad v_template");
   NCG_CHECK(m.parents_.dim() == 1, "SmplxModel: bad parents");
