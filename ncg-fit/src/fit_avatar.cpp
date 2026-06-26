@@ -121,15 +121,26 @@ recon::GaussianCloud fit_avatar(const body::SmplxModel& model, const Tensor& bet
   auto gain = torch::ones({F, 3}, opts).set_requires_grad(cfg.per_view_exposure);
   auto bias = torch::zeros({F, 3}, opts).set_requires_grad(cfg.per_view_exposure);
 
+  // Bound scales to a human-scale range: collapse (→0) makes the projected covariance singular and
+  // explodes the conic-inverse gradient; runaway growth lets one Gaussian dominate the normalized
+  // splat. Both drive the fit to NaN, so clamp the rendered scale (gradient still flows in-range).
+  const double smin = 1e-3;
+  const double smax = 0.05;
   auto canonical = [&]() {
     recon::GaussianCloud g;
     g.positions = positions;
-    g.scales = torch::exp(log_scales);
+    g.scales = torch::exp(log_scales).clamp(smin, smax);
     g.rotations = quats;
     g.opacities = torch::sigmoid(opacity_logits);
     g.colors = torch::sigmoid(color_logits);
     return g;
   };
+  std::vector<Tensor> clip_leaves{log_scales, quats, color_logits, opacity_logits};
+  if (cfg.lr_position > 0) clip_leaves.push_back(positions);
+  if (cfg.per_view_exposure) {
+    clip_leaves.push_back(gain);
+    clip_leaves.push_back(bias);
+  }
 
   // Per-frame body masks from the posed init render.
   std::vector<Tensor> targets(F);
@@ -183,7 +194,13 @@ recon::GaussianCloud fit_avatar(const body::SmplxModel& model, const Tensor& bet
     }
     const auto l1 = torch::l1_loss(pred, tgt);
     const auto loss = (1.0 - cfg.lambda_dssim) * l1 + cfg.lambda_dssim * (1.0 - ssim(pred, tgt));
+    // Skip a non-finite step rather than poison Adam's moments with NaN.
+    if (!std::isfinite(loss.item<double>())) {
+      optimizer.zero_grad();
+      continue;
+    }
     loss.backward();
+    torch::nn::utils::clip_grad_norm_(clip_leaves, 1.0);  // tame conic-inverse gradient spikes
     optimizer.step();
 
     if (rec != nullptr && (it % cfg.log_every == 0 || it == cfg.iterations - 1)) {
