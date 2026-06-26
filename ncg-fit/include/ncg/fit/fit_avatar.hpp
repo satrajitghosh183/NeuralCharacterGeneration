@@ -41,7 +41,7 @@ struct AvatarFitConfig {
   double densify_grad = 5e-5;      // mean accumulated position-gradient norm to densify
   double densify_scale_frac = 0.4;  // split (vs clone) when scale exceeds this fraction of init_scale
   double prune_opacity = 0.05;
-  int64_t max_gaussians = 800000;
+  int64_t max_gaussians = 60000;  // bounded for the (non-tiled) soft renderer's per-iter cost
 
   int log_every = 100;
   int dump_every = 0;
