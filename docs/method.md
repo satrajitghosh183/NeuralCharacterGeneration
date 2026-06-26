@@ -437,3 +437,12 @@ recovered from data too inconsistent for any averaging method. *That intersectio
 > finishing step for a correct glTF `normalTexture` is a **tangent-space conversion** (per-texel
 > tangent frame from the UV gradient). Textured-+-animated glTF (combine the UV texture with a baked
 > clip) is the other small finishing step for an animated, photoreal game character.
+>
+> **Both finishing steps done.** The normals are now converted to **tangent space** via the canonical
+> per-texel TBN frame (`recon::compute_uv_tangents` from the UV gradient + geometric normal), so the
+> map is a correct glTF `normalTexture` (body-texel Z rises 131→158, leaning +Z as expected).
+> `mesh::write_glb_textured` gained an animation track, so `avatar --identity --uv-texture --motion`
+> emits a **single glb that is textured (albedo) + normal-mapped + rigged + animated** — a photoreal,
+> walking game character (validated: 2 textures, 55-channel animation). The full chain — incoherent
+> web data → robust identity → high-res albedo + photometric normals → textured/animated character →
+> playable browser game (`web/rock_game.html`) — is end to end.
