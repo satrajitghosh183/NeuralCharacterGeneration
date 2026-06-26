@@ -1057,6 +1057,14 @@ int cmd_avatar(const ncg::app::Args& args) {
     return std::make_pair(small, s);
   };
 
+  // --identity: recover a clean canonical albedo from inconsistent data via the robust C1/C2 inverse
+  // renderer (per-frame SH lighting solved away, clothing-swap/occlusion/wrong-person observations
+  // rejected per vertex), instead of naively averaging color across frames (which blurs). This is
+  // the route to "dump incoherent footage, get a coherent relightable identity."
+  const bool identity = args.get_int("identity", 0) != 0;
+  const auto faces_cpu = model.has_faces() ? model.faces().to(at::kCPU) : torch::Tensor();
+  std::vector<torch::Tensor> id_obs, id_nrm, id_w;  // per-frame [V,3],[V,3],[V] for the solver
+
   std::vector<ncg::fit::AvatarFrame> frames;
   torch::Tensor betas0;
   torch::Tensor init_colors;
@@ -1071,6 +1079,20 @@ int cmd_avatar(const ncg::app::Args& args) {
       continue;
     }
     if (!betas0.defined()) betas0 = pred.params.betas.to(device);
+
+    // Identity mode: collect full-res per-vertex observation, posed normal and visibility for the
+    // robust inverse-render solver (same inputs as `ncg_cli delight`).
+    if (identity && pred.vertices2d.size(0) == model.num_verts() && faces_cpu.defined()) {
+      const auto v2df = pred.vertices2d.to(device);
+      ncg::mesh::TriMesh tm;
+      tm.vertices = pred.vertices3d.to(at::kCPU);
+      tm.faces = faces_cpu;
+      id_nrm.push_back(ncg::mesh::compute_vertex_normals(tm).to(device));
+      id_obs.push_back(ncg::recon::sample_vertex_colors(img_full, v2df).clamp(0.0, 1.0));
+      id_w.push_back(ncg::recon::vertex_visibility(
+          v2df, pred.vertices3d.select(1, 2).to(device), static_cast<int64_t>(img_full.size(1)),
+          static_cast<int64_t>(img_full.size(2))));
+    }
 
     ncg::fit::AvatarFrame fr;
     fr.pose_aa = pred.params.pose_aa.squeeze(0).to(device);  // [J,3] camera-frame orientation kept
@@ -1092,19 +1114,52 @@ int cmd_avatar(const ncg::app::Args& args) {
   NCG_CHECK(frames.size() >= 2, "avatar: need >=2 usable frames");
   NCG_LOG_INFO("avatar: training on {} frames at {}px", frames.size(), res);
 
-  ncg::fit::AvatarFitConfig cfg;
-  cfg.iterations = args.get_int("iters", 3000);
-  cfg.init_scale = args.get_float("scale", 0.015F);
-  cfg.lambda_dssim = args.get_float("dssim", 0.2F);
-  cfg.per_view_exposure = args.get_int("exposure", 1) != 0;
-  cfg.robust = args.get_int("robust", 1) != 0;  // C2 robust consistency on by default (mixed data)
-  cfg.robust_k = args.get_float("robust_k", 3.0F);
-  cfg.log_every = 50;
-  cfg.dump_every = args.get_int("dump-every", 500);
-  cfg.densify = args.get_int("densify", 0) != 0;
-  const auto result = ncg::fit::fit_avatar(model, betas0, frames, init_colors, cfg, &rec);
-  const auto& canonical = result.canonical;
-  const auto& binding = result.binding;
+  ncg::recon::GaussianCloud canonical;
+  torch::Tensor binding;
+  if (identity) {
+    // The award-worthy path on incoherent data: jointly solve a single canonical albedo + per-frame
+    // SH lighting with robust per-observation consistency (C1/C2). The face/skin (consistent across
+    // all footage) anchor a clean identity; outfits/occlusion/wrong-person frames are down-weighted.
+    NCG_CHECK(id_obs.size() >= 2, "avatar --identity: need >=2 frames with full-res vertices");
+    ncg::recon::InverseRenderConfig ic;
+    ic.iterations = args.get_int("iters", 80);
+    ic.robust = true;
+    const auto ir = ncg::recon::solve_inverse_render(torch::stack(id_obs, 0), torch::stack(id_nrm, 0),
+                                                     torch::stack(id_w, 0), ic);
+    // Gauge-fix the albedo (identifiable up to a per-channel scale): match its mean to the robust
+    // mean observed color so it displays at a sensible brightness.
+    auto albedo = ir.albedo.clamp_min(0.0F);
+    const auto obs_mean = torch::stack(id_obs, 0).mean({0, 1}).clamp_min(1e-3F);   // [3]
+    const auto alb_mean = albedo.mean(0).clamp_min(1e-3F);                          // [3]
+    albedo = (albedo * (obs_mean / alb_mean).view({1, 3})).clamp(0.0F, 1.0F);
+    NCG_LOG_INFO("avatar --identity: recovered canonical albedo from {} frames (mean consistency {:.2f})",
+                 id_obs.size(), ir.consistency.mean().item<double>());
+
+    // Build the rigged avatar: SMPL-X body geometry + the robust identity albedo.
+    ncg::body::SmplxParams rp;
+    rp.betas = betas0;
+    rp.pose_aa = torch::zeros({1, model.num_joints(), 3}, betas0.options());
+    rp.transl = torch::zeros({1, 3}, betas0.options());
+    const auto rest_v = model.forward(rp).vertices.squeeze(0);
+    const auto pvs = ncg::recon::per_vertex_scale(rest_v, args.get_float("scale_mult", 0.75F));
+    canonical = ncg::recon::gaussians_on_body(rest_v, args.get_float("scale", 0.012F), albedo, pvs);
+    canonical.to_(device);
+    binding = torch::arange(model.num_verts(), at::TensorOptions().dtype(at::kLong).device(device));
+  } else {
+    ncg::fit::AvatarFitConfig cfg;
+    cfg.iterations = args.get_int("iters", 3000);
+    cfg.init_scale = args.get_float("scale", 0.015F);
+    cfg.lambda_dssim = args.get_float("dssim", 0.2F);
+    cfg.per_view_exposure = args.get_int("exposure", 1) != 0;
+    cfg.robust = args.get_int("robust", 1) != 0;  // C2 robust consistency on by default (mixed data)
+    cfg.robust_k = args.get_float("robust_k", 3.0F);
+    cfg.log_every = 50;
+    cfg.dump_every = args.get_int("dump-every", 500);
+    cfg.densify = args.get_int("densify", 0) != 0;
+    auto result = ncg::fit::fit_avatar(model, betas0, frames, init_colors, cfg, &rec);
+    canonical = result.canonical;
+    binding = result.binding;
+  }
 
   // Fit-check: render the avatar at frame 0's pose/camera next to the target.
   const auto prefix = args.get("out-prefix", "avatar");
