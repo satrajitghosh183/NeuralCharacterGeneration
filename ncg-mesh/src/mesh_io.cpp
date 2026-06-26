@@ -7,6 +7,7 @@
 #include <fstream>
 #include <sstream>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace ncg::mesh {
@@ -345,6 +346,190 @@ void write_glb_skinned(const Tensor& vertices, const Tensor& faces, const Tensor
 
   std::ofstream os(path, std::ios::binary);
   NCG_CHECK(os.good(), "write_glb_skinned: cannot open '{}'", path);
+  os.write(glb.data(), static_cast<std::streamsize>(glb.size()));
+}
+
+void write_glb_textured(const Tensor& vertices, const Tensor& faces_in, const Tensor& normals_in,
+                        const Tensor& uv_coords_in, const Tensor& uv_faces_in, const Tensor& joints_in,
+                        const Tensor& parents_in, const Tensor& skin_weights_in,
+                        const std::string& texture_png_path, const std::string& path) {
+  const auto vsrc = vertices.to(at::kCPU, at::kFloat).contiguous();
+  const auto fgeo = faces_in.to(at::kCPU, at::kInt).contiguous();   // [F,3] geometry vertex idx
+  const auto fuv = uv_faces_in.to(at::kCPU, at::kInt).contiguous(); // [F,3] uv vertex idx
+  const auto uvc = uv_coords_in.to(at::kCPU, at::kFloat).contiguous();
+  const bool hasN = normals_in.defined() && normals_in.numel() > 0;
+  const auto nsrc = hasN ? normals_in.to(at::kCPU, at::kFloat).contiguous() : Tensor();
+  const auto jpos = joints_in.to(at::kCPU, at::kFloat).contiguous();
+  const auto parents = parents_in.to(at::kCPU, at::kLong).contiguous();
+  const int64_t J = jpos.size(0), F = fgeo.size(0), n_uv = uvc.size(0);
+
+  auto topk = skin_weights_in.to(at::kCPU, at::kFloat).topk(std::min<int64_t>(4, J), 1);
+  auto wval = std::get<0>(topk).contiguous();
+  auto widx = std::get<1>(topk).to(at::kInt).contiguous();
+  if (wval.size(1) < 4) {
+    wval = torch::constant_pad_nd(wval, {0, 4 - wval.size(1)}, 0.0);
+    widx = torch::constant_pad_nd(widx, {0, 4 - widx.size(1)}, 0);
+  }
+  wval = wval / wval.sum(1, true).clamp_min(1e-8F);
+  const auto* vp = vsrc.data_ptr<float>();
+  const auto* np = hasN ? nsrc.data_ptr<float>() : nullptr;
+  const auto* uvp = uvc.data_ptr<float>();
+  const auto* fg = fgeo.data_ptr<int32_t>();
+  const auto* fu = fuv.data_ptr<int32_t>();
+  const auto* wv = wval.data_ptr<float>();
+  const auto* wi = widx.data_ptr<int32_t>();
+
+  // Unweld by (geometry-vertex, uv-vertex) pairs so each glTF vertex has one UV.
+  std::unordered_map<int64_t, int32_t> remap;
+  std::vector<float> pos, nor, tex, wgt;
+  std::vector<uint16_t> jnt;
+  std::vector<uint32_t> idx;
+  auto getv = [&](int32_t gv, int32_t uv) -> int32_t {
+    const int64_t key = static_cast<int64_t>(gv) * n_uv + uv;
+    auto it = remap.find(key);
+    if (it != remap.end()) return it->second;
+    const int32_t ni = static_cast<int32_t>(pos.size() / 3);
+    remap[key] = ni;
+    pos.insert(pos.end(), {vp[gv * 3], vp[gv * 3 + 1], vp[gv * 3 + 2]});
+    if (hasN) nor.insert(nor.end(), {np[gv * 3], np[gv * 3 + 1], np[gv * 3 + 2]});
+    tex.insert(tex.end(), {uvp[uv * 2], uvp[uv * 2 + 1]});
+    for (int k = 0; k < 4; ++k) jnt.push_back(static_cast<uint16_t>(wi[gv * 4 + k]));
+    for (int k = 0; k < 4; ++k) wgt.push_back(wv[gv * 4 + k]);
+    return ni;
+  };
+  for (int64_t fi = 0; fi < F; ++fi)
+    for (int k = 0; k < 3; ++k) idx.push_back(static_cast<uint32_t>(getv(fg[fi * 3 + k], fu[fi * 3 + k])));
+  const int64_t V = static_cast<int64_t>(pos.size() / 3);
+
+  std::vector<char> png;
+  {
+    std::ifstream tf(texture_png_path, std::ios::binary | std::ios::ate);
+    NCG_CHECK(tf.good(), "write_glb_textured: cannot read texture '{}'", texture_png_path);
+    const auto sz = tf.tellg();
+    tf.seekg(0);
+    png.resize(static_cast<size_t>(sz));
+    tf.read(png.data(), sz);
+  }
+
+  std::vector<char> bin;
+  std::vector<size_t> off;
+  off.push_back(bin.size());
+  append_bytes(bin, pos.data(), pos.size() * 4);
+  size_t norOff = 0;
+  if (hasN) { norOff = bin.size(); append_bytes(bin, nor.data(), nor.size() * 4); }
+  const size_t texOff = bin.size();
+  append_bytes(bin, tex.data(), tex.size() * 4);
+  const size_t jntOff = bin.size();
+  for (auto u : jnt) { bin.push_back(static_cast<char>(u & 0xff)); bin.push_back(static_cast<char>((u >> 8) & 0xff)); }
+  const size_t wgtOff = bin.size();
+  append_bytes(bin, wgt.data(), wgt.size() * 4);
+  const size_t ibmOff = bin.size();
+  const auto* jp = jpos.data_ptr<float>();
+  for (int64_t j = 0; j < J; ++j) {
+    float m[16] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, -jp[j * 3], -jp[j * 3 + 1], -jp[j * 3 + 2], 1};
+    append_bytes(bin, m, sizeof(m));
+  }
+  const size_t idxOff = bin.size();
+  append_bytes(bin, idx.data(), idx.size() * 4);
+  while (bin.size() % 4 != 0) bin.push_back(0);
+  const size_t pngOff = bin.size();
+  append_bytes(bin, png.data(), png.size());
+  while (bin.size() % 4 != 0) bin.push_back(0);
+
+  const auto posT = torch::from_blob(pos.data(), {V, 3}).clone();
+  const auto vmin = std::get<0>(posT.min(0));
+  const auto vmax = std::get<0>(posT.max(0));
+  const auto* mn = vmin.data_ptr<float>();
+  const auto* mx = vmax.data_ptr<float>();
+
+  const auto* pp = parents.data_ptr<int64_t>();
+  std::vector<std::vector<int64_t>> children(static_cast<size_t>(J));
+  for (int64_t j = 1; j < J; ++j) children[static_cast<size_t>(pp[j])].push_back(j);
+
+  std::ostringstream js;
+  js << "{\"asset\":{\"version\":\"2.0\",\"generator\":\"NeuralCharGen\"},\"scene\":0,"
+     << "\"scenes\":[{\"nodes\":[0," << J << "]}],\"nodes\":[";
+  for (int64_t j = 0; j < J; ++j) {
+    const int64_t par = (j == 0) ? -1 : pp[j];
+    const float lx = jp[j * 3] - (par < 0 ? 0.0F : jp[par * 3]);
+    const float ly = jp[j * 3 + 1] - (par < 0 ? 0.0F : jp[par * 3 + 1]);
+    const float lz = jp[j * 3 + 2] - (par < 0 ? 0.0F : jp[par * 3 + 2]);
+    js << "{\"translation\":[" << lx << "," << ly << "," << lz << "]";
+    if (!children[static_cast<size_t>(j)].empty()) {
+      js << ",\"children\":[";
+      for (size_t k = 0; k < children[static_cast<size_t>(j)].size(); ++k)
+        js << (k ? "," : "") << children[static_cast<size_t>(j)][k];
+      js << "]";
+    }
+    js << "},";
+  }
+  js << "{\"mesh\":0,\"skin\":0}],";
+
+  int bv = 0;
+  std::ostringstream bvs;
+  auto add = [&](size_t boff, int64_t bytes, int target) {
+    bvs << (bv ? "," : "") << "{\"buffer\":0,\"byteOffset\":" << boff << ",\"byteLength\":" << bytes
+        << (target ? (",\"target\":" + std::to_string(target)) : "") << "}";
+    return bv++;
+  };
+  const int bvPos = add(off[0], V * 12, 34962);
+  const int bvN = hasN ? add(norOff, V * 12, 34962) : -1;
+  const int bvT = add(texOff, V * 8, 34962);
+  const int bvJ = add(jntOff, V * 8, 34962);
+  const int bvW = add(wgtOff, V * 16, 34962);
+  const int bvIBM = add(ibmOff, J * 64, 0);
+  const int bvIdx = add(idxOff, static_cast<int64_t>(idx.size()) * 4, 34963);
+  const int bvImg = add(pngOff, static_cast<int64_t>(png.size()), 0);
+
+  std::ostringstream accs;
+  accs << "{\"bufferView\":" << bvPos << ",\"componentType\":5126,\"count\":" << V
+       << ",\"type\":\"VEC3\",\"min\":[" << mn[0] << "," << mn[1] << "," << mn[2] << "],\"max\":["
+       << mx[0] << "," << mx[1] << "," << mx[2] << "]}";
+  int acc = 1, accN = -1;
+  if (hasN) { accN = acc++; accs << ",{\"bufferView\":" << bvN << ",\"componentType\":5126,\"count\":" << V << ",\"type\":\"VEC3\"}"; }
+  const int accT = acc++;
+  accs << ",{\"bufferView\":" << bvT << ",\"componentType\":5126,\"count\":" << V << ",\"type\":\"VEC2\"}";
+  const int accJ = acc++;
+  accs << ",{\"bufferView\":" << bvJ << ",\"componentType\":5123,\"count\":" << V << ",\"type\":\"VEC4\"}";
+  const int accW = acc++;
+  accs << ",{\"bufferView\":" << bvW << ",\"componentType\":5126,\"count\":" << V << ",\"type\":\"VEC4\"}";
+  const int accIBM = acc++;
+  accs << ",{\"bufferView\":" << bvIBM << ",\"componentType\":5126,\"count\":" << J << ",\"type\":\"MAT4\"}";
+  const int accIdx = acc++;
+  accs << ",{\"bufferView\":" << bvIdx << ",\"componentType\":5125,\"count\":" << idx.size() << ",\"type\":\"SCALAR\"}";
+
+  js << "\"bufferViews\":[" << bvs.str() << "],\"accessors\":[" << accs.str() << "],";
+  js << "\"images\":[{\"bufferView\":" << bvImg << ",\"mimeType\":\"image/png\"}],"
+     << "\"samplers\":[{}],\"textures\":[{\"source\":0,\"sampler\":0}],";
+  js << "\"meshes\":[{\"primitives\":[{\"attributes\":{\"POSITION\":0";
+  if (hasN) js << ",\"NORMAL\":" << accN;
+  js << ",\"TEXCOORD_0\":" << accT << ",\"JOINTS_0\":" << accJ << ",\"WEIGHTS_0\":" << accW
+     << "},\"indices\":" << accIdx << ",\"material\":0}]}],";
+  js << "\"skins\":[{\"inverseBindMatrices\":" << accIBM << ",\"skeleton\":0,\"joints\":[";
+  for (int64_t j = 0; j < J; ++j) js << (j ? "," : "") << j;
+  js << "]}],\"materials\":[{\"pbrMetallicRoughness\":{\"baseColorTexture\":{\"index\":0},"
+        "\"metallicFactor\":0,\"roughnessFactor\":1}}],\"buffers\":[{\"byteLength\":"
+     << bin.size() << "}]}";
+  std::string json = js.str();
+  while (json.size() % 4 != 0) json.push_back(' ');
+
+  std::vector<char> glb;
+  put_u32(glb, 0x46546C67);
+  put_u32(glb, 2);
+  put_u32(glb, 0);
+  put_u32(glb, static_cast<uint32_t>(json.size()));
+  put_u32(glb, 0x4E4F534A);
+  append_bytes(glb, json.data(), json.size());
+  put_u32(glb, static_cast<uint32_t>(bin.size()));
+  put_u32(glb, 0x004E4942);
+  append_bytes(glb, bin.data(), bin.size());
+  const uint32_t total = static_cast<uint32_t>(glb.size());
+  glb[8] = static_cast<char>(total & 0xff);
+  glb[9] = static_cast<char>((total >> 8) & 0xff);
+  glb[10] = static_cast<char>((total >> 16) & 0xff);
+  glb[11] = static_cast<char>((total >> 24) & 0xff);
+  std::ofstream os(path, std::ios::binary);
+  NCG_CHECK(os.good(), "write_glb_textured: cannot open '{}'", path);
   os.write(glb.data(), static_cast<std::streamsize>(glb.size()));
 }
 

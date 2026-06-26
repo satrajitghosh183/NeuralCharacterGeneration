@@ -56,6 +56,18 @@ void write_glb_animated(const Tensor& vertices, const Tensor& faces, const Tenso
                         const Tensor& skin_weights, const Tensor& rot_quats, const Tensor& times,
                         const std::string& path);
 
+/// Export a **UV-textured, rigged** binary glTF (.glb): the SMPL-X mesh with a baked albedo texture
+/// (the per-texel C5 albedo) instead of per-vertex colors, plus the skeleton + skinning. Because
+/// glTF needs one UV per vertex, vertices are unwelded at UV seams by (geometry-vertex, uv-vertex)
+/// pairs. `uv_coords` [n_uv,2] + `uv_faces` [F,3] are the SMPL-X UV layout (separate indices from
+/// geometry `faces`). The texture is embedded by reading `texture_png_path` (a PNG already written
+/// by save_png) into the GLB image buffer. This is what makes the high-res recovered face visible on
+/// the actual character in any engine.
+void write_glb_textured(const Tensor& vertices, const Tensor& faces, const Tensor& normals,
+                        const Tensor& uv_coords, const Tensor& uv_faces, const Tensor& joints,
+                        const Tensor& parents, const Tensor& skin_weights,
+                        const std::string& texture_png_path, const std::string& path);
+
 /// Export a Gaussian cloud as a **standard 3DGS binary .ply** — the Inria/3DGS convention read by
 /// Unity/Unreal Gaussian-splat plugins and standalone viewers (per-splat x,y,z; nx,ny,nz; f_dc_0..2
 /// = SH-DC of color; opacity as inverse-sigmoid; scale_0..2 as log; rot_0..3 quaternion w,x,y,z).

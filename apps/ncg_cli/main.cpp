@@ -1358,6 +1358,13 @@ int cmd_avatar(const ncg::app::Args& args) {
                                      skin, prefix + ".glb");
         NCG_LOG_INFO("avatar: wrote rigged mesh -> {}.glb", prefix);
       }
+      // Textured variant: the high-res per-texel albedo on the UV-mapped rigged mesh.
+      if (identity && args.has("uv-texture") && model.has_uv()) {
+        ncg::mesh::write_glb_textured(rest_verts, model.faces(), normals, model.uv_coords(),
+                                      model.uv_faces(), joints, parents, skin,
+                                      prefix + "_albedo_uv.png", prefix + "_textured.glb");
+        NCG_LOG_INFO("avatar: wrote UV-textured rigged mesh -> {}_textured.glb", prefix);
+      }
     }
   }
   NCG_LOG_INFO("avatar: done -> {}.ply (splats) + {}.glb (rigged mesh) + {}_fit0.png ({} gaussians)",
