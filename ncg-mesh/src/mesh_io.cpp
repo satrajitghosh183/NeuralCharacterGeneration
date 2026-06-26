@@ -352,7 +352,8 @@ void write_glb_skinned(const Tensor& vertices, const Tensor& faces, const Tensor
 void write_glb_textured(const Tensor& vertices, const Tensor& faces_in, const Tensor& normals_in,
                         const Tensor& uv_coords_in, const Tensor& uv_faces_in, const Tensor& joints_in,
                         const Tensor& parents_in, const Tensor& skin_weights_in,
-                        const std::string& texture_png_path, const std::string& path) {
+                        const std::string& texture_png_path, const std::string& path,
+                        const std::string& normal_png_path) {
   const auto vsrc = vertices.to(at::kCPU, at::kFloat).contiguous();
   const auto fgeo = faces_in.to(at::kCPU, at::kInt).contiguous();   // [F,3] geometry vertex idx
   const auto fuv = uv_faces_in.to(at::kCPU, at::kInt).contiguous(); // [F,3] uv vertex idx
@@ -401,15 +402,19 @@ void write_glb_textured(const Tensor& vertices, const Tensor& faces_in, const Te
     for (int k = 0; k < 3; ++k) idx.push_back(static_cast<uint32_t>(getv(fg[fi * 3 + k], fu[fi * 3 + k])));
   const int64_t V = static_cast<int64_t>(pos.size() / 3);
 
-  std::vector<char> png;
-  {
-    std::ifstream tf(texture_png_path, std::ios::binary | std::ios::ate);
-    NCG_CHECK(tf.good(), "write_glb_textured: cannot read texture '{}'", texture_png_path);
+  auto read_file = [](const std::string& p, std::vector<char>& out) {
+    std::ifstream tf(p, std::ios::binary | std::ios::ate);
+    if (!tf.good()) return false;
     const auto sz = tf.tellg();
     tf.seekg(0);
-    png.resize(static_cast<size_t>(sz));
-    tf.read(png.data(), sz);
-  }
+    out.resize(static_cast<size_t>(sz));
+    tf.read(out.data(), sz);
+    return true;
+  };
+  std::vector<char> png, npng;
+  NCG_CHECK(read_file(texture_png_path, png), "write_glb_textured: cannot read texture '{}'",
+            texture_png_path);
+  const bool hasNT = !normal_png_path.empty() && read_file(normal_png_path, npng) && !npng.empty();
 
   std::vector<char> bin;
   std::vector<size_t> off;
@@ -435,6 +440,12 @@ void write_glb_textured(const Tensor& vertices, const Tensor& faces_in, const Te
   const size_t pngOff = bin.size();
   append_bytes(bin, png.data(), png.size());
   while (bin.size() % 4 != 0) bin.push_back(0);
+  size_t npngOff = 0;
+  if (hasNT) {
+    npngOff = bin.size();
+    append_bytes(bin, npng.data(), npng.size());
+    while (bin.size() % 4 != 0) bin.push_back(0);
+  }
 
   const auto posT = torch::from_blob(pos.data(), {V, 3}).clone();
   const auto vmin = std::get<0>(posT.min(0));
@@ -480,6 +491,7 @@ void write_glb_textured(const Tensor& vertices, const Tensor& faces_in, const Te
   const int bvIBM = add(ibmOff, J * 64, 0);
   const int bvIdx = add(idxOff, static_cast<int64_t>(idx.size()) * 4, 34963);
   const int bvImg = add(pngOff, static_cast<int64_t>(png.size()), 0);
+  const int bvImgN = hasNT ? add(npngOff, static_cast<int64_t>(npng.size()), 0) : -1;
 
   std::ostringstream accs;
   accs << "{\"bufferView\":" << bvPos << ",\"componentType\":5126,\"count\":" << V
@@ -499,8 +511,11 @@ void write_glb_textured(const Tensor& vertices, const Tensor& faces_in, const Te
   accs << ",{\"bufferView\":" << bvIdx << ",\"componentType\":5125,\"count\":" << idx.size() << ",\"type\":\"SCALAR\"}";
 
   js << "\"bufferViews\":[" << bvs.str() << "],\"accessors\":[" << accs.str() << "],";
-  js << "\"images\":[{\"bufferView\":" << bvImg << ",\"mimeType\":\"image/png\"}],"
-     << "\"samplers\":[{}],\"textures\":[{\"source\":0,\"sampler\":0}],";
+  js << "\"images\":[{\"bufferView\":" << bvImg << ",\"mimeType\":\"image/png\"}";
+  if (hasNT) js << ",{\"bufferView\":" << bvImgN << ",\"mimeType\":\"image/png\"}";
+  js << "],\"samplers\":[{}],\"textures\":[{\"source\":0,\"sampler\":0}";
+  if (hasNT) js << ",{\"source\":1,\"sampler\":0}";
+  js << "],";
   js << "\"meshes\":[{\"primitives\":[{\"attributes\":{\"POSITION\":0";
   if (hasN) js << ",\"NORMAL\":" << accN;
   js << ",\"TEXCOORD_0\":" << accT << ",\"JOINTS_0\":" << accJ << ",\"WEIGHTS_0\":" << accW
@@ -508,8 +523,9 @@ void write_glb_textured(const Tensor& vertices, const Tensor& faces_in, const Te
   js << "\"skins\":[{\"inverseBindMatrices\":" << accIBM << ",\"skeleton\":0,\"joints\":[";
   for (int64_t j = 0; j < J; ++j) js << (j ? "," : "") << j;
   js << "]}],\"materials\":[{\"pbrMetallicRoughness\":{\"baseColorTexture\":{\"index\":0},"
-        "\"metallicFactor\":0,\"roughnessFactor\":1}}],\"buffers\":[{\"byteLength\":"
-     << bin.size() << "}]}";
+        "\"metallicFactor\":0,\"roughnessFactor\":1}";
+  if (hasNT) js << ",\"normalTexture\":{\"index\":1}";
+  js << "}],\"buffers\":[{\"byteLength\":" << bin.size() << "}]}";
   std::string json = js.str();
   while (json.size() % 4 != 0) json.push_back(' ');
 

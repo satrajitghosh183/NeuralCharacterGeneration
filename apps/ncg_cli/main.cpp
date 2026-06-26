@@ -1017,7 +1017,7 @@ torch::Tensor recover_uv_albedo(const ncg::body::SmplxModel& model,
                                 const std::vector<torch::Tensor>& v2ds,
                                 const std::vector<torch::Tensor>& nrms,
                                 const std::vector<torch::Tensor>& viss, int T,
-                                torch::Tensor& mask_out) {
+                                torch::Tensor& mask_out, torch::Tensor& normal_out) {
   const auto device = model.uv_coords().device();
   const auto ras = ncg::recon::uv_rasterize(model.uv_coords(), model.uv_faces(), T);
   const auto face = ras.face.to(device);                              // [T^2]
@@ -1058,6 +1058,37 @@ torch::Tensor recover_uv_albedo(const ncg::body::SmplxModel& model,
   const auto alb_mean = albedo.mean(0).clamp_min(1e-3F);
   albedo = (albedo * (obs_mean / alb_mean).view({1, 3})).clamp(0.0F, 1.0F);
   mask_out = valid.view({T, T});
+
+  // ---- per-texel photometric normals (photometric stereo on the UV map) ----
+  // Under the linear (order-1) part of each frame's recovered SH light, O/albedo = a_f + g_f·n.
+  // Stack over frames & channels and solve a weighted 3×3 normal equation per texel for n — the
+  // multi-illumination diversity (the thesis) is exactly what makes the normal observable.
+  {
+    const auto opts = albedo.options();
+    const auto B = ncg::recon::sh_basis(torch::eye(3, opts));           // [3,9] basis at the 3 axes
+    const auto b0 = B.index({0, 0});                                    // DC term (axis-invariant)
+    const auto M = B.index({torch::indexing::Slice(), torch::indexing::Slice(1, 4)});  // [3,3]
+    const auto obs = torch::stack(obs_l, 0);                            // [N,T^2,3]
+    const auto w = torch::stack(w_l, 0);                                // [N,T^2]
+    const auto L1 = ir.lights.index({torch::indexing::Slice(), torch::indexing::Slice(),
+                                     torch::indexing::Slice(1, 4)});    // [N,3ch,3k] order-1 coeffs
+    const auto g = torch::einsum("ak,fck->fca", {M, L1});              // [N,3ch,3axis]
+    const auto a_dc = ir.lights.index({torch::indexing::Slice(), torch::indexing::Slice(), 0}) * b0;  // [N,3ch]
+    const auto ratio = obs / albedo.unsqueeze(0).clamp_min(0.05F);     // [N,T^2,3]
+    const auto y = (ratio - a_dc.unsqueeze(1)).permute({0, 2, 1});     // [N,3ch,T^2]
+    const auto GG = torch::einsum("fca,fcb->fab", {g, g});             // [N,3,3]
+    const auto ATA = torch::einsum("ft,fab->tab", {w, GG});           // [T^2,3,3]
+    const auto gy = torch::einsum("fca,fct->fat", {g, y});            // [N,3,T^2]
+    const auto ATy = torch::einsum("ft,fat->ta", {w, gy});           // [T^2,3]
+    const auto ridge = torch::eye(3, opts).unsqueeze(0) * 1e-2F;
+    auto n = torch::linalg_solve(ATA + ridge, ATy.unsqueeze(2)).squeeze(2);  // [T^2,3]
+    n = torch::nan_to_num(n);
+    n = n / n.norm(2, 1, true).clamp_min(1e-6F);
+    // Tangent-space-ish encode to [0,1]; flat (0,0,1) where invalid so it reads as no perturbation.
+    const auto flat = torch::tensor({0.5F, 0.5F, 1.0F}, opts).view({1, 3});
+    auto nmap = (n * 0.5F + 0.5F) * valid.unsqueeze(1) + flat * (1.0F - valid.unsqueeze(1));
+    normal_out = nmap.view({T, T, 3});
+  }
   return albedo.view({T, T, 3});
 }
 
@@ -1207,10 +1238,12 @@ int cmd_avatar(const ncg::app::Args& args) {
     if (args.has("uv-texture") && model.has_uv() && !id_img.empty()) {
       const int T = args.get_int("uv-texture", 512);
       const auto pfx = args.get("out-prefix", "avatar");
-      torch::Tensor uvmask;
-      const auto uvtex = recover_uv_albedo(model, id_img, id_v2d, id_nrm, id_w, T, uvmask);
+      torch::Tensor uvmask, uvnrm;
+      const auto uvtex = recover_uv_albedo(model, id_img, id_v2d, id_nrm, id_w, T, uvmask, uvnrm);
       ncg::io::save_png(pfx + "_albedo_uv.png", uvtex.permute({2, 0, 1}).contiguous().detach());
-      NCG_LOG_INFO("avatar --identity: wrote {}x{} per-texel albedo -> {}_albedo_uv.png", T, T, pfx);
+      ncg::io::save_png(pfx + "_normal_uv.png", uvnrm.permute({2, 0, 1}).contiguous().detach());
+      NCG_LOG_INFO("avatar --identity: wrote {}x{} per-texel albedo + photometric normals -> "
+                   "{}_albedo_uv.png / {}_normal_uv.png", T, T, pfx, pfx);
     }
 
     // Personalize geometry: a robust median of the per-frame SMPL-X shape (drives face/body
@@ -1362,7 +1395,8 @@ int cmd_avatar(const ncg::app::Args& args) {
       if (identity && args.has("uv-texture") && model.has_uv()) {
         ncg::mesh::write_glb_textured(rest_verts, model.faces(), normals, model.uv_coords(),
                                       model.uv_faces(), joints, parents, skin,
-                                      prefix + "_albedo_uv.png", prefix + "_textured.glb");
+                                      prefix + "_albedo_uv.png", prefix + "_textured.glb",
+                                      prefix + "_normal_uv.png");
         NCG_LOG_INFO("avatar: wrote UV-textured rigged mesh -> {}_textured.glb", prefix);
       }
     }
