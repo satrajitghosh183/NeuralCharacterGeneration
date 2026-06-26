@@ -70,6 +70,25 @@ front resolves to a real likeness while the back/sides are unconstrained. This i
 single slow **360° full-body phone video** (`ffmpeg -i orbit.mov -vf fps=8 frames/f_%04d.jpg`) feeds
 the exact same command and fills all angles. No method change recovers geometry never photographed.
 
+## 4b. C5 — identity from incoherent data (the hard win)
+
+The frontal-only ceiling (§4) is a *data coherence* problem, and the award-worthy answer is to solve
+it in the method, not by hunting for clean data (which, for a celebrity, doesn't exist to scrape).
+`ncg_cli avatar --identity` runs the robust C1/C2 inverse-render solver (per-frame SH lighting + a
+single shared albedo + per-observation consistency) to drive the avatar's appearance.
+
+On a deliberately **incoherent** pile (≈1,200 mixed web frames of one person — different films,
+outfits, lighting, montage cuts, occasional wrong person; 81 usable):
+- **Naive averaging** (`fit_avatar`) collapses to a spiky blur — there is no consensus to average.
+- **Identity solver** rejects ≈**72%** of observations as inconsistent (mean consistency ≈0.28) and
+  recovers a **clean, complete, 360° relightable body** from the consistent face/skin core
+  (`server_artifacts/C5_before_after.png`). It recovers *who they are* (shape + skin + face), not a
+  specific outfit the data never agreed on — recovering a non-existent consensus would be
+  hallucination. Uncertain vertices are faded by the solver's per-vertex precision.
+
+Math + novelty (robust low-rank-identity + sparse-nuisance factorization under a per-image
+illumination operator; unified with C4 on the motion manifold): `docs/method.md` §14.
+
 ## 5. The game (`apps/ncg_game`)
 
 Native **Vulkan** (vk-bootstrap + VMA + tinygltf + GLFW + glm), no engine. Loads the rigged `.glb`,
