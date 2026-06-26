@@ -1138,8 +1138,64 @@ int cmd_avatar(const ncg::app::Args& args) {
     }
     NCG_LOG_INFO("avatar: wrote {} turntable views -> {}_turn*.png", nv, prefix);
   }
-  NCG_LOG_INFO("avatar: done -> {}_fit0.png / {}_turn*.png ({} gaussians)", prefix, prefix,
-               canonical.size());
+
+  // ---- engine export: dual representation driven by one SMPL-X skeleton ----
+  // (1) Skinned Gaussian .ply: high-fidelity render asset (any GS plugin/viewer) + a .skin sidecar
+  //     binding each splat to the skeleton, so the splats follow the physics rig.
+  // (2) Rigged (optionally animated) mesh .glb: the universal, physics-ready body that imports into
+  //     any engine and drives ragdoll/colliders — the same 55-joint skeleton both share.
+  {
+    const int64_t Jn = model.num_joints();
+    ncg::body::SmplxParams rp;
+    rp.betas = betas0;
+    rp.pose_aa = torch::zeros({1, Jn, 3}, betas0.options());
+    rp.transl = torch::zeros({1, 3}, betas0.options());
+    const auto ro = model.forward(rp);
+    const auto rest_verts = ro.vertices.squeeze(0);  // [V,3]
+    const auto joints = ro.joints.squeeze(0);        // [J,3]
+    const auto lbs = model.lbs_weights().to(device);  // [V,J]
+
+    // Per-splat skinning: each Gaussian inherits its bound vertex's top-4 bone influences.
+    const auto lbs_g = lbs.index_select(0, binding.defined() && binding.numel() > 0
+                                                ? binding
+                                                : torch::arange(model.num_verts(),
+                                                                binding.options()));
+    const auto tk = lbs_g.topk(4, /*dim=*/1);
+    auto sw_g = std::get<0>(tk);
+    const auto idx_g = std::get<1>(tk);
+    sw_g = sw_g / sw_g.sum(1, true).clamp_min(1e-8);
+    ncg::mesh::write_gaussian_ply(canonical, prefix + ".ply", idx_g, sw_g);
+    NCG_LOG_INFO("avatar: wrote skinned Gaussian splat -> {}.ply (+ .skin, {} splats)", prefix,
+                 canonical.size());
+
+    // Rigged mesh .glb with the trained per-vertex appearance (when 1:1) and the SMPL-X rig.
+    if (model.has_faces()) {
+      ncg::mesh::TriMesh tm;
+      tm.vertices = rest_verts.to(at::kCPU);
+      tm.faces = model.faces().to(at::kCPU);
+      const auto normals = ncg::mesh::compute_vertex_normals(tm);
+      const auto vcol =
+          (canonical.size() == model.num_verts() ? canonical.colors : init_colors).to(at::kCPU);
+      const auto parents = model.parents();
+      const auto skin = model.lbs_weights();
+      if (args.has("motion")) {
+        auto motion = ncg::io::load_npy(args.require("motion")).to(betas0.options());  // [T,J,3]
+        const auto quats = aa_to_quat(motion);                                         // [T,J,4]
+        const float fps = args.get_float("fps", 24.0F);
+        const auto times = torch::arange(motion.size(0), at::kFloat) / fps;
+        ncg::mesh::write_glb_animated(rest_verts, model.faces(), normals, vcol, joints, parents,
+                                      skin, quats, times, prefix + ".glb");
+        NCG_LOG_INFO("avatar: wrote rigged+animated mesh -> {}.glb ({} frames)", prefix,
+                     motion.size(0));
+      } else {
+        ncg::mesh::write_glb_skinned(rest_verts, model.faces(), normals, vcol, joints, parents,
+                                     skin, prefix + ".glb");
+        NCG_LOG_INFO("avatar: wrote rigged mesh -> {}.glb", prefix);
+      }
+    }
+  }
+  NCG_LOG_INFO("avatar: done -> {}.ply (splats) + {}.glb (rigged mesh) + {}_fit0.png ({} gaussians)",
+               prefix, prefix, prefix, canonical.size());
   return 0;
 }
 

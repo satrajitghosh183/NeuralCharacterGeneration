@@ -56,4 +56,14 @@ void write_glb_animated(const Tensor& vertices, const Tensor& faces, const Tenso
                         const Tensor& skin_weights, const Tensor& rot_quats, const Tensor& times,
                         const std::string& path);
 
+/// Export a Gaussian cloud as a **standard 3DGS binary .ply** — the Inria/3DGS convention read by
+/// Unity/Unreal Gaussian-splat plugins and standalone viewers (per-splat x,y,z; nx,ny,nz; f_dc_0..2
+/// = SH-DC of color; opacity as inverse-sigmoid; scale_0..2 as log; rot_0..3 quaternion w,x,y,z).
+/// This is the high-fidelity, engine-portable render asset. When `skin_joints` [N,4] (int) and
+/// `skin_weights` [N,4] are given, a sidecar "<path>.skin" is also written (binary: int32 N, then
+/// N×(4×int32 joint + 4×float32 weight)) so a GS-skinning shader deforms the splats with the
+/// SMPL-X skeleton — the same rig the physics body uses, so the splats follow real physics.
+void write_gaussian_ply(const recon::GaussianCloud& cloud, const std::string& path,
+                        const Tensor& skin_joints = {}, const Tensor& skin_weights = {});
+
 }  // namespace ncg::mesh

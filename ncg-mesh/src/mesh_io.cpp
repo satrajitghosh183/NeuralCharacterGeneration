@@ -497,4 +497,75 @@ void write_glb_animated(const Tensor& vertices, const Tensor& faces, const Tenso
   os.write(glb.data(), static_cast<std::streamsize>(glb.size()));
 }
 
+void write_gaussian_ply(const recon::GaussianCloud& cloud, const std::string& path,
+                        const Tensor& skin_joints, const Tensor& skin_weights) {
+  cloud.validate();
+  const int64_t n = cloud.size();
+  NCG_CHECK(n > 0, "write_gaussian_ply: empty cloud");
+
+  // Move to CPU float and apply the 3DGS storage conventions.
+  const auto pos = cloud.positions.detach().to(at::kCPU, at::kFloat).contiguous();
+  const auto col = cloud.colors.detach().to(at::kCPU, at::kFloat).clamp(0.0, 1.0);
+  // f_dc: color = SH_C0 * f_dc + 0.5  ->  f_dc = (color - 0.5) / SH_C0
+  constexpr float kShC0 = 0.28209479177387814F;
+  const auto fdc = ((col - 0.5F) / kShC0).contiguous();
+  // opacity stored pre-sigmoid; scales stored as log; quaternion normalized (w,x,y,z).
+  const auto op = cloud.opacities.detach().to(at::kCPU, at::kFloat).clamp(1e-6, 1.0 - 1e-6);
+  const auto op_logit = (op / (1.0 - op)).log().contiguous();
+  const auto logscale =
+      cloud.scales.detach().to(at::kCPU, at::kFloat).clamp_min(1e-9).log().contiguous();
+  auto rot = cloud.rotations.detach().to(at::kCPU, at::kFloat);
+  rot = (rot / rot.norm(2, 1, true).clamp_min(1e-8)).contiguous();
+
+  const auto pa = pos.accessor<float, 2>();
+  const auto fa = fdc.accessor<float, 2>();
+  const auto oa = op_logit.accessor<float, 2>();
+  const auto sa = logscale.accessor<float, 2>();
+  const auto ra = rot.accessor<float, 2>();
+
+  std::ofstream os(path, std::ios::binary);
+  NCG_CHECK(os.good(), "write_gaussian_ply: cannot open '{}'", path);
+  os << "ply\nformat binary_little_endian 1.0\n";
+  os << "element vertex " << n << "\n";
+  for (const char* prop : {"x", "y", "z", "nx", "ny", "nz", "f_dc_0", "f_dc_1", "f_dc_2", "opacity",
+                           "scale_0", "scale_1", "scale_2", "rot_0", "rot_1", "rot_2", "rot_3"}) {
+    os << "property float " << prop << "\n";
+  }
+  os << "end_header\n";
+  auto put = [&](float v) { os.write(reinterpret_cast<const char*>(&v), sizeof(float)); };
+  for (int64_t i = 0; i < n; ++i) {
+    put(pa[i][0]); put(pa[i][1]); put(pa[i][2]);
+    put(0.0F); put(0.0F); put(0.0F);                            // normals (unused by GS)
+    put(fa[i][0]); put(fa[i][1]); put(fa[i][2]);                // SH DC color
+    put(oa[i][0]);                                              // opacity (pre-sigmoid)
+    put(sa[i][0]); put(sa[i][1]); put(sa[i][2]);                // log scales
+    put(ra[i][0]); put(ra[i][1]); put(ra[i][2]); put(ra[i][3]); // quaternion (w,x,y,z)
+  }
+  os.close();
+
+  // Optional skinning sidecar: int32 N, then per-splat 4×int32 joints + 4×float32 weights.
+  if (skin_joints.defined() && skin_weights.defined() && skin_joints.numel() > 0) {
+    NCG_CHECK(skin_joints.size(0) == n && skin_joints.size(1) == 4, "skin_joints must be [N,4]");
+    NCG_CHECK(skin_weights.size(0) == n && skin_weights.size(1) == 4, "skin_weights must be [N,4]");
+    const auto jj = skin_joints.detach().to(at::kCPU, at::kInt).contiguous();
+    const auto ww = skin_weights.detach().to(at::kCPU, at::kFloat).contiguous();
+    const auto ja = jj.accessor<int32_t, 2>();
+    const auto wa = ww.accessor<float, 2>();
+    std::ofstream ss(path + ".skin", std::ios::binary);
+    NCG_CHECK(ss.good(), "write_gaussian_ply: cannot open skin sidecar");
+    const int32_t ni = static_cast<int32_t>(n);
+    ss.write(reinterpret_cast<const char*>(&ni), sizeof(int32_t));
+    for (int64_t i = 0; i < n; ++i) {
+      for (int k = 0; k < 4; ++k) {
+        const int32_t j = ja[i][k];
+        ss.write(reinterpret_cast<const char*>(&j), sizeof(int32_t));
+      }
+      for (int k = 0; k < 4; ++k) {
+        const float w = wa[i][k];
+        ss.write(reinterpret_cast<const char*>(&w), sizeof(float));
+      }
+    }
+  }
+}
+
 }  // namespace ncg::mesh
