@@ -404,3 +404,15 @@ recovered from data too inconsistent for any averaging method. *That intersectio
 > collapses to a spiky blur, while the identity solver — **rejecting ≈70% of observations as
 > inconsistent (mean consistency ≈0.3)** — recovers a clean, complete, 360° relightable body. The
 > garment-residual decomposition is the proposed next step.
+>
+> **Ablation that pins the claim (`--identity --refine`).** Re-introducing a *photometric* (per-pixel
+> image) fit on even the most-consistent 50% of frames **re-blurs** the result (fit collapses, body
+> spikes return) — direct evidence that on incoherent appearance *no* image-space optimization can
+> converge, because the targets genuinely disagree. Only the **robust per-vertex albedo** (reject
+> per-observation, never average) survives. This delimits where the contribution lives: recovery must
+> happen in the **consistency-gated parameter domain (albedo on the manifold)**, not in image space.
+> **Ceiling + true next step:** per-vertex albedo is inherently smooth (≈10⁴ verts) and SMPL-X face
+> shape is near-template, so the recovered face is a clean *identity* but not yet a recognizable
+> likeness. Sharpening it is not a photometric fit but a resolution+geometry upgrade: (i) lift the
+> robust albedo from per-vertex to **per-texel (UV)** so the same C1/C2 solver recovers a high-res
+> face texture, and (ii) **personalized face geometry** from the consistent face observations.
