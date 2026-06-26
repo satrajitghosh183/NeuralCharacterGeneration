@@ -66,8 +66,10 @@ Tensor bake_to_uv(const UVRaster& ras, const Tensor& vertex_values, const Tensor
   const int64_t C = vv.size(1);
   auto tex = torch::zeros({static_cast<int64_t>(res) * res, C}, at::kFloat);
   auto mask = torch::zeros({static_cast<int64_t>(res) * res}, at::kFloat);
-  const auto faceacc = ras.face.to(at::kCPU).accessor<int64_t, 1>();
-  const auto baryacc = ras.bary.to(at::kCPU).accessor<float, 2>();
+  const auto face_cpu = ras.face.to(at::kCPU).contiguous();
+  const auto bary_cpu = ras.bary.to(at::kCPU).contiguous();
+  const auto faceacc = face_cpu.accessor<int64_t, 1>();
+  const auto baryacc = bary_cpu.accessor<float, 2>();
   const auto vva = vv.accessor<float, 2>();
   const auto fca = fc.accessor<int64_t, 2>();
   auto ta = tex.accessor<float, 2>();
