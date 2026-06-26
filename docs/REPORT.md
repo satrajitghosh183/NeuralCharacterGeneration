@@ -56,7 +56,11 @@ N·H·W, so densify + high-res can OOM — use the tiled rasterizer for large N,
 | run | frames | res | splats | body-masked PSNR |
 |---|---|---|---|---|
 | baseline (`rock_char`) | 16 | 320 | 10,475 | **20.8 dB** |
-| high-fidelity (`rock_char_hi`) | ~30 | 384 | 10,475 | _<pending — updates on completion>_ |
+| high-fidelity (`rock_char_hi`) | 30 | 384 | 10,475 | **20.8 dB** (≈ baseline — see below) |
+
+Higher resolution did not move the masked PSNR (20.8 → 20.8): the per-frame fit is already converged
+and resolution sharpens visual detail, not the metric. The number is **pinned by coverage**, not
+fidelity headroom — direct evidence that the next gain is data (a 360° capture), not more iterations.
 
 Assets validated structurally: `.glb` = valid glTF v2 (55-joint skin, 65-frame animation); `.ply` =
 standard 3DGS (10,475 finite splats, 17 properties); `.skin` = N records, joints 0–54, weights → 1.0.
