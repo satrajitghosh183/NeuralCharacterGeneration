@@ -13,7 +13,8 @@
 namespace ncg::fit {
 namespace {
 
-Tensor logit(const Tensor& p) {
+// Inverse sigmoid (named to avoid ADL collision with at::logit).
+Tensor inv_sigmoid(const Tensor& p) {
   const auto c = p.clamp(1e-4, 1.0 - 1e-4);
   return torch::log(c / (1.0 - c));
 }
@@ -77,9 +78,9 @@ recon::GaussianCloud fit_adaptive(const std::vector<Tensor>& targets_in,
   }
 
   // Scene extent (bbox diagonal) sets the split size threshold.
-  const double extent = (init.positions.max(0).values - init.positions.min(0).values)
-                            .norm()
-                            .item<double>();
+  const auto pmax = std::get<0>(init.positions.max(0));
+  const auto pmin = std::get<0>(init.positions.min(0));
+  const double extent = (pmax - pmin).norm().item<double>();
 
   // Per-view body masks from the init render's alpha (keeps the fit off the background).
   std::vector<Tensor> masks(V);
@@ -95,8 +96,8 @@ recon::GaussianCloud fit_adaptive(const std::vector<Tensor>& targets_in,
   auto positions = init.positions.detach().clone().set_requires_grad(true);
   auto log_scales = init.scales.detach().clamp_min(1e-6).log().set_requires_grad(true);
   auto quats = init.rotations.detach().clone().set_requires_grad(true);
-  auto color_logits = logit(init.colors.detach()).set_requires_grad(true);
-  auto opacity_logits = logit(init.opacities.detach()).set_requires_grad(true);
+  auto color_logits = inv_sigmoid(init.colors.detach()).set_requires_grad(true);
+  auto opacity_logits = inv_sigmoid(init.opacities.detach()).set_requires_grad(true);
   auto gain = torch::ones({V, 3}, opts).set_requires_grad(cfg.per_view_exposure);
   auto bias = torch::zeros({V, 3}, opts).set_requires_grad(cfg.per_view_exposure);
 
@@ -241,7 +242,7 @@ recon::GaussianCloud fit_adaptive(const std::vector<Tensor>& targets_in,
       torch::NoGradGuard ng;
       const auto reset = torch::min(torch::sigmoid(opacity_logits),
                                     torch::full_like(opacity_logits, 0.01));
-      opacity_logits = logit(reset).detach().set_requires_grad(true);
+      opacity_logits = inv_sigmoid(reset).detach().set_requires_grad(true);
       optimizer = make_opt();
     }
 
