@@ -89,4 +89,35 @@ Tensor bake_to_uv(const UVRaster& ras, const Tensor& vertex_values, const Tensor
   return tex.view({res, res, C});
 }
 
+Tensor compute_uv_tangents(const Tensor& verts, const Tensor& faces, const Tensor& uv_coords,
+                           const Tensor& uv_faces) {
+  const auto v = verts.to(at::kCPU, at::kFloat).contiguous();
+  const auto f = faces.to(at::kCPU, at::kLong).contiguous();
+  const auto uv = uv_coords.to(at::kCPU, at::kFloat).contiguous();
+  const auto uf = uv_faces.to(at::kCPU, at::kLong).contiguous();
+  const int64_t V = v.size(0), F = f.size(0);
+  auto tan = torch::zeros({V, 3}, at::kFloat);
+  const auto va = v.accessor<float, 2>();
+  const auto fa = f.accessor<int64_t, 2>();
+  const auto uva = uv.accessor<float, 2>();
+  const auto ufa = uf.accessor<int64_t, 2>();
+  auto ta = tan.accessor<float, 2>();
+  for (int64_t i = 0; i < F; ++i) {
+    const int64_t i0 = fa[i][0], i1 = fa[i][1], i2 = fa[i][2];
+    const int64_t u0 = ufa[i][0], u1 = ufa[i][1], u2 = ufa[i][2];
+    const float e1[3] = {va[i1][0] - va[i0][0], va[i1][1] - va[i0][1], va[i1][2] - va[i0][2]};
+    const float e2[3] = {va[i2][0] - va[i0][0], va[i2][1] - va[i0][1], va[i2][2] - va[i0][2]};
+    const float du1 = uva[u1][0] - uva[u0][0], dv1 = uva[u1][1] - uva[u0][1];
+    const float du2 = uva[u2][0] - uva[u0][0], dv2 = uva[u2][1] - uva[u0][1];
+    const float det = du1 * dv2 - du2 * dv1;
+    if (std::abs(det) < 1e-12F) continue;
+    const float r = 1.0F / det;
+    const float Tt[3] = {r * (e1[0] * dv2 - e2[0] * dv1), r * (e1[1] * dv2 - e2[1] * dv1),
+                         r * (e1[2] * dv2 - e2[2] * dv1)};
+    for (int64_t vi : {i0, i1, i2})
+      for (int k = 0; k < 3; ++k) ta[vi][k] += Tt[k];
+  }
+  return tan / tan.norm(2, 1, true).clamp_min(1e-8F);
+}
+
 }  // namespace ncg::recon

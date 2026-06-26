@@ -29,4 +29,12 @@ UVRaster uv_rasterize(const Tensor& uv_coords, const Tensor& uv_faces, int res);
 Tensor bake_to_uv(const UVRaster& ras, const Tensor& vertex_values, const Tensor& faces,
                   Tensor& mask_out);
 
+/// Per-vertex tangent vectors [V,3] from the UV parameterization (the +U surface direction),
+/// computed by accumulating each triangle's `dP/du` (from positions + the triangle's UV corners)
+/// onto its vertices and normalizing. Needed to convert photometrically-recovered object-space
+/// normals into the **tangent-space** normal map that glTF's `normalTexture` expects. `verts`
+/// [V,3], geometry `faces` [F,3], `uv_coords` [n_uv,2], `uv_faces` [F,3].
+Tensor compute_uv_tangents(const Tensor& verts, const Tensor& faces, const Tensor& uv_coords,
+                           const Tensor& uv_faces);
+
 }  // namespace ncg::recon

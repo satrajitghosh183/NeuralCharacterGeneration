@@ -353,7 +353,12 @@ void write_glb_textured(const Tensor& vertices, const Tensor& faces_in, const Te
                         const Tensor& uv_coords_in, const Tensor& uv_faces_in, const Tensor& joints_in,
                         const Tensor& parents_in, const Tensor& skin_weights_in,
                         const std::string& texture_png_path, const std::string& path,
-                        const std::string& normal_png_path) {
+                        const std::string& normal_png_path, const Tensor& rot_quats,
+                        const Tensor& times) {
+  const bool hasAnim = rot_quats.defined() && rot_quats.numel() > 0 && times.defined();
+  const auto quats = hasAnim ? rot_quats.to(at::kCPU, at::kFloat).contiguous() : Tensor();  // [T,J,4]
+  const auto ts = hasAnim ? times.to(at::kCPU, at::kFloat).contiguous() : Tensor();          // [T]
+  const int64_t Tn = hasAnim ? ts.size(0) : 0;
   const auto vsrc = vertices.to(at::kCPU, at::kFloat).contiguous();
   const auto fgeo = faces_in.to(at::kCPU, at::kInt).contiguous();   // [F,3] geometry vertex idx
   const auto fuv = uv_faces_in.to(at::kCPU, at::kInt).contiguous(); // [F,3] uv vertex idx
@@ -446,6 +451,19 @@ void write_glb_textured(const Tensor& vertices, const Tensor& faces_in, const Te
     append_bytes(bin, npng.data(), npng.size());
     while (bin.size() % 4 != 0) bin.push_back(0);
   }
+  size_t timeOff = 0;
+  std::vector<size_t> quatOff;
+  if (hasAnim) {
+    timeOff = bin.size();
+    append_bytes(bin, ts.data_ptr<float>(), Tn * 4);
+    while (bin.size() % 4 != 0) bin.push_back(0);
+    for (int64_t j = 0; j < J; ++j) {
+      const auto qj = quats.select(1, j).contiguous();  // [T,4] (x,y,z,w)
+      quatOff.push_back(bin.size());
+      append_bytes(bin, qj.data_ptr<float>(), Tn * 16);
+    }
+    while (bin.size() % 4 != 0) bin.push_back(0);
+  }
 
   const auto posT = torch::from_blob(pos.data(), {V, 3}).clone();
   const auto vmin = std::get<0>(posT.min(0));
@@ -492,6 +510,12 @@ void write_glb_textured(const Tensor& vertices, const Tensor& faces_in, const Te
   const int bvIdx = add(idxOff, static_cast<int64_t>(idx.size()) * 4, 34963);
   const int bvImg = add(pngOff, static_cast<int64_t>(png.size()), 0);
   const int bvImgN = hasNT ? add(npngOff, static_cast<int64_t>(npng.size()), 0) : -1;
+  int bvTime = -1;
+  std::vector<int> bvQuat;
+  if (hasAnim) {
+    bvTime = add(timeOff, Tn * 4, 0);
+    for (int64_t j = 0; j < J; ++j) bvQuat.push_back(add(quatOff[static_cast<size_t>(j)], Tn * 16, 0));
+  }
 
   std::ostringstream accs;
   accs << "{\"bufferView\":" << bvPos << ",\"componentType\":5126,\"count\":" << V
@@ -509,6 +533,19 @@ void write_glb_textured(const Tensor& vertices, const Tensor& faces_in, const Te
   accs << ",{\"bufferView\":" << bvIBM << ",\"componentType\":5126,\"count\":" << J << ",\"type\":\"MAT4\"}";
   const int accIdx = acc++;
   accs << ",{\"bufferView\":" << bvIdx << ",\"componentType\":5125,\"count\":" << idx.size() << ",\"type\":\"SCALAR\"}";
+  int accTime = -1;
+  std::vector<int> accQuat;
+  if (hasAnim) {
+    accTime = acc++;
+    accs << ",{\"bufferView\":" << bvTime << ",\"componentType\":5126,\"count\":" << Tn
+         << ",\"type\":\"SCALAR\",\"min\":[" << ts.min().item<float>() << "],\"max\":["
+         << ts.max().item<float>() << "]}";
+    for (int64_t j = 0; j < J; ++j) {
+      accQuat.push_back(acc++);
+      accs << ",{\"bufferView\":" << bvQuat[static_cast<size_t>(j)]
+           << ",\"componentType\":5126,\"count\":" << Tn << ",\"type\":\"VEC4\"}";
+    }
+  }
 
   js << "\"bufferViews\":[" << bvs.str() << "],\"accessors\":[" << accs.str() << "],";
   js << "\"images\":[{\"bufferView\":" << bvImg << ",\"mimeType\":\"image/png\"}";
@@ -525,7 +562,19 @@ void write_glb_textured(const Tensor& vertices, const Tensor& faces_in, const Te
   js << "]}],\"materials\":[{\"pbrMetallicRoughness\":{\"baseColorTexture\":{\"index\":0},"
         "\"metallicFactor\":0,\"roughnessFactor\":1}";
   if (hasNT) js << ",\"normalTexture\":{\"index\":1}";
-  js << "}],\"buffers\":[{\"byteLength\":" << bin.size() << "}]}";
+  js << "}]";
+  if (hasAnim) {
+    js << ",\"animations\":[{\"name\":\"clip\",\"samplers\":[";
+    for (int64_t j = 0; j < J; ++j)
+      js << (j ? "," : "") << "{\"input\":" << accTime << ",\"output\":" << accQuat[static_cast<size_t>(j)]
+         << ",\"interpolation\":\"LINEAR\"}";
+    js << "],\"channels\":[";
+    for (int64_t j = 0; j < J; ++j)
+      js << (j ? "," : "") << "{\"sampler\":" << j << ",\"target\":{\"node\":" << j
+         << ",\"path\":\"rotation\"}}";
+    js << "]}]";
+  }
+  js << ",\"buffers\":[{\"byteLength\":" << bin.size() << "}]}";
   std::string json = js.str();
   while (json.size() % 4 != 0) json.push_back(' ');
 

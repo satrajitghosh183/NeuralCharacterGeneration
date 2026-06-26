@@ -1017,7 +1017,8 @@ torch::Tensor recover_uv_albedo(const ncg::body::SmplxModel& model,
                                 const std::vector<torch::Tensor>& v2ds,
                                 const std::vector<torch::Tensor>& nrms,
                                 const std::vector<torch::Tensor>& viss, int T,
-                                torch::Tensor& mask_out, torch::Tensor& normal_out) {
+                                const torch::Tensor& rest_verts, torch::Tensor& mask_out,
+                                torch::Tensor& normal_out) {
   const auto device = model.uv_coords().device();
   const auto ras = ncg::recon::uv_rasterize(model.uv_coords(), model.uv_faces(), T);
   const auto face = ras.face.to(device);                              // [T^2]
@@ -1081,12 +1082,30 @@ torch::Tensor recover_uv_albedo(const ncg::body::SmplxModel& model,
     const auto gy = torch::einsum("fca,fct->fat", {g, y});            // [N,3,T^2]
     const auto ATy = torch::einsum("ft,fat->ta", {w, gy});           // [T^2,3]
     const auto ridge = torch::eye(3, opts).unsqueeze(0) * 1e-2F;
-    auto n = torch::linalg_solve(ATA + ridge, ATy.unsqueeze(2)).squeeze(2);  // [T^2,3]
+    auto n = torch::linalg_solve(ATA + ridge, ATy.unsqueeze(2)).squeeze(2);  // [T^2,3] object-space
     n = torch::nan_to_num(n);
     n = n / n.norm(2, 1, true).clamp_min(1e-6F);
-    // Tangent-space-ish encode to [0,1]; flat (0,0,1) where invalid so it reads as no perturbation.
+
+    // Convert object-space normals to TANGENT space (what glTF normalTexture expects) using the
+    // canonical TBN frame per texel: geometric normal + UV tangent + bitangent.
+    ncg::mesh::TriMesh rm;
+    rm.vertices = rest_verts.to(at::kCPU);
+    rm.faces = model.faces().to(at::kCPU);
+    const auto vnorm = ncg::mesh::compute_vertex_normals(rm).to(device);            // [V,3]
+    const auto vtan = ncg::recon::compute_uv_tangents(rest_verts, model.faces(), model.uv_coords(),
+                                                      model.uv_faces()).to(device);  // [V,3]
+    auto bw = [&](const torch::Tensor& vv) {  // barycentric gather per texel -> [T^2,3]
+      return (vv.index_select(0, geomv).reshape({TT, 3, 3}) * bary.unsqueeze(2)).sum(1);
+    };
+    auto ng = bw(vnorm);
+    ng = ng / ng.norm(2, 1, true).clamp_min(1e-6F);
+    auto tg = bw(vtan);
+    tg = tg - ng * (ng * tg).sum(1, true);  // Gram-Schmidt orthogonalize
+    tg = tg / tg.norm(2, 1, true).clamp_min(1e-6F);
+    const auto bg = torch::cross(ng, tg, 1);
+    const auto nt = torch::stack({(n * tg).sum(1), (n * bg).sum(1), (n * ng).sum(1)}, 1);  // tangent
     const auto flat = torch::tensor({0.5F, 0.5F, 1.0F}, opts).view({1, 3});
-    auto nmap = (n * 0.5F + 0.5F) * valid.unsqueeze(1) + flat * (1.0F - valid.unsqueeze(1));
+    auto nmap = (nt * 0.5F + 0.5F) * valid.unsqueeze(1) + flat * (1.0F - valid.unsqueeze(1));
     normal_out = nmap.view({T, T, 3});
   }
   return albedo.view({T, T, 3});
@@ -1234,28 +1253,29 @@ int cmd_avatar(const ncg::app::Args& args) {
     NCG_LOG_INFO("avatar --identity: recovered canonical albedo from {} frames (mean consistency {:.2f})",
                  id_obs.size(), ir.consistency.mean().item<double>());
 
-    // Optional high-res face: per-texel robust albedo over the SMPL-X UV layout.
-    if (args.has("uv-texture") && model.has_uv() && !id_img.empty()) {
-      const int T = args.get_int("uv-texture", 512);
-      const auto pfx = args.get("out-prefix", "avatar");
-      torch::Tensor uvmask, uvnrm;
-      const auto uvtex = recover_uv_albedo(model, id_img, id_v2d, id_nrm, id_w, T, uvmask, uvnrm);
-      ncg::io::save_png(pfx + "_albedo_uv.png", uvtex.permute({2, 0, 1}).contiguous().detach());
-      ncg::io::save_png(pfx + "_normal_uv.png", uvnrm.permute({2, 0, 1}).contiguous().detach());
-      NCG_LOG_INFO("avatar --identity: wrote {}x{} per-texel albedo + photometric normals -> "
-                   "{}_albedo_uv.png / {}_normal_uv.png", T, T, pfx, pfx);
-    }
-
-    // Personalize geometry: a robust median of the per-frame SMPL-X shape (drives face/body
-    // proportions) instead of one noisy frame — the consistent frames agree on the person's shape,
-    // outliers are pulled out. (Fine per-vertex face geometry is the deeper follow-on module.)
+    // Personalize geometry first (robust median of per-frame SMPL-X shape) so the UV solve and the
+    // body share the same rest mesh — and so the per-texel normals get the right tangent frame.
     if (id_betas.size() >= 3) betas0 = std::get<0>(torch::stack(id_betas, 0).median(0));
-    // Build the rigged avatar: SMPL-X body geometry + the robust identity albedo.
     ncg::body::SmplxParams rp;
     rp.betas = betas0;
     rp.pose_aa = torch::zeros({1, model.num_joints(), 3}, betas0.options());
     rp.transl = torch::zeros({1, 3}, betas0.options());
     const auto rest_v = model.forward(rp).vertices.squeeze(0);
+
+    // Optional high-res face: per-texel robust albedo + tangent-space photometric normals (UV).
+    if (args.has("uv-texture") && model.has_uv() && !id_img.empty()) {
+      const int T = args.get_int("uv-texture", 512);
+      const auto pfx = args.get("out-prefix", "avatar");
+      torch::Tensor uvmask, uvnrm;
+      const auto uvtex =
+          recover_uv_albedo(model, id_img, id_v2d, id_nrm, id_w, T, rest_v, uvmask, uvnrm);
+      ncg::io::save_png(pfx + "_albedo_uv.png", uvtex.permute({2, 0, 1}).contiguous().detach());
+      ncg::io::save_png(pfx + "_normal_uv.png", uvnrm.permute({2, 0, 1}).contiguous().detach());
+      NCG_LOG_INFO("avatar --identity: wrote {}x{} per-texel albedo + tangent-space normals -> "
+                   "{}_albedo_uv.png / {}_normal_uv.png", T, T, pfx, pfx);
+    }
+
+    // Build the rigged avatar: SMPL-X body geometry + the robust identity albedo.
     auto pvs = ncg::recon::per_vertex_scale(rest_v, args.get_float("scale_mult", 0.75F));
     pvs = torch::nan_to_num(pvs).clamp(0.004F, 0.02F);  // bound scale: no giant/degenerate splats
     canonical = ncg::recon::gaussians_on_body(rest_v, args.get_float("scale", 0.01F), albedo, pvs);
@@ -1391,13 +1411,21 @@ int cmd_avatar(const ncg::app::Args& args) {
                                      skin, prefix + ".glb");
         NCG_LOG_INFO("avatar: wrote rigged mesh -> {}.glb", prefix);
       }
-      // Textured variant: the high-res per-texel albedo on the UV-mapped rigged mesh.
+      // Textured variant: the high-res per-texel albedo + normal map on the UV-mapped rigged mesh,
+      // and the baked locomotion clip when --motion is given (photoreal AND animated).
       if (identity && args.has("uv-texture") && model.has_uv()) {
+        torch::Tensor tquats, ttimes;
+        if (args.has("motion")) {
+          const auto m = ncg::io::load_npy(args.require("motion")).to(betas0.options());  // [T,J,3]
+          tquats = aa_to_quat(m);
+          ttimes = torch::arange(m.size(0), at::kFloat) / args.get_float("fps", 24.0F);
+        }
         ncg::mesh::write_glb_textured(rest_verts, model.faces(), normals, model.uv_coords(),
                                       model.uv_faces(), joints, parents, skin,
                                       prefix + "_albedo_uv.png", prefix + "_textured.glb",
-                                      prefix + "_normal_uv.png");
-        NCG_LOG_INFO("avatar: wrote UV-textured rigged mesh -> {}_textured.glb", prefix);
+                                      prefix + "_normal_uv.png", tquats, ttimes);
+        NCG_LOG_INFO("avatar: wrote UV-textured{} rigged mesh -> {}_textured.glb",
+                     args.has("motion") ? "+animated" : "", prefix);
       }
     }
   }

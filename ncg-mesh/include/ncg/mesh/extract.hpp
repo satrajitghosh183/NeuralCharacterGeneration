@@ -67,7 +67,8 @@ void write_glb_textured(const Tensor& vertices, const Tensor& faces, const Tenso
                         const Tensor& uv_coords, const Tensor& uv_faces, const Tensor& joints,
                         const Tensor& parents, const Tensor& skin_weights,
                         const std::string& texture_png_path, const std::string& path,
-                        const std::string& normal_png_path = "");
+                        const std::string& normal_png_path = "", const Tensor& rot_quats = {},
+                        const Tensor& times = {});
 
 /// Export a Gaussian cloud as a **standard 3DGS binary .ply** — the Inria/3DGS convention read by
 /// Unity/Unreal Gaussian-splat plugins and standalone viewers (per-splat x,y,z; nx,ny,nz; f_dc_0..2
