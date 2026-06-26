@@ -217,11 +217,12 @@ recon::GaussianCloud fit_avatar(const body::SmplxModel& model, const Tensor& bet
 
   torch::NoGradGuard ng;
   auto g = canonical();
-  g.positions = g.positions.detach();
-  g.scales = g.scales.detach();
-  g.rotations = g.rotations.detach();
-  g.opacities = g.opacities.detach();
-  g.colors = g.colors.detach();
+  g.positions = torch::nan_to_num(g.positions.detach());
+  g.scales = torch::nan_to_num(g.scales.detach());
+  g.rotations = torch::nan_to_num(g.rotations.detach());
+  g.rotations = g.rotations / g.rotations.norm(2, 1, true).clamp_min(1e-8);  // re-unit quaternions
+  g.opacities = torch::nan_to_num(g.opacities.detach());
+  g.colors = torch::nan_to_num(g.colors.detach());
   g.validate();
   return g;
 }

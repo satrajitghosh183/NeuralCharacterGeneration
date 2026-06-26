@@ -189,8 +189,10 @@ RenderOutput render_soft_aniso(const recon::GaussianCloud& g, const Camera& cam,
   const auto fg = csum / (wsum.unsqueeze(0) + 1e-8);
   const auto bg = torch::tensor({background[0], background[1], background[2]}, opts).view({3, 1, 1});
   RenderOutput out;
-  out.image = fg * coverage + bg * (1.0 - coverage);
-  out.alpha = coverage;
+  // Sanitize: a few near-degenerate Gaussians can leave isolated non-finite pixels that would
+  // otherwise poison metrics/exports. nan_to_num is differentiable (passes finite grads through).
+  out.image = torch::nan_to_num(fg * coverage + bg * (1.0 - coverage));
+  out.alpha = torch::nan_to_num(coverage);
   return out;
 }
 
