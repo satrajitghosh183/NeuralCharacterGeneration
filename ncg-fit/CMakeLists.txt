@@ -4,6 +4,7 @@ include(NcgAddLibrary)
 ncg_add_library(ncg-fit
   SOURCES
     src/fit_image.cpp
+    src/fit_adaptive.cpp
   PUBLIC_DEPS
     ncg::core
     ncg::recon

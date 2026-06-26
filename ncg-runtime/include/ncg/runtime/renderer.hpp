@@ -25,4 +25,15 @@ RenderOutput render_gaussians(const recon::GaussianCloud& gaussians, const Camer
 RenderOutput render_soft(const recon::GaussianCloud& gaussians, const Camera& camera,
                          std::array<float, 3> background = {0.0F, 0.0F, 0.0F}, int64_t chunk = 256);
 
+/// Fully-differentiable *anisotropic* EWA splatter. Unlike render_soft (which collapses each
+/// Gaussian to an isotropic screen disk from the mean scale and ignores rotation), this projects
+/// the full 3D covariance Σ = R diag(s)² Rᵀ through the perspective Jacobian to a 2D conic, so
+/// Gaussians can be oriented and elongated and gradients flow to the rotation quaternions. This is
+/// the reconstruction-quality renderer used by the adaptive fitter (oriented splats resolve hair,
+/// edges and the face that isotropic disks blur). `dilation` is the screen-space low-pass added to
+/// the 2D covariance diagonal (3DGS uses ~0.3 px). Output image is graph-connected. CUDA or CPU.
+RenderOutput render_soft_aniso(const recon::GaussianCloud& gaussians, const Camera& camera,
+                               std::array<float, 3> background = {0.0F, 0.0F, 0.0F},
+                               int64_t chunk = 256, float dilation = 0.3F);
+
 }  // namespace ncg::runtime
