@@ -422,5 +422,9 @@ recovered from data too inconsistent for any averaging method. *That intersectio
 > barycentric correspondence, and the C1/C2 solver runs in **texel space** (T², e.g. 512² ≫ 10⁴
 > verts). On the incoherent pile it recovers a high-res albedo texture whose face island shows real
 > eye/nose/mouth structure — the resolution per-vertex couldn't hold. Shape is also robustly
-> personalized (median of per-frame betas). **Remaining for full likeness:** textured-glTF export of
-> the UV map, and fine **per-vertex face geometry** (the displacement field) — the last module.
+> personalized (median of per-frame betas). Textured-glTF export of the UV map is implemented
+> (`mesh::write_glb_textured`, seam-unwelded + embedded PNG + material), so the recovered face shows
+> on the rigged character in any engine. **Remaining for full likeness:** fine **face geometry** —
+> either a per-vertex displacement field or, more in keeping with the thesis, **per-texel photometric
+> normals** solved from the same multi-illumination observations (photometric stereo on the UV map),
+> which adds high-frequency facial detail as a normal map without leaving the robust parameter domain.
