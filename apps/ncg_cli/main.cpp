@@ -18,6 +18,7 @@
 #include <ncg/recon/appearance.hpp>
 #include <ncg/recon/init_from_body.hpp>
 #include <ncg/recon/inverse_render.hpp>
+#include <ncg/recon/uv_texture.hpp>
 #include <ncg/recon/motion_style.hpp>
 #include <ncg/record/metrics.hpp>
 #include <ncg/record/recorder.hpp>
@@ -1007,6 +1008,59 @@ int cmd_style(const ncg::app::Args& args) {
   return 0;
 }
 
+// Per-texel robust albedo (C5 at high resolution): lift the C1/C2 inverse-render from per-vertex
+// (~10^4) to per-texel (T^2) over the SMPL-X UV layout. For each valid texel, barycentrically map to
+// the image in every frame, sample observation + normal + visibility, and run the same robust
+// solver in texel space — so the consistent face/skin gains real resolution. Returns albedo [T,T,3].
+torch::Tensor recover_uv_albedo(const ncg::body::SmplxModel& model,
+                                const std::vector<torch::Tensor>& imgs,
+                                const std::vector<torch::Tensor>& v2ds,
+                                const std::vector<torch::Tensor>& nrms,
+                                const std::vector<torch::Tensor>& viss, int T,
+                                torch::Tensor& mask_out) {
+  const auto device = model.uv_coords().device();
+  const auto ras = ncg::recon::uv_rasterize(model.uv_coords(), model.uv_faces(), T);
+  const auto face = ras.face.to(device);                              // [T^2]
+  const auto bary = ras.bary.to(device);                             // [T^2,3]
+  const auto valid = (face >= 0).to(at::kFloat);                     // [T^2]
+  const auto faces = model.faces().to(device);                      // [F,3]
+  const auto geomv = faces.index_select(0, face.clamp_min(0)).reshape(-1);  // [T^2*3]
+  const int64_t TT = face.size(0);
+  namespace F = torch::nn::functional;
+
+  std::vector<torch::Tensor> obs_l, nrm_l, w_l;
+  for (size_t f = 0; f < imgs.size(); ++f) {
+    const auto img = imgs[f].to(device);                             // [3,H,W]
+    const int H = static_cast<int>(img.size(1)), W = static_cast<int>(img.size(2));
+    const auto v2d = v2ds[f].to(device);                            // [V,2]
+    const auto pv = v2d.index_select(0, geomv).reshape({TT, 3, 2});  // [T^2,3,2]
+    const auto texel_uv = (pv * bary.unsqueeze(2)).sum(1);          // [T^2,2] pixel coords
+    const auto gx = texel_uv.select(1, 0) / (W - 1) * 2 - 1;
+    const auto gy = texel_uv.select(1, 1) / (H - 1) * 2 - 1;
+    const auto grid = torch::stack({gx, gy}, 1).view({1, TT, 1, 2});
+    const auto samp = F::grid_sample(
+        img.unsqueeze(0), grid,
+        F::GridSampleFuncOptions().mode(torch::kBilinear).padding_mode(torch::kZeros).align_corners(true));
+    obs_l.push_back(samp.view({3, TT}).t().contiguous());          // [T^2,3]
+    const auto nv = nrms[f].to(device).index_select(0, geomv).reshape({TT, 3, 3});
+    const auto tn = (nv * bary.unsqueeze(2)).sum(1);               // [T^2,3]
+    nrm_l.push_back(tn / tn.norm(2, 1, true).clamp_min(1e-6));
+    const auto vv = viss[f].to(device).index_select(0, geomv).reshape({TT, 3});
+    w_l.push_back(std::get<0>(vv.min(1)) * valid);                 // [T^2]
+  }
+  ncg::recon::InverseRenderConfig ic;
+  ic.iterations = 60;
+  ic.robust = true;
+  const auto ir = ncg::recon::solve_inverse_render(torch::stack(obs_l, 0), torch::stack(nrm_l, 0),
+                                                   torch::stack(w_l, 0), ic);
+  auto albedo = torch::nan_to_num(ir.albedo).clamp(0.0F, 1.0F);     // [T^2,3]
+  const auto obs_mean = torch::stack(obs_l, 0).mean(0).mean(0).clamp_min(1e-3F);
+  const auto alb_mean = albedo.mean(0).clamp_min(1e-3F);
+  albedo = (albedo * (obs_mean / alb_mean).view({1, 3})).clamp(0.0F, 1.0F);
+  mask_out = valid.view({T, T});
+  return albedo.view({T, T, 3});
+}
+
 // Trains an animatable Gaussian avatar from a directory of video frames of one person. Each frame
 // is run through NLF to get its SMPL-X pose + a solved camera; fit_avatar then optimizes a single
 // canonical cloud (anisotropic splats, per-frame exposure, D-SSIM) so it reproduces every posed
@@ -1064,6 +1118,7 @@ int cmd_avatar(const ncg::app::Args& args) {
   const bool identity = args.get_int("identity", 0) != 0;
   const auto faces_cpu = model.has_faces() ? model.faces().to(at::kCPU) : torch::Tensor();
   std::vector<torch::Tensor> id_obs, id_nrm, id_w;  // per-frame [V,3],[V,3],[V] for the solver
+  std::vector<torch::Tensor> id_img, id_v2d;        // per-frame image + scaled v2d (per-texel solve)
 
   std::vector<ncg::fit::AvatarFrame> frames;
   torch::Tensor betas0;
@@ -1095,6 +1150,8 @@ int cmd_avatar(const ncg::app::Args& args) {
       id_w.push_back(ncg::recon::vertex_visibility(
           v2df, pred.vertices3d.select(1, 2).to(device), static_cast<int64_t>(img_full.size(1)),
           static_cast<int64_t>(img_full.size(2))));
+      id_img.push_back(img);                          // downscaled image for per-texel sampling
+      id_v2d.push_back(pred.vertices2d.to(device) * s);  // v2d in the downscaled image's pixels
     }
 
     ncg::fit::AvatarFrame fr;
@@ -1143,6 +1200,16 @@ int cmd_avatar(const ncg::app::Args& args) {
     albedo = albedo * conf + obs_mean.view({1, 3}) * (1.0F - conf);
     NCG_LOG_INFO("avatar --identity: recovered canonical albedo from {} frames (mean consistency {:.2f})",
                  id_obs.size(), ir.consistency.mean().item<double>());
+
+    // Optional high-res face: per-texel robust albedo over the SMPL-X UV layout.
+    if (args.has("uv-texture") && model.has_uv() && !id_img.empty()) {
+      const int T = args.get_int("uv-texture", 512);
+      const auto pfx = args.get("out-prefix", "avatar");
+      torch::Tensor uvmask;
+      const auto uvtex = recover_uv_albedo(model, id_img, id_v2d, id_nrm, id_w, T, uvmask);
+      ncg::io::save_png(pfx + "_albedo_uv.png", uvtex.permute({2, 0, 1}).contiguous().detach());
+      NCG_LOG_INFO("avatar --identity: wrote {}x{} per-texel albedo -> {}_albedo_uv.png", T, T, pfx);
+    }
 
     // Build the rigged avatar: SMPL-X body geometry + the robust identity albedo.
     ncg::body::SmplxParams rp;
