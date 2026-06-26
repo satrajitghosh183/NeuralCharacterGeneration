@@ -1110,11 +1110,16 @@ int cmd_avatar(const ncg::app::Args& args) {
     p0.transl = frames[0].transl.unsqueeze(0);
     const auto vt0 = model.forward(p0).vertex_transforms.squeeze(0);
     const auto posed = ncg::fit::deform_avatar(canonical, vt0);
-    const auto fit = ncg::runtime::render_soft_aniso(posed, frames[0].camera).image;
-    ncg::io::save_png(prefix + "_fit0.png", fit.detach());
+    const auto out0 = ncg::runtime::render_soft_aniso(posed, frames[0].camera);
+    const auto fit = out0.image.detach();
+    ncg::io::save_png(prefix + "_fit0.png", fit);
     ncg::io::save_png(prefix + "_tgt0.png", frames[0].target.detach());
-    NCG_LOG_INFO("avatar: fit0 PSNR vs target = {:.2f} dB",
-                 ncg::record::psnr(fit.detach(), frames[0].target));
+    // Body-masked PSNR: the avatar renders the body on a black background while the target has a
+    // full scene, so whole-image PSNR is meaningless — measure only inside the rendered silhouette.
+    const auto mask = (out0.alpha.detach() > 0.05F).to(at::kFloat);
+    NCG_LOG_INFO("avatar: fit0 body-masked PSNR vs target = {:.2f} dB ({:.0f}% body coverage)",
+                 ncg::record::psnr(fit * mask, frames[0].target.detach() * mask),
+                 100.0 * mask.mean().item<double>());
   }
   // Novel-view turntable of the canonical (rest-pose) avatar — shows a coherent 3D likeness.
   {

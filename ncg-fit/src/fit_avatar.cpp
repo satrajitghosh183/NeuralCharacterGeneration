@@ -200,7 +200,12 @@ recon::GaussianCloud fit_avatar(const body::SmplxModel& model, const Tensor& bet
       continue;
     }
     loss.backward();
-    torch::nn::utils::clip_grad_norm_(clip_leaves, 1.0);  // tame conic-inverse gradient spikes
+    // Zero any non-finite gradient element FIRST: clip_grad_norm_ uses a global norm, so a single
+    // NaN/inf grad from one degenerate Gaussian would otherwise poison every parameter.
+    for (auto& p : clip_leaves) {
+      if (p.grad().defined()) p.mutable_grad() = torch::nan_to_num(p.grad());
+    }
+    torch::nn::utils::clip_grad_norm_(clip_leaves, 1.0);  // tame remaining gradient spikes
     optimizer.step();
 
     if (rec != nullptr && (it % cfg.log_every == 0 || it == cfg.iterations - 1)) {

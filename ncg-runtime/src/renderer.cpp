@@ -178,8 +178,10 @@ RenderOutput render_soft_aniso(const recon::GaussianCloud& g, const Camera& cam,
     const auto ca = con_a.index({Slice(s, e)}).view({-1, 1, 1});
     const auto cb = con_b.index({Slice(s, e)}).view({-1, 1, 1});
     const auto cc = con_c.index({Slice(s, e)}).view({-1, 1, 1});
-    // Mahalanobis power; clamp to keep exp finite for distant pixels.
-    const auto power = (-0.5 * (ca * dx * dx + 2 * cb * dx * dy + cc * dy * dy)).clamp_min(-30.0);
+    // Mahalanobis power. For a positive-definite conic the quadratic form is ≥0 so power ≤0; clamp
+    // to [-30,0] so float error can't make exp(power) overflow to inf (which yields inf gradients).
+    const auto power =
+        (-0.5 * (ca * dx * dx + 2 * cb * dx * dy + cc * dy * dy)).clamp(-30.0, 0.0);
     const auto w = op.index({Slice(s, e)}).view({-1, 1, 1}) * torch::exp(power);  // [C,H,W]
     wsum = wsum + w.sum(0);
     csum = csum + torch::einsum("chw,ck->khw", {w, g.colors.index({Slice(s, e)})});
