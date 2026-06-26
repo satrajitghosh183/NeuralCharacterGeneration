@@ -1119,6 +1119,7 @@ int cmd_avatar(const ncg::app::Args& args) {
   const auto faces_cpu = model.has_faces() ? model.faces().to(at::kCPU) : torch::Tensor();
   std::vector<torch::Tensor> id_obs, id_nrm, id_w;  // per-frame [V,3],[V,3],[V] for the solver
   std::vector<torch::Tensor> id_img, id_v2d;        // per-frame image + scaled v2d (per-texel solve)
+  std::vector<torch::Tensor> id_betas;              // per-frame SMPL-X shape (robust personalization)
 
   std::vector<ncg::fit::AvatarFrame> frames;
   torch::Tensor betas0;
@@ -1152,6 +1153,7 @@ int cmd_avatar(const ncg::app::Args& args) {
           static_cast<int64_t>(img_full.size(2))));
       id_img.push_back(img);                          // downscaled image for per-texel sampling
       id_v2d.push_back(pred.vertices2d.to(device) * s);  // v2d in the downscaled image's pixels
+      id_betas.push_back(pred.params.betas.to(device));  // per-frame shape estimate
     }
 
     ncg::fit::AvatarFrame fr;
@@ -1211,6 +1213,10 @@ int cmd_avatar(const ncg::app::Args& args) {
       NCG_LOG_INFO("avatar --identity: wrote {}x{} per-texel albedo -> {}_albedo_uv.png", T, T, pfx);
     }
 
+    // Personalize geometry: a robust median of the per-frame SMPL-X shape (drives face/body
+    // proportions) instead of one noisy frame — the consistent frames agree on the person's shape,
+    // outliers are pulled out. (Fine per-vertex face geometry is the deeper follow-on module.)
+    if (id_betas.size() >= 3) betas0 = std::get<0>(torch::stack(id_betas, 0).median(0));
     // Build the rigged avatar: SMPL-X body geometry + the robust identity albedo.
     ncg::body::SmplxParams rp;
     rp.betas = betas0;

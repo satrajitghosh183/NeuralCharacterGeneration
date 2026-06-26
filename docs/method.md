@@ -416,3 +416,11 @@ recovered from data too inconsistent for any averaging method. *That intersectio
 > likeness. Sharpening it is not a photometric fit but a resolution+geometry upgrade: (i) lift the
 > robust albedo from per-vertex to **per-texel (UV)** so the same C1/C2 solver recovers a high-res
 > face texture, and (ii) **personalized face geometry** from the consistent face observations.
+>
+> **Update — per-texel UV albedo implemented (`avatar --identity --uv-texture T`).** The SMPL-X UV
+> layout (`vt`/`ft`) is now exported + loaded; `recon::uv_rasterize` (tested) gives a per-texel
+> barycentric correspondence, and the C1/C2 solver runs in **texel space** (T², e.g. 512² ≫ 10⁴
+> verts). On the incoherent pile it recovers a high-res albedo texture whose face island shows real
+> eye/nose/mouth structure — the resolution per-vertex couldn't hold. Shape is also robustly
+> personalized (median of per-frame betas). **Remaining for full likeness:** textured-glTF export of
+> the UV map, and fine **per-vertex face geometry** (the displacement field) — the last module.
