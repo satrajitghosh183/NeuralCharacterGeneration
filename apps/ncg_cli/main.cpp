@@ -1129,7 +1129,7 @@ int cmd_avatar(const ncg::app::Args& args) {
     // Gauge-fix the albedo (identifiable up to a per-channel scale): match its mean to the robust
     // mean observed color so it displays at a sensible brightness.
     auto albedo = ir.albedo.clamp_min(0.0F);
-    const auto obs_mean = torch::stack(id_obs, 0).mean({0, 1}).clamp_min(1e-3F);   // [3]
+    const auto obs_mean = torch::stack(id_obs, 0).mean(0).mean(0).clamp_min(1e-3F);  // [3]
     const auto alb_mean = albedo.mean(0).clamp_min(1e-3F);                          // [3]
     albedo = (albedo * (obs_mean / alb_mean).view({1, 3})).clamp(0.0F, 1.0F);
     NCG_LOG_INFO("avatar --identity: recovered canonical albedo from {} frames (mean consistency {:.2f})",
