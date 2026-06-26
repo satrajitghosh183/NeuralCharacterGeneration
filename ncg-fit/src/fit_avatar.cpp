@@ -205,7 +205,27 @@ AvatarFitResult fit_avatar(const body::SmplxModel& model, const Tensor& betas_in
       pred = pred * masks[f];
       tgt = tgt * masks[f];
     }
-    const auto l1 = torch::l1_loss(pred, tgt);
+    Tensor l1;
+    if (cfg.robust) {
+      // Auto-scaled Welsch (IRLS): per-pixel weight exp(-½(r/c)²), c = k·median residual over the
+      // body region. Down-weights pixels the canonical can't reconcile (conflicting outfits, bad
+      // cameras, junk) so the consensus appearance wins instead of a blurred average.
+      const auto diff = pred - tgt;                          // [3,H,W]
+      const auto a = diff.abs().mean(0, /*keepdim=*/true);    // [1,H,W] per-pixel residual
+      Tensor med;
+      if (cfg.use_mask) {
+        const auto sel = a.masked_select(masks[f] > 0.5);
+        med = sel.numel() > 0 ? sel.median() : a.median();
+      } else {
+        med = a.median();
+      }
+      const auto c = (cfg.robust_k * med).clamp_min(1e-3).detach();
+      auto w = torch::exp(-0.5 * (a / c).pow(2)).detach();   // [1,H,W]
+      if (cfg.use_mask) w = w * masks[f];
+      l1 = (w * diff.abs()).sum() / (w.sum() * 3.0 + 1e-6);  // weighted mean over body pixels
+    } else {
+      l1 = torch::l1_loss(pred, tgt);
+    }
     const auto loss = (1.0 - cfg.lambda_dssim) * l1 + cfg.lambda_dssim * (1.0 - ssim(pred, tgt));
     // Skip a non-finite step rather than poison Adam's moments with NaN.
     if (!std::isfinite(loss.item<double>())) {

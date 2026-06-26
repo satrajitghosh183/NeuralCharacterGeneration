@@ -1097,6 +1097,8 @@ int cmd_avatar(const ncg::app::Args& args) {
   cfg.init_scale = args.get_float("scale", 0.015F);
   cfg.lambda_dssim = args.get_float("dssim", 0.2F);
   cfg.per_view_exposure = args.get_int("exposure", 1) != 0;
+  cfg.robust = args.get_int("robust", 1) != 0;  // C2 robust consistency on by default (mixed data)
+  cfg.robust_k = args.get_float("robust_k", 3.0F);
   cfg.log_every = 50;
   cfg.dump_every = args.get_int("dump-every", 500);
   cfg.densify = args.get_int("densify", 0) != 0;

@@ -32,6 +32,13 @@ struct AvatarFitConfig {
   bool use_mask = true;             // supervise inside each frame's posed body silhouette
   bool per_view_exposure = true;    // casual frames vary in exposure / white balance
 
+  // C2-style robust consistency: down-weight pixels/frames whose appearance disagrees with the
+  // converging canonical (different outfits, junk frames, bad cameras), so the consensus look of the
+  // person wins instead of a blurry average. Auto-scaled Welsch weight (IRLS) per iteration. This is
+  // what lets "upload whatever casual data exists and run" actually work on heterogeneous sources.
+  bool robust = false;
+  double robust_k = 3.0;            // Welsch scale = robust_k · median(residual), recomputed per step
+
   // Adaptive density control (off by default). Densified Gaussians inherit their parent's vertex
   // binding, so they still skin. Requires lr_position > 0 to produce a position-gradient signal.
   bool densify = false;
