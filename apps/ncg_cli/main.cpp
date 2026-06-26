@@ -9,6 +9,7 @@
 #include <ncg/body/smplx.hpp>
 #include <ncg/core/device.hpp>
 #include <ncg/core/logging.hpp>
+#include <ncg/fit/fit_avatar.hpp>
 #include <ncg/fit/fit_image.hpp>
 #include <ncg/io/image.hpp>
 #include <ncg/io/npy.hpp>
@@ -18,6 +19,7 @@
 #include <ncg/recon/init_from_body.hpp>
 #include <ncg/recon/inverse_render.hpp>
 #include <ncg/recon/motion_style.hpp>
+#include <ncg/record/metrics.hpp>
 #include <ncg/record/recorder.hpp>
 #include <ncg/rig/rig.hpp>
 #include <ncg/runtime/camera.hpp>
@@ -26,10 +28,12 @@
 
 #include <torch/torch.h>
 
+#include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <exception>
+#include <filesystem>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -1003,6 +1007,134 @@ int cmd_style(const ncg::app::Args& args) {
   return 0;
 }
 
+// Trains an animatable Gaussian avatar from a directory of video frames of one person. Each frame
+// is run through NLF to get its SMPL-X pose + a solved camera; fit_avatar then optimizes a single
+// canonical cloud (anisotropic splats, per-frame exposure, D-SSIM) so it reproduces every posed
+// frame. Multi-pose casual video thus becomes multi-view evidence for one avatar — the path from a
+// projected-color mannequin to a real likeness. Renders fit-check + novel-view turntable frames.
+//   ncg_cli avatar --frames dir/ --weights nlf.torchscript --smplx model.safetensors \
+//                  [--max-frames 60 --res 288 --iters 3000 --out-prefix rock_avatar]
+int cmd_avatar(const ncg::app::Args& args) {
+  const auto device = ncg::cuda_available() ? at::Device(at::kCUDA, 0) : at::Device(at::kCPU);
+  auto rec = ncg::record::Recorder::create("runs", args.get("run", "avatar"));
+
+  // Enumerate frame images (sorted), then evenly subsample to --max-frames.
+  namespace fs = std::filesystem;
+  std::vector<std::string> all;
+  for (const auto& e : fs::directory_iterator(args.require("frames"))) {
+    const auto p = e.path().string();
+    const auto ext = e.path().extension().string();
+    if (ext == ".jpg" || ext == ".jpeg" || ext == ".png" || ext == ".JPG") all.push_back(p);
+  }
+  std::sort(all.begin(), all.end());
+  NCG_CHECK(!all.empty(), "avatar: no images in --frames dir");
+  const int max_frames = args.get_int("max-frames", 60);
+  std::vector<std::string> paths;
+  if (static_cast<int>(all.size()) <= max_frames) {
+    paths = all;
+  } else {
+    const double step = static_cast<double>(all.size()) / max_frames;
+    for (int i = 0; i < max_frames; ++i) paths.push_back(all[static_cast<size_t>(i * step)]);
+  }
+  NCG_LOG_INFO("avatar: {} frames selected from {} in {}", paths.size(), all.size(),
+               args.require("frames"));
+
+  ncg::body::NlfConfig nc;
+  nc.detection = args.get_int("detection", 0);
+  auto nlf = ncg::body::Nlf::load(args.require("weights"), device, nc);
+  const auto model = ncg::body::SmplxModel::load(args.require("smplx"), device);
+
+  const int res = args.get_int("res", 288);
+  namespace F = torch::nn::functional;
+  auto downscale = [&](const torch::Tensor& img) {
+    const double s = std::min(1.0, static_cast<double>(res) /
+                                       static_cast<double>(std::max(img.size(1), img.size(2))));
+    auto small = F::interpolate(img.unsqueeze(0), F::InterpolateFuncOptions()
+                                                      .scale_factor(std::vector<double>{s, s})
+                                                      .mode(torch::kBilinear)
+                                                      .align_corners(false))
+                     .squeeze(0);
+    return std::make_pair(small, s);
+  };
+
+  std::vector<ncg::fit::AvatarFrame> frames;
+  torch::Tensor betas0;
+  torch::Tensor init_colors;
+  for (size_t i = 0; i < paths.size(); ++i) {
+    const auto img_full = ncg::io::load_image(paths[i]).to(device);
+    auto [img, s] = downscale(img_full);
+    ncg::body::NlfPrediction pred;
+    try {
+      pred = nlf.detect(img_full);
+    } catch (const std::exception& e) {
+      NCG_LOG_WARN("avatar: NLF failed on {} ({}), skipping", paths[i], e.what());
+      continue;
+    }
+    if (!betas0.defined()) betas0 = pred.params.betas.to(device);
+
+    ncg::fit::AvatarFrame fr;
+    fr.pose_aa = pred.params.pose_aa.squeeze(0).to(device);  // [J,3] camera-frame orientation kept
+    fr.transl = pred.params.transl.squeeze(0).to(device);
+    fr.target = img;
+    const int w = static_cast<int>(img.size(2));
+    const int h = static_cast<int>(img.size(1));
+    fr.camera = ncg::runtime::solve_pinhole_camera(pred.vertices3d.to(device),
+                                                   pred.vertices2d.to(device) * s, w, h);
+    frames.push_back(std::move(fr));
+
+    if (!init_colors.defined()) {  // seed appearance from the first good frame
+      const auto v2d = pred.vertices2d.to(device) * s;
+      auto cols = ncg::recon::sample_vertex_colors(img, v2d).clamp(0.0, 1.0);
+      const auto vis = ncg::recon::vertex_visibility(v2d, pred.vertices3d.select(1, 2).to(device), h, w);
+      init_colors = torch::where(vis.unsqueeze(1) > 0, cols, torch::full_like(cols, 0.6F));
+    }
+  }
+  NCG_CHECK(frames.size() >= 2, "avatar: need >=2 usable frames");
+  NCG_LOG_INFO("avatar: training on {} frames at {}px", frames.size(), res);
+
+  ncg::fit::AvatarFitConfig cfg;
+  cfg.iterations = args.get_int("iters", 3000);
+  cfg.init_scale = args.get_float("scale", 0.015F);
+  cfg.lambda_dssim = args.get_float("dssim", 0.2F);
+  cfg.per_view_exposure = args.get_int("exposure", 1) != 0;
+  cfg.log_every = 50;
+  cfg.dump_every = args.get_int("dump-every", 500);
+  const auto canonical = ncg::fit::fit_avatar(model, betas0, frames, init_colors, cfg, &rec);
+
+  // Fit-check: render the avatar at frame 0's pose/camera next to the target.
+  const auto prefix = args.get("out-prefix", "avatar");
+  {
+    ncg::body::SmplxParams p0;
+    p0.betas = betas0;
+    p0.pose_aa = frames[0].pose_aa.unsqueeze(0);
+    p0.transl = frames[0].transl.unsqueeze(0);
+    const auto vt0 = model.forward(p0).vertex_transforms.squeeze(0);
+    const auto posed = ncg::fit::deform_avatar(canonical, vt0);
+    const auto fit = ncg::runtime::render_soft_aniso(posed, frames[0].camera).image;
+    ncg::io::save_png(prefix + "_fit0.png", fit.detach());
+    ncg::io::save_png(prefix + "_tgt0.png", frames[0].target.detach());
+    NCG_LOG_INFO("avatar: fit0 PSNR vs target = {:.2f} dB",
+                 ncg::record::psnr(fit.detach(), frames[0].target));
+  }
+  // Novel-view turntable of the canonical (rest-pose) avatar — shows a coherent 3D likeness.
+  {
+    const int nv = args.get_int("turn", 8);
+    const auto cams = ncg::runtime::orbit_trajectory(canonical.positions.mean(0),
+                                                     args.get_float("radius", 2.4F), 0.0F, nv,
+                                                     50.0F, res, res, device);
+    for (int i = 0; i < nv; ++i) {
+      const auto im = ncg::runtime::render_soft_aniso(canonical, cams[i]).image.detach();
+      char name[64];
+      std::snprintf(name, sizeof(name), "%s_turn%02d.png", prefix.c_str(), i);
+      ncg::io::save_png(name, im);
+    }
+    NCG_LOG_INFO("avatar: wrote {} turntable views -> {}_turn*.png", nv, prefix);
+  }
+  NCG_LOG_INFO("avatar: done -> {}_fit0.png / {}_turn*.png ({} gaussians)", prefix, prefix,
+               canonical.size());
+  return 0;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -1011,7 +1143,7 @@ int main(int argc, char** argv) {
     std::fprintf(stderr,
                  "usage: ncg_cli "
                  "<pipeline|render|turntable|select|fitimg|fit|fuse|relight|export|benchmark|"
-                 "runtime|nerf|style> [--flags]\n");
+                 "runtime|nerf|style|avatar> [--flags]\n");
     return 2;
   }
   const std::string cmd = argv[1];
@@ -1030,6 +1162,7 @@ int main(int argc, char** argv) {
     if (cmd == "delight") return cmd_delight(args);
     if (cmd == "runtime") return cmd_runtime(args);
     if (cmd == "style") return cmd_style(args);
+    if (cmd == "avatar") return cmd_avatar(args);
     if (cmd == "nerf") return cmd_nerf(args);
     std::fprintf(stderr, "unknown command '%s'\n", cmd.c_str());
     return 2;
