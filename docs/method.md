@@ -341,3 +341,66 @@ personalized avatar. That intersection is new.
 > manifold. Under **30% cut/outlier frames**, robust = **0.004 vs naive 0.735** — robust recovery
 > is essentially exact where naive pooling collapses. (Synthetic ground-truth factors; real-video
 > + a generative real-time controller are the next steps.)
+
+## 14. C5 — identity from incoherent observation (the hardest case, the win condition)
+
+**Problem.** Given `N` casual images of one person that disagree in *many* nuisances at once —
+lighting, pose, camera, **outfit, occlusion, even which person is framed** — recover a single
+coherent, relightable identity. Standard multi-view/inverse rendering assumes a *consistent*
+appearance; standard robust estimators assume a *dominant inlier mode*. Casual web data of one
+person has **neither** — so naive averaging blurs and majority-vote robustness has no majority.
+
+**Generative model (per-vertex, Lambertian under per-image SH light — the C1 model).** NLF gives,
+for image `f`, a pose and camera, hence for each visible vertex `v` an observed color
+`O_{f,v} ∈ ℝ³`, a posed world normal `n_{f,v}`, and a validity weight `π_{f,v} ∈ [0,1]`:
+
+```
+O_{f,v}  ≈  a_v ⊙ ( L_f · b(n_{f,v}) )                                   (1)
+```
+
+`a_v` = per-vertex albedo (the identity — **shared across all `f`**); `L_f ∈ ℝ^{3×9}` = image `f`'s
+order-2 SH illumination (per channel, **unknown, per-image**); `b(n) ∈ ℝ⁹` = SH basis with the
+Lambertian half-cosine convolution folded in; `⊙` = per-channel product.
+
+**Estimator (block-coordinate, each block closed-form + CUDA-parallel; robust E-step).**
+Minimize `Σ_{f,v} w_{f,v} ‖O_{f,v} − a_v ⊙ (L_f·b(n_{f,v}))‖²` with `w_{f,v}=π_{f,v}·ν_{f,v}`:
+- **L-step** (per image): given `a`, solve the 9-per-channel SH normal equations (ridge `λ_L`).
+- **A-step** (per vertex): given `{L_f}`, solve `a_v` in closed form (ridge `λ_a`).
+- **E-step** (consistency, C2): `ν_{f,v} = exp(−‖r_{f,v}‖² / 2σ²)`, residual
+  `r_{f,v}=O_{f,v} − a_v⊙(L_f·b(n_{f,v}))`, scale auto-set `σ = 1.4826·MAD(r)` (half-quadratic /
+  Welsch IRLS). Iterate L→A→E. `a` is identifiable up to a per-channel gauge (global scale), fixed
+  by matching `mean(a)` to the robust mean observed color.
+
+**Why identity *is* recoverable from incoherent data (the crux).** The exposed identity surface —
+**face, skin, hair** — is observed *consistently* across every image (same albedo, only the light
+changes), so under (1) its residuals are small and `ν→1`: it forms the inlier set and pins `a`
+there. Clothing changes per image, so its residuals are large and `ν→0`: it is *excluded* from `a`
+rather than averaged into a blur. The recovered `a` is therefore the **identity albedo**, relightable
+by `shade_sh(a, L, n)` under any chosen `L`, and kept correct when posed by normal transport (§8/C3).
+Naming is deliberate: we recover **who they are**, not an outfit the data never agreed on — inventing
+a non-existent consensus outfit would be hallucination, not reconstruction.
+
+**The novelty — from *reject* to *decompose*.** Stack `O ∈ ℝ^{N×V×3}`. The shaded-identity term
+`S_{f,v}=a_v⊙(L_f·b(n_{f,v}))` is *low-rank in appearance* (one shared `a`; a 9-D light per image);
+the per-image nuisance `G_{f,v}=O−S` (garment/occlusion) is what each image adds. C2 (implemented)
+treats `G` as outliers to **reject** (`ν→0`). The **proposed extension** treats `G` as a *structured
+per-image residual* (sparse, or low-rank per garment) to **model and subtract** — recovering more
+identity (e.g. skin under partial occlusion) and optionally a per-image garment field. This is a
+**robust low-rank-identity + sparse-nuisance factorization under a per-image illumination operator**:
+the precise, novel estimator for truly incoherent capture. It strictly generalizes both classical
+multi-illumination photometric stereo (which assumes one light or one shot) and robust PCA (which has
+no physical illumination/shading operator and no shared-albedo manifold constraint).
+
+**Unification (the thesis closes).** The identical structure is C4 on the motion manifold (§13): a
+shared low-rank **style** `W` (identity) explains many actions (each exercising a subspace) with
+per-action **content** (nuisance), recovered by robust ALS. Appearance (C1/C2/C5) and motion (C4) are
+the **same invariant-vs-nuisance factorization on two manifolds** — one principle, one avatar,
+recovered from data too inconsistent for any averaging method. *That intersection is the contribution.*
+
+> **Status.** Implemented + green: `solve_inverse_render` (L/A/E, auto-scaled Welsch,
+> `tests/recon/test_inverse_render.cpp`) now drives the photoreal Gaussian avatar via
+> `ncg_cli avatar --identity`. On a deliberately incoherent pile (≈150 mixed web frames of one
+> subject: different films/outfits/lighting, montage cuts, occasional wrong person), the naive fit
+> collapses to a spiky blur, while the identity solver — **rejecting ≈70% of observations as
+> inconsistent (mean consistency ≈0.3)** — recovers a clean, complete, 360° relightable body. The
+> garment-residual decomposition is the proposed next step.
