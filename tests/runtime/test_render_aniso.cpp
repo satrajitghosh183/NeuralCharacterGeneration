@@ -61,7 +61,7 @@ TEST_CASE("aniso splat: gradients flow to the rotation quaternion", "[runtime][a
   auto g = one_gaussian(kOpts, torch::tensor({{0.30F, 0.06F, 0.06F}}, kOpts), quat);
   const auto out = ncg::runtime::render_soft_aniso(g, front_cam(), {0.0F, 0.0F, 0.0F});
   // Asymmetric target so rotating the elongated splat changes the loss.
-  const auto target = torch::zeros_like(out.image);
+  auto target = torch::zeros_like(out.image);
   target.index_put_({torch::indexing::Slice(), torch::indexing::Slice(20, 44), 50}, 1.0F);
   const auto loss = torch::mse_loss(out.image, target);
   loss.backward();
