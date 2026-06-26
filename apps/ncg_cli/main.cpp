@@ -1078,6 +1078,9 @@ int cmd_avatar(const ncg::app::Args& args) {
       NCG_LOG_WARN("avatar: NLF failed on {} ({}), skipping", paths[i], e.what());
       continue;
     }
+    // In identity mode keep only full-vertex detections so the frame list stays aligned 1:1 with the
+    // solver's observations (needed to gate refinement by per-frame consistency).
+    if (identity && pred.vertices2d.size(0) != model.num_verts()) continue;
     if (!betas0.defined()) betas0 = pred.params.betas.to(device);
 
     // Identity mode: collect full-res per-vertex observation, posed normal and visibility for the
@@ -1153,6 +1156,31 @@ int cmd_avatar(const ncg::app::Args& args) {
     canonical.to_(device);
     canonical.opacities = (0.2F + 0.8F * conf.to(device)).clamp(0.0F, 1.0F);  // fade uncertain verts
     binding = torch::arange(model.num_verts(), at::TensorOptions().dtype(at::kLong).device(device));
+
+    // Consistency-gated photometric refinement: the solver tells us which frames are trustworthy;
+    // run the photoreal anisotropic fit (+ densification) on just that coherent subset, starting
+    // from the clean identity albedo, to sharpen the face/detail without re-muddying on outliers.
+    if (args.get_int("refine", 0) != 0) {
+      const auto fscore = ir.consistency.mean(1);  // [N] per-frame mean consistency
+      const double thr = fscore.median().item<double>();
+      std::vector<ncg::fit::AvatarFrame> coherent;
+      for (size_t k = 0; k < frames.size() && k < static_cast<size_t>(fscore.size(0)); ++k)
+        if (fscore[static_cast<int64_t>(k)].item<double>() >= thr) coherent.push_back(frames[k]);
+      NCG_LOG_INFO("avatar --identity --refine: photometric refine on {}/{} coherent frames",
+                   coherent.size(), frames.size());
+      if (coherent.size() >= 2) {
+        ncg::fit::AvatarFitConfig rc;
+        rc.iterations = args.get_int("refine_iters", 2500);
+        rc.init_scale = args.get_float("scale", 0.012F);
+        rc.per_view_exposure = true;
+        rc.robust = true;
+        rc.densify = args.get_int("densify", 1) != 0;
+        rc.log_every = 100;
+        auto rr = ncg::fit::fit_avatar(model, betas0, coherent, albedo, rc, &rec);
+        canonical = rr.canonical;
+        binding = rr.binding;
+      }
+    }
   } else {
     ncg::fit::AvatarFitConfig cfg;
     cfg.iterations = args.get_int("iters", 3000);
