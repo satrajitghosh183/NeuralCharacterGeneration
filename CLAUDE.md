@@ -21,6 +21,8 @@ ncg-material/  analytical relight (real) + intrinsic decomposition (IDArb gated 
 ncg-rig/       rig inheritance + OBJ/JSON export (real); UniRig + FBX/glTF gated
 ncg-mesh/      marching-cubes mesh extraction + OBJ/PLY export      (PBR bake → P4)
 ncg-runtime/   renderer: forward-splat CUDA kernel + differentiable soft renderer (Phase 1 → P2)
+ncg-geom/      out-of-subspace Δv geometry solver + observability field o(v) + cotangent Laplacian  (Phase B)
+ncg-diffuse/   SDS-as-loss completion: DDPM schedule + sds_loss + observability-gated completion_gate (C¹, exact-zero on Ω_obs) + SdGuidance (TorchScript SD UNet/VAE)  (Phase E)
 ncg-fit/       Gaussian optimization loop (fit cloud to image via autograd + Adam)  (Phase 2)
 ncg-nerf/      TinyNerf implicit volume + differentiable volume render + hybrid composite_over (NeRF leg)
 ncg-record/    experiment recording (run dirs, metrics.jsonl, image dumps, timers) + PSNR/SSIM/MAE
