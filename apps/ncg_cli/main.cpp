@@ -1613,6 +1613,10 @@ int cmd_face(const ncg::app::Args& args) {
                                                      W, ic);
     const auto albedo = torch::nan_to_num(ir.albedo).clamp(0.0, 1.0);          // [V,3] relightable
     NCG_LOG_INFO("face: recovered relightable skin albedo from {} view(s)", Nt);
+    // Export albedo + geometry so the face can be rendered as a sharp textured MESH (no splat blur).
+    ncg::io::save_npy(prefix + "_albedo.npy", albedo.to(at::kCPU).contiguous());
+    ncg::io::save_npy(prefix + "_verts.npy", id_verts.contiguous());
+    ncg::io::save_npy(prefix + "_faces.npy", faces.to(at::kInt).contiguous());
 
     // Personalized identity mesh (rest pose) + its normals, framed on the head for a portrait.
     const auto verts = id_verts.to(device);                                    // [V,3]
