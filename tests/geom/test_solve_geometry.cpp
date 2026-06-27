@@ -59,14 +59,15 @@ TEST_CASE("solve_geometry: off-subspace Δv recovered where observed, pinned whe
       B.select(2, k).select(1, 2).copy_(torch::sin((k + 1) * f0 * gx) * torch::cos((k + 1) * f0 * gy));
     return B;
   };
-  const int64_t nid = 4, nex = 2;
-  const auto id_basis = basis(nid, 3.0), expr_basis = basis(nex, 5.0);
+  const int64_t nid = 2, nex = 2;  // few smooth modes ⇒ β cannot absorb a sharp local bump
+  const auto id_basis = basis(nid, 2.0), expr_basis = basis(nex, 5.0);
   const auto beta_gt = torch::randn({nid}) * 0.1;
 
-  // Δv_gt: an OFF-subspace Gaussian bump in z (not representable by the sin/cos basis).
-  const auto bump = torch::exp(-((gx - 0.35).pow(2) + (gy - 0.5).pow(2)) / 0.03);
+  // Δv_gt: a SHARP, localized OFF-subspace bump in z — neither the smooth id modes nor a global
+  // affine camera can absorb it (its multi-view parallax forces it into Δv where observed).
+  const auto bump = torch::exp(-((gx - 0.30).pow(2) + (gy - 0.5).pow(2)) / 0.008);
   auto dv_gt = torch::zeros({V, 3});
-  dv_gt.select(1, 2).copy_(bump * 0.15);
+  dv_gt.select(1, 2).copy_(bump * 0.25);
 
   // Dense points: K samples on left-half faces (x<0.5) ⇒ the right half is unobserved.
   std::vector<int64_t> sel;
@@ -101,11 +102,11 @@ TEST_CASE("solve_geometry: off-subspace Δv recovered where observed, pinned whe
   }
 
   ncg::geom::GeomConfig cfg;
-  cfg.iterations = 20;
-  cfg.lap_weight = 20.0F;
-  cfg.mag_weight = 2.0F;
-  cfg.cg_iters = 120;
-  cfg.o_solve = 0.6F;  // gate between unobserved (~0.35) and observed (~0.99)
+  cfg.iterations = 30;
+  cfg.lap_weight = 3.0F;   // light smoothness — let the localized bump through
+  cfg.mag_weight = 0.1F;   // do not over-penalize Δv (else β+camera absorb the bump, Δv→0)
+  cfg.cg_iters = 150;
+  cfg.o_solve = 0.6F;  // gate between unobserved (~0.23) and observed (~0.99)
   const auto R = ncg::geom::solve_geometry(base, id_basis, expr_basis, faces, L, assoc, bary, lm,
                                            torch::ones({N, K}), torch::ones({N}), cfg);
 
