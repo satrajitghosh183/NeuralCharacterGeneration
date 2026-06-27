@@ -46,15 +46,20 @@ SubjectGate subject_gate(const Tensor& embeddings_in, const SubjectGateConfig& c
   const auto is_sub = cos >= cfg.keep_cos;                     // [P] bool
   const auto dist = (1.0 - cos);                               // cosine distance
 
-  // Robust scale from the subject distances (MAD), then a Welsch trust prior (0 for non-subject).
-  double mad = 0;
+  // Robust trust: Welsch on the deviation of each face's distance from the TYPICAL subject distance
+  // (median), one-sided — only a face FARTHER than typical is suspect; a tightly-clustered subject
+  // face sits at the baseline distance ⇒ deviation≈0 ⇒ trust≈1. (Penalizing the raw distance would
+  // wrongly zero out every subject face, since on the unit sphere the baseline distance dwarfs the
+  // cluster spread.)  Non-subject faces get exactly 0.
+  double mad = 0, med_d = 0;
   const auto sub_d = dist.index({is_sub});
   if (sub_d.numel() > 0) {
-    const auto med = sub_d.median();
-    mad = 1.4826 * (sub_d - med).abs().median().item<double>();
+    med_d = sub_d.median().item<double>();
+    mad = 1.4826 * (sub_d - med_d).abs().median().item<double>();
   }
   const double c = cfg.robust_k * std::max(mad, 1e-6);
-  const auto w = torch::exp(-0.5 * (dist / c).pow(2)) * is_sub.to(at::kFloat);
+  const auto dev = (dist - med_d).clamp_min(0.0);  // farther-than-typical ⇒ down-weight
+  const auto w = torch::exp(-0.5 * (dev / c).pow(2)) * is_sub.to(at::kFloat);
 
   out.is_subject = is_sub;
   out.w_prior = w;
