@@ -1066,7 +1066,15 @@ torch::Tensor recover_uv_albedo(const ncg::body::SmplxModel& model,
     const auto u = texel_uv.select(1, 0);
     const auto vc = texel_uv.select(1, 1);
     const auto inb = ((u >= 0) & (u <= W - 1) & (vc >= 0) & (vc <= H - 1)).to(at::kFloat);
-    w_l.push_back(tw * inb);                                       // [T^2]
+    // Specular down-weight: a Lambertian albedo solve must not trust blown, DESATURATED highlights
+    // (they are view-dependent reflection, not albedo — the source of the baked-in bright blotches).
+    // Specular ≈ bright (high luminance) AND low saturation (R≈G≈B). Soft-gate both, drop those obs.
+    const auto of = obs_l.back();                                  // [T^2,3] this frame's samples
+    const auto lum = of.mean(1);                                  // [T^2]
+    const auto mx = std::get<0>(of.max(1)).clamp_min(1e-3F);
+    const auto sat = (mx - std::get<0>(of.min(1))) / mx;          // [T^2]
+    const auto spec = torch::sigmoid((lum - 0.78F) * 14.0F) * torch::sigmoid((0.22F - sat) * 14.0F);
+    w_l.push_back(tw * inb * (1.0F - 0.92F * spec));              // [T^2]
   }
   ncg::recon::InverseRenderConfig ic;
   ic.iterations = 60;
@@ -1656,6 +1664,36 @@ int cmd_face(const ncg::app::Args& args) {
       ncg::io::save_npy(prefix + "_uvfaces.npy", model.uv_faces().to(at::kInt).contiguous());
       NCG_LOG_INFO("face: wrote {}x{} per-texel UV albedo + normal map -> {}_albedo_uv.png", T, T,
                    prefix);
+
+      // ---- hair shell: give the dark scalp VOLUME (the bald scalp is the at-a-glance tell) -------
+      // Segment hair from skin using the recovered albedo (hair = dark, on the upper head), then
+      // offset those vertices outward along the normal. The skin↔hair boundary (no offset → offset)
+      // forms a hairline ridge; the texture there is already the photo-sampled hair color. v1: a
+      // volume shell, not strands — but it reads as hair instead of a skull.
+      const auto vn_dev = ncg::mesh::compute_vertex_normals(ncg::mesh::TriMesh{id_verts, faces})
+                              .to(device);                                        // [V,3]
+      const auto yv2 = id_verts.select(1, 1).to(device);                         // [V]
+      const auto hthr2 = torch::quantile(id_verts.select(1, 1), 0.80).item<float>();
+      const auto head_w = torch::sigmoid((yv2 - hthr2) * 40.0F);                 // soft upper-head
+      const auto dark = torch::sigmoid((0.30F - albedo.mean(1)) * 16.0F);        // dark = hair-like
+      const auto hair_w = (head_w * dark).unsqueeze(1);                          // [V,1] in [0,1]
+      const float thick = args.get_float("hair-thick", 0.03F);                   // ~3 cm shell
+      const auto verts_hair = verts_dev + vn_dev * hair_w * thick;               // [V,3]
+      ncg::io::save_npy(prefix + "_verts_hair.npy", verts_hair.to(at::kCPU).contiguous());
+
+      // ---- engine-ready textured + rigged glTF (the deployable asset) ----------------------------
+      ncg::body::SmplxParams zp;  // rest-pose joints for the rig (template body matches id_verts)
+      zp.betas = torch::zeros({1, model.num_betas()}, verts_dev.options());
+      zp.pose_aa = torch::zeros({1, model.num_joints(), 3}, verts_dev.options());
+      zp.transl = torch::zeros({1, 3}, verts_dev.options());
+      const auto joints = model.forward(zp).joints.squeeze(0);                   // [J,3]
+      const auto hair_cpu = verts_hair.to(at::kCPU);
+      const auto hnrm = ncg::mesh::compute_vertex_normals(ncg::mesh::TriMesh{hair_cpu, faces});
+      ncg::mesh::write_glb_textured(hair_cpu, faces, hnrm, model.uv_coords(), model.uv_faces(),
+                                    joints, model.parents(), model.lbs_weights(),
+                                    prefix + "_albedo_uv.png", prefix + "_face.glb",
+                                    prefix + "_normal_uv.png");
+      NCG_LOG_INFO("face: wrote rigged + textured engine asset -> {}_face.glb", prefix);
     }
 
     // Personalized identity mesh (rest pose) + its normals, framed on the head for a portrait.
