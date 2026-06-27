@@ -1646,7 +1646,7 @@ int cmd_geom(const ncg::app::Args& args) {
       } catch (const std::exception&) { /* NLF may miss a body; skip */ }
     }
     if (!betas.empty()) {
-      const auto bavg = torch::stack(betas, 0).median(0).values().to(at::kFloat);  // robust avg
+      const auto bavg = std::get<0>(torch::stack(betas, 0).median(0)).to(at::kFloat);  // robust avg
       const int64_t nid = id_dirs.size(2), m = std::min<int64_t>(bavg.size(0), nid);
       beta_fixed = torch::zeros({nid}, at::kFloat);
       beta_fixed.slice(0, 0, m).copy_(bavg.slice(0, 0, m));
