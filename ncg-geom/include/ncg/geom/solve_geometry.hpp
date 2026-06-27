@@ -31,6 +31,8 @@ struct GeomConfig {
   bool robust = true;         // C2 per-photo Welsch reweight
   float robust_k = 3.0F;
   float o_solve = 0.25F;      // HARD gate: Δv pinned to 0 where observability o(v) < o_solve
+  float max_dv = 1.0F;        // hard clamp on per-vertex |Δv| (physical bound; set to a few cm on
+                              // real SMPL-X to reject blow-ups from noisy correspondences)
 };
 
 /// Recovered geometry. `delta_v` is the displacement that personalizes the face beyond SMPL-X's

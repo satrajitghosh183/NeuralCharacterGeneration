@@ -216,6 +216,10 @@ GeomResult solve_geometry(const Tensor& base_in, const Tensor& idb_in, const Ten
   // densely-covered near-frontal face still counts — diversity is a bonus, not a gate).
   const auto o = torch::sigmoid(6.0 * (torch::tanh(cover) * (0.4 + 0.6 * diversity) - 0.25));  // [V]
   dv = dv * (o > cfg.o_solve).to(fopt).unsqueeze(1);              // HARD gate
+  {  // physical magnitude clamp — reject blow-ups from noisy/approximate correspondences
+    const auto n = dv.norm(2, 1, true).clamp_min(1e-9);
+    dv = dv * (n.clamp_max(cfg.max_dv) / n);
+  }
 
   GeomResult R;
   R.beta = beta;
