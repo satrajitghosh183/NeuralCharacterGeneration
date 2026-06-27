@@ -40,15 +40,14 @@ class MeshW(nn.Module):
 
 
 class EmbW(nn.Module):
-    """Identity embedder: [1,3,112,112] in [0,1] -> emb[512] (L2). Resizes to 160 for facenet."""
+    """ArcFace identity embedder: ALIGNED [1,3,112,112] in [0,1] -> emb[512] (L2). ArcFace is 112²
+    native (no resize); expects (x-0.5)/0.5 normalization."""
     def __init__(self, net):
         super().__init__()
         self.net = net
 
     def forward(self, x):
-        x = F.interpolate(x, size=(160, 160), mode="bilinear", align_corners=False)
-        x = (x * 255.0 - 127.5) / 128.0
-        e = self.net(x).reshape(-1)
+        e = self.net(x * 2 - 1).reshape(-1)
         return e / e.norm().clamp_min(1e-9)
 
 
@@ -117,8 +116,15 @@ def main():
     torch.jit.trace(MeshW(fm), torch.rand(1, 3, 192, 192), check_trace=False).save(
         os.path.join(args.out, "facemesh.torchscript")); print("facemesh OK")
 
-    from facenet_pytorch import InceptionResnetV1
-    emb = InceptionResnetV1(pretrained="vggface2").eval()
+    # ArcFace IR-SE50 (facexlib weights) — far more discriminative than facenet/vggface2 on casual
+    # crops. Loaded by direct file import to bypass facexlib's cv2-dependent package __init__.
+    import importlib.util
+    _spec = importlib.util.spec_from_file_location(
+        "arcface_arch", os.path.join(args.face_src, "facexlib/facexlib/recognition/arcface_arch.py"))
+    _arc = importlib.util.module_from_spec(_spec); _spec.loader.exec_module(_arc)
+    emb = _arc.Backbone(num_layers=50, drop_ratio=0.6, mode="ir_se")
+    emb.load_state_dict(torch.load(os.path.join(args.face_src, "arcface_ir_se50.pth"), map_location="cpu"))
+    emb.eval()
     torch.jit.trace(EmbW(emb), torch.rand(1, 3, 112, 112), check_trace=False).save(
         os.path.join(args.out, "arcface.torchscript")); print("arcface OK")
 
