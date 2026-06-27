@@ -1529,9 +1529,25 @@ int cmd_face(const ncg::app::Args& args) {
   auto nlf = ncg::body::Nlf::load(args.require("weights"), device, nc);
 
   const bool texture = args.get_int("texture", 1) != 0 && ncg::cuda_available();
+  // SmplxModel gives the UV layout for the high-res per-texel solve (recover_uv_albedo).
+  const auto model = texture ? ncg::body::SmplxModel::load(args.require("smplx"), device)
+                             : ncg::body::SmplxModel::load(args.require("smplx"), at::kCPU);
+  namespace Fn = torch::nn::functional;
+  const int samp_res = args.get_int("sample-res", 1024);
+  auto downscale = [&](const torch::Tensor& img) {  // -> (scaled CHW, scale factor) for per-texel
+    const double s = std::min(1.0, static_cast<double>(samp_res) /
+                                       static_cast<double>(std::max(img.size(1), img.size(2))));
+    auto sm = Fn::interpolate(img.unsqueeze(0), Fn::InterpolateFuncOptions()
+                                                    .scale_factor(std::vector<double>{s, s})
+                                                    .mode(torch::kBilinear)
+                                                    .align_corners(false))
+                  .squeeze(0);
+    return std::make_pair(sm, s);
+  };
   std::vector<torch::Tensor> lm_list;
   std::vector<std::string> used;
   std::vector<torch::Tensor> obs_l, nrm_l, vis_l;  // per-photo full-vertex appearance (texture)
+  std::vector<torch::Tensor> uv_img, uv_v2d;       // downscaled image + scaled v2d (per-texel solve)
   for (const auto& p : paths) {
     torch::Tensor img;
     try {
@@ -1560,6 +1576,9 @@ int cmd_face(const ncg::app::Args& args) {
       vis_l.push_back(ncg::recon::vertex_visibility(v2dd, pred.vertices3d.select(1, 2).to(device),
                                                     static_cast<int64_t>(img.size(1)),
                                                     static_cast<int64_t>(img.size(2))));
+      auto [sm, s] = downscale(img);                   // per-texel: sample the downscaled photo
+      uv_img.push_back(sm);
+      uv_v2d.push_back(v2dd * static_cast<float>(s));  // v2d in the downscaled image's pixels
     }
   }
   NCG_CHECK(lm_list.size() >= 2, "face: need >=2 usable detections; got {}", lm_list.size());
@@ -1617,6 +1636,27 @@ int cmd_face(const ncg::app::Args& args) {
     ncg::io::save_npy(prefix + "_albedo.npy", albedo.to(at::kCPU).contiguous());
     ncg::io::save_npy(prefix + "_verts.npy", id_verts.contiguous());
     ncg::io::save_npy(prefix + "_faces.npy", faces.to(at::kInt).contiguous());
+
+    // ---- high-res per-texel UV albedo + photometric normals (the sharpness win) -----------------
+    // Lift the albedo from per-vertex (~10⁴) to per-texel (T²) over the SMPL-X UV layout — pore-level
+    // resolution — and recover a tangent-space normal map by photometric stereo across the album's
+    // illumination diversity. Outputs a sharp, relightable face texture + normal map for a real engine.
+    if (model.has_uv() && !uv_img.empty()) {
+      const int T = args.get_int("tex-res", 1024);
+      const auto verts_dev = id_verts.to(device);
+      std::vector<torch::Tensor> viss_t;  // visibility × identity trust (coherent robustness)
+      for (int64_t i = 0; i < Nt; ++i)
+        viss_t.push_back(vis_l[static_cast<size_t>(i)] * R.weight[i].to(device).clamp_min(0.05));
+      torch::Tensor uvmask, uvnrm;
+      const auto uvtex =
+          recover_uv_albedo(model, uv_img, uv_v2d, nrm_l, viss_t, T, verts_dev, uvmask, uvnrm);
+      ncg::io::save_png(prefix + "_albedo_uv.png", uvtex.permute({2, 0, 1}).contiguous().detach());
+      ncg::io::save_png(prefix + "_normal_uv.png", uvnrm.permute({2, 0, 1}).contiguous().detach());
+      ncg::io::save_npy(prefix + "_uvcoords.npy", model.uv_coords().to(at::kCPU).contiguous());
+      ncg::io::save_npy(prefix + "_uvfaces.npy", model.uv_faces().to(at::kInt).contiguous());
+      NCG_LOG_INFO("face: wrote {}x{} per-texel UV albedo + normal map -> {}_albedo_uv.png", T, T,
+                   prefix);
+    }
 
     // Personalized identity mesh (rest pose) + its normals, framed on the head for a portrait.
     const auto verts = id_verts.to(device);                                    // [V,3]
