@@ -24,7 +24,9 @@ struct SubjectGateConfig {
   // Mode-seeking refinement iterations for the robust subject centroid.
   int iterations = 8;
   // A face is kept as the subject iff cosine(e, μ_subject) ≥ keep_cos (after refinement).
-  float keep_cos = 0.45F;
+  // Calibrated for ArcFace IR-SE50 embeddings on real casual crops: same-person cosine ≳0.57,
+  // different-person ≲0.45 (verified on the album), so 0.5 cleanly separates.
+  float keep_cos = 0.5F;
 };
 
 /// Result of gating P detected faces (across the whole album) by identity.
