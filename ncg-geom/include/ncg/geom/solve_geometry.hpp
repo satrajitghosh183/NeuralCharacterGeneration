@@ -57,4 +57,9 @@ GeomResult solve_geometry(const Tensor& base, const Tensor& id_basis, const Tens
                           const Tensor& bary, const Tensor& landmarks2d, const Tensor& conf,
                           const Tensor& w_prior, const GeomConfig& cfg = {});
 
+/// Cotangent Laplace–Beltrami operator as a sparse, symmetric [V,V] matrix — the mesh-aware
+/// smoothness operator for the Δv regularizer (`solve_geometry`'s `lap`). `verts` [V,3], `faces`
+/// [F,3]. Sparse so it scales to the full SMPL-X mesh (V=10475) without a dense [V,V].
+Tensor cotangent_laplacian(const Tensor& verts, const Tensor& faces);
+
 }  // namespace ncg::geom

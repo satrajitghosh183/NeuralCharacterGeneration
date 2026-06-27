@@ -21,6 +21,36 @@ Tensor ridge_solve(const Tensor& A, const Tensor& b, double lam) {
 
 }  // namespace
 
+Tensor cotangent_laplacian(const Tensor& verts_in, const Tensor& faces_in) {
+  const auto v = verts_in.to(at::kCPU, at::kFloat).contiguous();   // [V,3]
+  const auto f = faces_in.to(at::kCPU, at::kLong).contiguous();    // [F,3]
+  const int64_t V = v.size(0);
+  const auto a = f.select(1, 0), b = f.select(1, 1), c = f.select(1, 2);  // [F] vertex ids
+  const auto va = v.index_select(0, a), vb = v.index_select(0, b), vc = v.index_select(0, c);
+  // cot of the angle at each vertex = (e1·e2)/|e1×e2| for the two incident edges.
+  auto cot = [](const Tensor& p, const Tensor& q, const Tensor& r) {  // angle at p
+    const auto e1 = q - p, e2 = r - p;
+    const auto cross = torch::cross(e1, e2, 1).norm(2, 1).clamp_min(1e-9);
+    return (e1 * e2).sum(1) / cross;  // [F]
+  };
+  const auto cot_a = 0.5 * cot(va, vb, vc);  // weight for opposite edge (b,c)
+  const auto cot_b = 0.5 * cot(vb, vc, va);  // edge (c,a)
+  const auto cot_c = 0.5 * cot(vc, va, vb);  // edge (a,b)
+  // Accumulate off-diagonal -w and diagonal +w for each cotangent contribution (COO, coalesced).
+  std::vector<Tensor> rows, cols, vals;
+  auto add_edge = [&](const Tensor& i, const Tensor& j, const Tensor& w) {
+    rows.insert(rows.end(), {i, j, i, j});
+    cols.insert(cols.end(), {j, i, i, j});
+    vals.insert(vals.end(), {-w, -w, w, w});
+  };
+  add_edge(b, c, cot_a);
+  add_edge(c, a, cot_b);
+  add_edge(a, b, cot_c);
+  const auto idx = torch::stack({torch::cat(rows), torch::cat(cols)}, 0);  // [2, 12F]
+  const auto val = torch::cat(vals);                                        // [12F]
+  return torch::sparse_coo_tensor(idx, val, {V, V}).coalesce();
+}
+
 GeomResult solve_geometry(const Tensor& base_in, const Tensor& idb_in, const Tensor& exb_in,
                           const Tensor& faces_in, const Tensor& lap_in, const Tensor& assoc_in,
                           const Tensor& bary_in, const Tensor& lm_in, const Tensor& conf_in,
@@ -30,7 +60,8 @@ GeomResult solve_geometry(const Tensor& base_in, const Tensor& idb_in, const Ten
   const auto idb = idb_in.to(at::kCPU, at::kFloat).contiguous();      // [V,3,nid]
   const auto exb = exb_in.to(at::kCPU, at::kFloat).contiguous();      // [V,3,nex]
   const auto faces = faces_in.to(at::kCPU, at::kLong).contiguous();   // [F,3]
-  const auto lap = lap_in.to(at::kCPU, at::kFloat).contiguous();      // [V,V]
+  const auto lap = lap_in.is_sparse() ? lap_in.to(at::kCPU, at::kFloat).coalesce()
+                                      : lap_in.to(at::kCPU, at::kFloat).contiguous();  // [V,V]
   const auto assoc = assoc_in.to(at::kCPU, at::kLong).contiguous();   // [K]
   const auto bary = bary_in.to(at::kCPU, at::kFloat).contiguous();    // [K,3]
   const auto lm = lm_in.to(at::kCPU, at::kFloat).contiguous();        // [N,K,2]
@@ -118,7 +149,11 @@ GeomResult solve_geometry(const Tensor& base_in, const Tensor& idb_in, const Ten
       const auto r0 = lm[i] - (torch::matmul(sfix, M[si].t()) + t[si].unsqueeze(0));  // [K,2]
       rhs += scatter_dv(torch::matmul(r0, M[si]) * wt[si]);        // Mᵀr0 = r0·M (M is [2,3])
     }
-    const auto LtL = torch::matmul(lap.t(), lap);
+    // L applied as a matvec (sparse-safe — never materialize LᵀL, which is dense [V,V]). L is
+    // symmetric (cotangent/graph), so LᵀL·p = L·(L·p).
+    auto Lmul = [&](const Tensor& x) {
+      return lap.is_sparse() ? torch::sparse::mm(lap, x) : torch::matmul(lap, x);
+    };
     auto apply = [&](const Tensor& p) {
       const auto gp = gather_dv(p);                                // [K,3]
       auto acc = torch::zeros({V, 3}, fopt);
@@ -126,7 +161,7 @@ GeomResult solve_geometry(const Tensor& base_in, const Tensor& idb_in, const Ten
         const auto si = static_cast<size_t>(i);
         acc += scatter_dv(torch::einsum("ab,kb->ka", {mm[si], gp}) * wt[si]);
       }
-      return acc + cfg.lap_weight * torch::matmul(LtL, p) + cfg.mag_weight * p;
+      return acc + cfg.lap_weight * Lmul(Lmul(p)) + cfg.mag_weight * p;
     };
     {  // conjugate gradient
       auto x = dv.clone();
