@@ -25,7 +25,11 @@ TEST_CASE("solve_geometry: off-subspace Δv recovered where observed, pinned whe
   const auto lin = torch::linspace(0, 1, G);
   const auto gx = lin.unsqueeze(0).expand({G, G}).reshape({V});
   const auto gy = lin.unsqueeze(1).expand({G, G}).reshape({V});
-  const auto base = torch::stack({gx, gy, torch::zeros({V})}, 1);  // [V,3] grid in z=0 plane
+  // Non-planar DOME base — a planar grid is a bas-relief-degenerate config for weak-perspective
+  // shape recovery (and gives zero angular diversity); a dome makes the geometry genuinely 3D.
+  const auto r2 = (gx - 0.5).pow(2) + (gy - 0.5).pow(2);
+  const auto zbase = 0.5 * torch::exp(-r2 / 0.1);
+  const auto base = torch::stack({gx, gy, zbase}, 1);  // [V,3] dome
 
   // Triangulate the grid (2 tris per cell).
   std::vector<int64_t> fv;
@@ -83,10 +87,11 @@ TEST_CASE("solve_geometry: off-subspace Δv recovered where observed, pinned whe
   const auto gt_verts = base + torch::einsum("vcn,n->vc", {id_basis, beta_gt}) + dv_gt;
   const auto cflat = faces.index_select(0, assoc).reshape({-1});
   const auto gq = torch::einsum("kc,kcd->kd", {bary, gt_verts.index_select(0, cflat).reshape({K, 3, 3})});
-  const int64_t N = 6;
+  const int64_t N = 8;
   auto lm = torch::zeros({N, K, 2});
   for (int64_t i = 0; i < N; ++i) {
-    const double ang = (i - 2.5) * 0.4, az = (i % 2 ? 0.3 : -0.3);
+    const double ang = (i / static_cast<double>(N - 1) - 0.5) * 2.4;  // yaw -1.2..1.2
+    const double az = (i % 2 ? 0.5 : -0.5);
     const auto Ry = torch::tensor({{std::cos(ang), 0.0, std::sin(ang)}, {0.0, 1.0, 0.0},
                                    {-std::sin(ang), 0.0, std::cos(ang)}});
     const auto Rx = torch::tensor({{1.0, 0.0, 0.0}, {0.0, std::cos(az), -std::sin(az)},
