@@ -1528,12 +1528,14 @@ int cmd_face(const ncg::app::Args& args) {
   nc.detection = args.get_int("detection", 0);
   auto nlf = ncg::body::Nlf::load(args.require("weights"), device, nc);
 
+  const bool texture = args.get_int("texture", 1) != 0 && ncg::cuda_available();
   std::vector<torch::Tensor> lm_list;
   std::vector<std::string> used;
+  std::vector<torch::Tensor> obs_l, nrm_l, vis_l;  // per-photo full-vertex appearance (texture)
   for (const auto& p : paths) {
     torch::Tensor img;
     try {
-      img = ncg::io::load_image(p).to(device);
+      img = ncg::io::load_image(p, 3).to(device);
     } catch (const std::exception& e) {
       NCG_LOG_WARN("face: cannot read {} ({}), skipping", p, e.what());
       continue;
@@ -1550,6 +1552,15 @@ int cmd_face(const ncg::app::Args& args) {
     const auto v2d_c = v2d.index_select(0, corner.reshape({-1})).reshape({L, 3, 2});
     lm_list.push_back(torch::einsum("lc,lcd->ld", {lmk_bary, v2d_c}));             // [L,2]
     used.push_back(p);
+    if (texture) {  // per-photo appearance for the robust multi-illumination albedo solve (C1/C2)
+      const auto v2dd = pred.vertices2d.to(device);
+      ncg::mesh::TriMesh m{pred.vertices3d.to(at::kCPU), faces};                   // posed normals
+      nrm_l.push_back(ncg::mesh::compute_vertex_normals(m).to(device));
+      obs_l.push_back(ncg::recon::sample_vertex_colors(img, v2dd).clamp(0.0, 1.0));
+      vis_l.push_back(ncg::recon::vertex_visibility(v2dd, pred.vertices3d.select(1, 2).to(device),
+                                                    static_cast<int64_t>(img.size(1)),
+                                                    static_cast<int64_t>(img.size(2))));
+    }
   }
   NCG_CHECK(lm_list.size() >= 2, "face: need >=2 usable detections; got {}", lm_list.size());
   const auto landmarks2d = torch::stack(lm_list, 0);  // [N,L,2]
@@ -1584,6 +1595,68 @@ int cmd_face(const ncg::app::Args& args) {
   rec.log_scalar("face", "residual_px", R.residual);
   rec.log_scalar("face", "beta_norm", beta.norm().item<double>());
   rec.log_scalar("face", "n_used", static_cast<double>(lm_list.size()));
+
+  // ---- photoreal skin: robust multi-illumination albedo on the PERSONALIZED face --------------
+  // The same album, now textured. Each photo's per-vertex color is delit by the C1/C2 inverse
+  // renderer (per-photo SH light solved away, outliers rejected) — and we fold in the identity
+  // estimator's per-photo trust w_i so the SAME frames it flagged as wrong-person/bad also lose
+  // their vote on appearance (coherent robustness). Albedo is per-vertex, so it drops straight onto
+  // the recovered identity geometry; we then render the face and relight it under novel lights.
+  if (texture && !obs_l.empty()) {
+    const int64_t Nt = static_cast<int64_t>(obs_l.size());
+    auto W = torch::stack(vis_l, 0);                                          // [N,V]
+    W = W * R.weight.to(device).slice(0, 0, Nt).unsqueeze(1).clamp_min(0.05); // × identity trust
+    ncg::recon::InverseRenderConfig ic;
+    ic.iterations = args.get_int("albedo-iters", 80);
+    ic.robust = Nt >= 2;
+    const auto ir = ncg::recon::solve_inverse_render(torch::stack(obs_l, 0), torch::stack(nrm_l, 0),
+                                                     W, ic);
+    const auto albedo = torch::nan_to_num(ir.albedo).clamp(0.0, 1.0);          // [V,3] relightable
+    NCG_LOG_INFO("face: recovered relightable skin albedo from {} view(s)", Nt);
+
+    // Personalized identity mesh (rest pose) + its normals, framed on the head for a portrait.
+    const auto verts = id_verts.to(device);                                    // [V,3]
+    ncg::mesh::TriMesh cm{id_verts, faces};
+    const auto cnrm = ncg::mesh::compute_vertex_normals(cm).to(device);
+    const auto pvs = ncg::recon::per_vertex_scale(verts, 0.75F);
+    const auto yv = id_verts.select(1, 1);
+    const auto hthr = torch::quantile(yv, 0.88).item<float>();
+    const auto hmask = (yv.to(device) > hthr).unsqueeze(1);                     // [V,1]
+    const auto head_c = verts.masked_select(hmask).reshape({-1, 3}).mean(0);    // head centroid
+
+    auto portrait = [&](const torch::Tensor& colors, float az_deg, float el_deg) {
+      auto cloud = ncg::recon::gaussians_on_body(verts, 0.008F, colors.clamp(0.0, 1.0), pvs);
+      cloud.to_(device);
+      const auto cam = ncg::runtime::Camera::orbit(head_c, 0.42F, az_deg, el_deg, 28.0F, 512, 512,
+                                                   device);
+      return ncg::runtime::render_gaussians(cloud, cam).image;
+    };
+
+    // (a) the recovered skin (flat albedo) — front + a few yaws to show it's a real 3D face.
+    ncg::io::save_png(prefix + "_face_albedo.png", portrait(albedo, 0.0F, 5.0F));
+    rec.log_image("face", "albedo_front", portrait(albedo, 0.0F, 5.0F));
+    for (int k = 0; k < 5; ++k) {
+      const float az = -40.0F + 20.0F * static_cast<float>(k);
+      char nm[24];
+      std::snprintf(nm, sizeof(nm), "view_%+03d", static_cast<int>(az));
+      rec.log_image("face", nm, portrait(albedo, az, 5.0F));
+    }
+    // (b) relit under an orbiting novel light — the payoff of the albedo/light decomposition.
+    const auto white = torch::ones({3}, verts.options());
+    const float el = 20.0F * static_cast<float>(M_PI) / 180.0F;
+    for (int k = 0; k < 6; ++k) {
+      const float az = 2.0F * static_cast<float>(M_PI) * static_cast<float>(k) / 6.0F;
+      const auto dir = torch::tensor(
+          {std::cos(el) * std::cos(az), std::sin(el), std::cos(el) * std::sin(az)}, verts.options());
+      const auto L = ncg::recon::sh_directional_light(dir, white, 0.30F);
+      char nm[24];
+      std::snprintf(nm, sizeof(nm), "relit_%03d", k);
+      rec.log_image("face", nm, portrait(ncg::recon::shade_sh(albedo, L, cnrm), 0.0F, 5.0F));
+    }
+    NCG_LOG_INFO("face: wrote {}_face_albedo.png + yaw/relit frames in {}", prefix,
+                 rec.dir().string());
+  }
+
   NCG_LOG_INFO("face: wrote personalized neutral identity -> {}_identity.obj (vs {}_mean.obj)",
                prefix, prefix);
   return 0;
