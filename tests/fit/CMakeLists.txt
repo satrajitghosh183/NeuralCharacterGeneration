@@ -19,4 +19,10 @@ if(NCG_WITH_CUDA)
     SOURCES test_gs_skinning.cpp
     DEPS    ncg::fit ncg::recon
     LABELS  "cuda;fit")
+
+  # Phase C: k-NN free-splat binding + anti-swim metric.
+  ncg_add_test(test_swim
+    SOURCES test_swim.cpp
+    DEPS    ncg::fit
+    LABELS  "cuda;fit")
 endif()

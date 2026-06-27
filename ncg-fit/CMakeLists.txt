@@ -6,6 +6,7 @@ ncg_add_library(ncg-fit
     src/fit_image.cpp
     src/fit_adaptive.cpp
     src/fit_avatar.cpp
+    src/splat_bind.cpp
   PUBLIC_DEPS
     ncg::core
     ncg::recon
