@@ -1535,6 +1535,25 @@ int cmd_gate(const ncg::app::Args& args) {
   }
   NCG_LOG_INFO("gate: {} photos → {} usable subject faces, {} other/contamination faces rejected",
                paths.size(), usable, rejected);
+  // Optional visual audit: dump every kept-subject and rejected face crop so the decisions can be
+  // eyeballed (kept should all be the same person; dropped should be others).
+  const bool dump = args.has("dump");
+  std::string ddir;
+  if (dump) { ddir = args.get("dump", "gate_dump"); fs::create_directories(ddir); }
+  auto save_crop = [&](const Tensor& img, const Tensor& bbox, const std::string& fn) {
+    namespace Fn = torch::nn::functional;
+    const int64_t H = img.size(1), W = img.size(2);
+    const auto b = bbox.to(at::kCPU);
+    const int64_t x0 = std::clamp<int64_t>((int64_t)b[0].item<float>(), 0, W - 1);
+    const int64_t y0 = std::clamp<int64_t>((int64_t)b[1].item<float>(), 0, H - 1);
+    const int64_t x1 = std::clamp<int64_t>((int64_t)b[2].item<float>(), x0 + 1, W);
+    const int64_t y1 = std::clamp<int64_t>((int64_t)b[3].item<float>(), y0 + 1, H);
+    auto c = Fn::interpolate(img.slice(1, y0, y1).slice(2, x0, x1).unsqueeze(0),
+                             Fn::InterpolateFuncOptions().size(std::vector<int64_t>{128, 128})
+                                 .mode(torch::kBilinear).align_corners(false)).squeeze(0);
+    ncg::io::save_png(fn, c.clamp(0.0, 1.0));
+  };
+  int ki = 0, di = 0;
   for (const auto& b : bundles) {
     if (b.usable)
       NCG_LOG_INFO("  [keep] trust {:.3f}  {} ({} pts)", b.w_prior,
@@ -1542,7 +1561,20 @@ int cmd_gate(const ncg::app::Args& args) {
     for (const auto& r : b.rejected)
       NCG_LOG_INFO("  [drop:{}] dist {:.3f}  {}", r.reason, r.embed_dist,
                    fs::path(r.path).filename().string());
+    if (!dump || (!b.usable && b.rejected.empty())) continue;
+    Tensor img;
+    try { img = ncg::io::load_image(b.path, 3); } catch (...) { continue; }
+    if (b.usable) {
+      char nm[64]; std::snprintf(nm, sizeof(nm), "%s/keep_%03d_t%02d.png", ddir.c_str(), ki++,
+                                 (int)(b.w_prior * 99));
+      save_crop(img, b.subject_bbox, nm);
+    }
+    for (const auto& r : b.rejected) {
+      char nm[64]; std::snprintf(nm, sizeof(nm), "%s/drop_%03d.png", ddir.c_str(), di++);
+      save_crop(img, r.bbox, nm);
+    }
   }
+  if (dump) NCG_LOG_INFO("gate: wrote {} kept + {} dropped face crops to {}/", ki, di, ddir);
   return 0;
 }
 
