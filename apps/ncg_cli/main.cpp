@@ -1271,17 +1271,26 @@ int cmd_avatar(const ncg::app::Args& args) {
     rp.transl = torch::zeros({1, 3}, betas0.options());
     const auto rest_v = model.forward(rp).vertices.squeeze(0);
 
-    // Optional high-res face: per-texel robust albedo + tangent-space photometric normals (UV).
+    // UV albedo texture. Default = bake the robust PER-VERTEX albedo (the clean turntable result)
+    // into the texture: coarse but artifact-free. The per-texel solver (--uv-pertexel) is sharper
+    // only when the face is well-aligned across frames; on generic SMPL-X faces it smears, so it is
+    // off by default until landmark-based face alignment lands.
     if (args.has("uv-texture") && model.has_uv() && !id_img.empty()) {
       const int T = args.get_int("uv-texture", 512);
       const auto pfx = args.get("out-prefix", "avatar");
-      torch::Tensor uvmask, uvnrm;
-      const auto uvtex =
-          recover_uv_albedo(model, id_img, id_v2d, id_nrm, id_w, T, rest_v, uvmask, uvnrm);
-      ncg::io::save_png(pfx + "_albedo_uv.png", uvtex.permute({2, 0, 1}).contiguous().detach());
-      ncg::io::save_png(pfx + "_normal_uv.png", uvnrm.permute({2, 0, 1}).contiguous().detach());
-      NCG_LOG_INFO("avatar --identity: wrote {}x{} per-texel albedo + tangent-space normals -> "
-                   "{}_albedo_uv.png / {}_normal_uv.png", T, T, pfx, pfx);
+      if (args.get_int("uv-pertexel", 0) != 0) {
+        torch::Tensor uvmask, uvnrm;
+        const auto uvtex =
+            recover_uv_albedo(model, id_img, id_v2d, id_nrm, id_w, T, rest_v, uvmask, uvnrm);
+        ncg::io::save_png(pfx + "_albedo_uv.png", uvtex.permute({2, 0, 1}).contiguous().detach());
+        ncg::io::save_png(pfx + "_normal_uv.png", uvnrm.permute({2, 0, 1}).contiguous().detach());
+      } else {
+        auto ras = ncg::recon::uv_rasterize(model.uv_coords(), model.uv_faces(), T);
+        torch::Tensor uvmask;
+        const auto uvtex = ncg::recon::bake_to_uv(ras, albedo, model.faces(), uvmask);  // [T,T,3]
+        ncg::io::save_png(pfx + "_albedo_uv.png", uvtex.permute({2, 0, 1}).contiguous().detach());
+      }
+      NCG_LOG_INFO("avatar --identity: wrote {}x{} UV albedo texture -> {}_albedo_uv.png", T, T, pfx);
     }
 
     // Build the rigged avatar: SMPL-X body geometry + the robust identity albedo.
