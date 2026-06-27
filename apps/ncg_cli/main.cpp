@@ -1629,6 +1629,32 @@ int cmd_geom(const ncg::app::Args& args) {
                lm_l.size(), landmarks2d.size(1), v_template.size(0));
   const auto lap = ncg::geom::cotangent_laplacian(v_template, faces);
 
+  // β from NLF's well-constrained whole-body fit (averaged over the gated photos) — the stable
+  // identity. SMPL-X's β is global; face landmarks alone under-constrain it, so we FIX β here and
+  // let Phase B solve only the off-subspace Δv. (--nlf optional; without it β is solved from the
+  // face landmarks, kept sane by --id-ridge.)
+  torch::Tensor beta_fixed;
+  if (args.has("nlf")) {
+    const auto ndev = ncg::cuda_available() ? at::Device(at::kCUDA, 0) : at::Device(at::kCPU);
+    auto nlf = ncg::body::Nlf::load(args.require("nlf"), ndev, {});
+    std::vector<torch::Tensor> betas;
+    for (const auto& b : bundles) {
+      if (!b.usable) continue;
+      try {
+        betas.push_back(nlf.detect(ncg::io::load_image(b.path, 3).to(ndev))
+                            .params.betas.reshape({-1}).to(at::kCPU));
+      } catch (const std::exception&) { /* NLF may miss a body; skip */ }
+    }
+    if (!betas.empty()) {
+      const auto bavg = torch::stack(betas, 0).median(0).values().to(at::kFloat);  // robust avg
+      const int64_t nid = id_dirs.size(2), m = std::min<int64_t>(bavg.size(0), nid);
+      beta_fixed = torch::zeros({nid}, at::kFloat);
+      beta_fixed.slice(0, 0, m).copy_(bavg.slice(0, 0, m));
+      NCG_LOG_INFO("geom: β fixed from NLF over {} photos (|β|={:.3f})", betas.size(),
+                   beta_fixed.norm().item<float>());
+    }
+  }
+
   ncg::geom::GeomConfig cfg;
   cfg.iterations = args.get_int("iters", 20);
   cfg.lap_weight = args.get_float("lap", 5.0F);
@@ -1639,7 +1665,7 @@ int cmd_geom(const ncg::app::Args& args) {
   cfg.mag_weight = args.get_float("mag", 2.0F);
   cfg.max_dv = args.get_float("max-dv", 0.03F);  // ≤3 cm displacement on the (~0.2 m) SMPL-X face
   const auto R = ncg::geom::solve_geometry(v_template, id_dirs, ex_dirs, faces, lap, assoc, bary,
-                                           landmarks2d, conf, w_prior, cfg);
+                                           landmarks2d, conf, w_prior, cfg, beta_fixed);
 
   const auto beta = R.beta;
   const auto id_verts = v_template + torch::einsum("vck,k->vc", {id_dirs, beta});  // identity (β only)

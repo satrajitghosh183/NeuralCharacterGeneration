@@ -54,10 +54,15 @@ struct GeomResult {
 /// `w_prior` [N] per-photo trust (from the Phase-A gate). Block-coordinate descent: per-photo pose
 /// & expression (ridge), shared β (ridge), shared Δv (Laplacian-regularized normal equations via
 /// matrix-free CG), robust reweight; then the observability field + hard gate.
+/// If `beta_fixed` is defined ([n_id]), the identity is FIXED to it (e.g. from NLF's well-constrained
+/// whole-body fit) and the solver recovers only Δv + per-photo pose/expression. This is the stable
+/// formulation: SMPL-X's β is global (whole body) but we observe only the face, so solving β from
+/// face landmarks alone is under-constrained — better to take β from NLF and let Δv add face detail.
 GeomResult solve_geometry(const Tensor& base, const Tensor& id_basis, const Tensor& expr_basis,
                           const Tensor& faces, const Tensor& lap, const Tensor& assoc,
                           const Tensor& bary, const Tensor& landmarks2d, const Tensor& conf,
-                          const Tensor& w_prior, const GeomConfig& cfg = {});
+                          const Tensor& w_prior, const GeomConfig& cfg = {},
+                          const Tensor& beta_fixed = {});
 
 /// Cotangent Laplace–Beltrami operator as a sparse, symmetric [V,V] matrix — the mesh-aware
 /// smoothness operator for the Δv regularizer (`solve_geometry`'s `lap`). `verts` [V,3], `faces`

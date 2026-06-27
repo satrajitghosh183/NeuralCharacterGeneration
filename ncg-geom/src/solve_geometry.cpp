@@ -54,8 +54,9 @@ Tensor cotangent_laplacian(const Tensor& verts_in, const Tensor& faces_in) {
 GeomResult solve_geometry(const Tensor& base_in, const Tensor& idb_in, const Tensor& exb_in,
                           const Tensor& faces_in, const Tensor& lap_in, const Tensor& assoc_in,
                           const Tensor& bary_in, const Tensor& lm_in, const Tensor& conf_in,
-                          const Tensor& wprior_in, const GeomConfig& cfg) {
+                          const Tensor& wprior_in, const GeomConfig& cfg, const Tensor& beta_fixed) {
   const auto fopt = at::TensorOptions().dtype(at::kFloat);
+  const bool fix_beta = beta_fixed.defined();
   const auto base = base_in.to(at::kCPU, at::kFloat).contiguous();    // [V,3]
   const auto idb = idb_in.to(at::kCPU, at::kFloat).contiguous();      // [V,3,nid]
   const auto exb = exb_in.to(at::kCPU, at::kFloat).contiguous();      // [V,3,nex]
@@ -91,7 +92,8 @@ GeomResult solve_geometry(const Tensor& base_in, const Tensor& idb_in, const Ten
     return torch::zeros({V, 3}, fopt).index_add_(0, cflat, contrib);
   };
 
-  auto beta = torch::zeros({nid}, fopt);
+  auto beta = fix_beta ? beta_fixed.to(at::kCPU, at::kFloat).reshape({nid}).clone()
+                       : torch::zeros({nid}, fopt);
   auto psi = torch::zeros({N, nex}, fopt);
   auto dv = torch::zeros({V, 3}, fopt);
   std::vector<Tensor> M(static_cast<size_t>(N)), t(static_cast<size_t>(N));
@@ -125,17 +127,19 @@ GeomResult solve_geometry(const Tensor& base_in, const Tensor& idb_in, const Ten
       const auto E = (torch::einsum("ab,kbn->kan", {M[si], ex_k}) * sw.unsqueeze(2)).reshape({K * 2, nex});
       psi[i] = ridge_solve(E, r, cfg.expr_ridge);
     }
-    // ---- shared β ----
-    std::vector<Tensor> As, bs;
-    for (int64_t i = 0; i < N; ++i) {
-      const auto si = static_cast<size_t>(i);
-      const auto sex = base_k + torch::einsum("kcn,n->kc", {ex_k, psi[i]}) + gather_dv(dv);
-      const auto pred0 = torch::matmul(sex, M[si].t()) + t[si].unsqueeze(0);
-      const auto sw = (conf[i] * std::max(1e-4F, w[i].item<float>())).sqrt().unsqueeze(1);
-      As.push_back((torch::einsum("ab,kbn->kan", {M[si], id_k}) * sw.unsqueeze(2)).reshape({K * 2, nid}));
-      bs.push_back(((lm[i] - pred0) * sw).reshape({K * 2}));
+    // ---- shared β (skipped when β is fixed from NLF) ----
+    if (!fix_beta) {
+      std::vector<Tensor> As, bs;
+      for (int64_t i = 0; i < N; ++i) {
+        const auto si = static_cast<size_t>(i);
+        const auto sex = base_k + torch::einsum("kcn,n->kc", {ex_k, psi[i]}) + gather_dv(dv);
+        const auto pred0 = torch::matmul(sex, M[si].t()) + t[si].unsqueeze(0);
+        const auto sw = (conf[i] * std::max(1e-4F, w[i].item<float>())).sqrt().unsqueeze(1);
+        As.push_back((torch::einsum("ab,kbn->kan", {M[si], id_k}) * sw.unsqueeze(2)).reshape({K * 2, nid}));
+        bs.push_back(((lm[i] - pred0) * sw).reshape({K * 2}));
+      }
+      beta = ridge_solve(torch::cat(As, 0), torch::cat(bs, 0), cfg.id_ridge);
     }
-    beta = ridge_solve(torch::cat(As, 0), torch::cat(bs, 0), cfg.id_ridge);
 
     // ---- shared Δv: (Σᵢ Gᵀ Mᵀ W M G + λ_lap LᵀL + λ_mag I) Δv = Σᵢ Gᵀ Mᵀ W r0  via matrix-free CG ----
     std::vector<Tensor> mm(static_cast<size_t>(N)), wt(static_cast<size_t>(N));
