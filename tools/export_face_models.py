@@ -1,134 +1,128 @@
 #!/usr/bin/env python3
 """Export the Phase-A face front-end nets to TorchScript matching the FIXED C++ I/O contract
-(ncg/body/face_models.hpp). DEV-ONLY (no Python at runtime). Each model is wrapped so the C++
-stays architecture-agnostic; only this tool knows the underlying nets.
+(ncg/body/face_models.hpp). DEV-ONLY (no Python at runtime). Verified working with:
+  detector : BlazeFace      — github.com/hollance/BlazeFace-PyTorch  (blazeface.pth + anchors.npy)
+  facemesh : FaceMesh 468   — github.com/thepowerfuldeez/facemesh.pytorch  (facemesh.pth)
+  embedder : InceptionResnetV1 vggface2 — pip facenet-pytorch (identity embedding for the gate)
 
 C++ contract (must match exactly):
   detector(img[3,H,W] f32 in [0,1])      -> boxes [N,5] = (x0,y0,x1,y1,score), source-image px
-  facemesh(crop[3,192,192] f32 in [0,1]) -> (uv[K,2] in [0,1] crop-space, conf[K] in [0,1])
-  arcface (crop[3,112,112] f32 in [0,1]) -> emb[512] (L2-normalized)
+  facemesh(crop[1,3,192,192] f32 in[0,1])-> (uv[468,2] in [0,1] crop-space, conf[468] in [0,1])
+  arcface (crop[1,3,112,112] f32 in[0,1])-> emb[512] (L2-normalized)
 
-Recommended torch-native sources (all export to TorchScript; pick what you have on the box):
-  detector : RetinaFace  — github.com/biubug6/Pytorch_Retinaface (single scriptable net)
-  facemesh : FaceMesh468 — github.com/thepowerfuldeez/facemesh.pytorch (MediaPipe weights, 468 pts)
-  arcface  : ArcFace r100 — insightface arcface_torch, OR facenet-pytorch InceptionResnetV1 (pip)
-
-Usage (on the H100, dev env with torch + the chosen model repos/weights):
-  python tools/export_face_models.py --out data/face \
-     --retinaface-weights <...>.pth --facemesh-weights facemesh.pth --arcface-weights <...>.pth
-Outputs: data/face/{detector,facemesh,arcface}.torchscript  (loaded by ncg::body::*::load).
-Each exporter is isolated: a missing model just skips that one (the C++ test SKIPs on missing asset).
+Usage (on the H100, in the face_venv with the two repos cloned):
+  python tools/export_face_models.py --face-src <dir with facemesh.pytorch + BlazeFace-PyTorch> \
+                                     --out data/face
+Outputs: <out>/{detector,facemesh,arcface}.torchscript  (loaded by ncg::body::*::load).
 """
 import argparse
 import os
 import sys
 
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torchvision.ops import nms
 
 
-# ----------------------------------------------------------------------------- detector (RetinaFace)
-class DetectorWrap(nn.Module):
-    """Wrap a RetinaFace net to the contract: full image -> [N,5] (x0,y0,x1,y1,score) in src px.
-    Internally letterboxes to the net's input, runs, decodes anchors, rescales boxes to src px."""
-    def __init__(self, net, in_size=640, score_thr=0.5):
-        super().__init__()
-        self.net = net
-        self.in_size = in_size
-        self.score_thr = score_thr
-
-    def forward(self, img):  # img [3,H,W] in [0,1]
-        _, H, W = img.shape
-        s = self.in_size / max(H, W)
-        nh, nw = int(round(H * s)), int(round(W * s))
-        x = F.interpolate(img.unsqueeze(0), size=(nh, nw), mode="bilinear", align_corners=False)
-        canvas = torch.zeros(1, 3, self.in_size, self.in_size, dtype=img.dtype, device=img.device)
-        canvas[:, :, :nh, :nw] = x
-        # NOTE: RetinaFace returns (loc, conf, landms); decoding with priors is model-specific.
-        # Replace the next two lines with the repo's decode() to get [N,5] in canvas px, then /s.
-        boxes_canvas = self.net(canvas)  # expected [N,5] (x0,y0,x1,y1,score) after the repo's decode
-        boxes = boxes_canvas.clone()
-        boxes[:, :4] = boxes[:, :4] / s
-        return boxes[boxes[:, 4] >= self.score_thr]
-
-
-# ----------------------------------------------------------------------------- facemesh (468 pts)
-class FaceMeshWrap(nn.Module):
-    """Wrap MediaPipe-FaceMesh-pytorch to the contract. The net takes a 192x192 crop and returns
-    468x3 landmarks (x,y in [0,192], z) + a face-presence flag. We emit uv in [0,1] and broadcast
-    the presence score as per-point confidence (MediaPipe gives one flag, not per-point)."""
+class MeshW(nn.Module):
+    """FaceMesh: [1,3,192,192] in [0,1] -> (uv[468,2] in [0,1], conf[468])."""
     def __init__(self, net):
         super().__init__()
         self.net = net
 
-    def forward(self, crop):  # crop [3,192,192] in [0,1]
-        out = self.net(crop.unsqueeze(0) * 255.0 if crop.max() <= 1.0 else crop.unsqueeze(0))
-        lmk, flag = out  # lmk [1,468,3] in [0,192], flag [1,1]
-        uv = lmk[0, :, :2] / 192.0                          # [K,2] in [0,1]
-        conf = torch.sigmoid(flag).reshape(1).expand(uv.shape[0]).contiguous()  # [K]
-        return (uv.contiguous(), conf)
+    def forward(self, x):
+        r, c = self.net(x * 2 - 1)                       # r[1,1404], c[1,1]
+        uv = r[0].reshape(468, 3)[:, :2] / 192.0
+        conf = torch.sigmoid(c[0]).reshape(1).expand(468).contiguous()
+        return uv.contiguous(), conf
 
 
-# ----------------------------------------------------------------------------- arcface (512-d emb)
-class ArcFaceWrap(nn.Module):
-    """Wrap an ArcFace/embedding backbone to the contract. Applies the standard (x-0.5)/0.5
-    normalization a 112x112 face expects, returns an L2-normalized 512-d embedding."""
+class EmbW(nn.Module):
+    """Identity embedder: [1,3,112,112] in [0,1] -> emb[512] (L2). Resizes to 160 for facenet."""
     def __init__(self, net):
         super().__init__()
         self.net = net
 
-    def forward(self, crop):  # crop [3,112,112] in [0,1]
-        x = (crop.unsqueeze(0) - 0.5) / 0.5
+    def forward(self, x):
+        x = F.interpolate(x, size=(160, 160), mode="bilinear", align_corners=False)
+        x = (x * 255.0 - 127.5) / 128.0
         e = self.net(x).reshape(-1)
         return e / e.norm().clamp_min(1e-9)
 
 
-def _save(mod, example, path):
-    mod.eval()
-    with torch.no_grad():
-        ts = torch.jit.trace(mod, example, check_trace=False)
-    torch.jit.save(ts, path)
-    print(f"  wrote {path}")
+class Det(nn.Module):
+    """BlazeFace detector: [3,H,W] in [0,1] -> [N,5] (x0,y0,x1,y1,score) in source px.
+    Letterboxes to 128, decodes anchors (vectorized), thresholds, NMS. Scripted (variable N)."""
+    def __init__(self, net, anchors, thr: float = 0.5, iou: float = 0.3):
+        super().__init__()
+        self.net = net
+        self.register_buffer("anchors", anchors)
+        self.thr = thr
+        self.iou = iou
+
+    def forward(self, img):
+        H = img.size(1)
+        W = img.size(2)
+        m = float(H if H > W else W)
+        sc = 128.0 / m
+        nh = int(float(H) * sc)
+        nw = int(float(W) * sc)
+        x = F.interpolate(img.unsqueeze(0), size=[nh, nw], mode="bilinear", align_corners=False)
+        canvas = torch.zeros([1, 3, 128, 128])
+        canvas[:, :, :nh, :nw] = x
+        out = self.net(canvas * 2 - 1)
+        r = out[0]
+        c = out[1]                                       # r[1,896,16], c[1,896,1]
+        a = self.anchors
+        xc = r[0, :, 0] / 128.0 * a[:, 2] + a[:, 0]
+        yc = r[0, :, 1] / 128.0 * a[:, 3] + a[:, 1]
+        w = r[0, :, 2] / 128.0 * a[:, 2]
+        h = r[0, :, 3] / 128.0 * a[:, 3]
+        x0 = (xc - w / 2) * m
+        y0 = (yc - h / 2) * m
+        x1 = (xc + w / 2) * m
+        y1 = (yc + h / 2) * m
+        score = c[0, :, 0].clamp(-100.0, 100.0).sigmoid()
+        keep = score >= self.thr
+        boxes = torch.stack([x0, y0, x1, y1], dim=1)[keep]
+        ss = score[keep]
+        if boxes.size(0) == 0:
+            return torch.zeros([0, 5])
+        idx = nms(boxes, ss, self.iou)
+        return torch.cat([boxes[idx], ss[idx].unsqueeze(1)], dim=1)
 
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--face-src", required=True, help="dir containing facemesh.pytorch/ and BlazeFace-PyTorch/")
     ap.add_argument("--out", default="data/face")
-    ap.add_argument("--retinaface-weights")
-    ap.add_argument("--facemesh-weights")
-    ap.add_argument("--arcface-weights")
     args = ap.parse_args()
     os.makedirs(args.out, exist_ok=True)
+    fmdir = os.path.join(args.face_src, "facemesh.pytorch")
+    bfdir = os.path.join(args.face_src, "BlazeFace-PyTorch")
+    sys.path.insert(0, fmdir)
+    sys.path.insert(0, bfdir)
 
-    # Each block is best-effort and isolated: it loads the underlying net from the user-provided
-    # weights, wraps to the contract, and traces. Fill in the repo-specific net construction.
-    if args.facemesh_weights:
-        try:
-            from facemesh import FaceMesh  # thepowerfuldeez/facemesh.pytorch on PYTHONPATH
-            net = FaceMesh(); net.load_weights(args.facemesh_weights)
-            _save(FaceMeshWrap(net), torch.rand(3, 192, 192), os.path.join(args.out, "facemesh.torchscript"))
-        except Exception as e:
-            print(f"  [facemesh] skipped: {e}", file=sys.stderr)
+    from facemesh import FaceMesh
+    fm = FaceMesh(); fm.load_weights(os.path.join(fmdir, "facemesh.pth")); fm.eval()
+    torch.jit.trace(MeshW(fm), torch.rand(1, 3, 192, 192), check_trace=False).save(
+        os.path.join(args.out, "facemesh.torchscript")); print("facemesh OK")
 
-    if args.arcface_weights:
-        try:
-            # e.g. insightface arcface_torch: from backbones import get_model; net=get_model('r100')
-            net = torch.load(args.arcface_weights, map_location="cpu")
-            net = net.eval() if isinstance(net, nn.Module) else net
-            _save(ArcFaceWrap(net), torch.rand(3, 112, 112), os.path.join(args.out, "arcface.torchscript"))
-        except Exception as e:
-            print(f"  [arcface] skipped: {e}", file=sys.stderr)
+    from facenet_pytorch import InceptionResnetV1
+    emb = InceptionResnetV1(pretrained="vggface2").eval()
+    torch.jit.trace(EmbW(emb), torch.rand(1, 3, 112, 112), check_trace=False).save(
+        os.path.join(args.out, "arcface.torchscript")); print("arcface OK")
 
-    if args.retinaface_weights:
-        try:
-            print("  [detector] construct RetinaFace + decode() per the repo, then wrap.", file=sys.stderr)
-            # net = load_retinaface(args.retinaface_weights)  # repo-specific
-            # _save(DetectorWrap(net), torch.rand(3, 640, 640), os.path.join(args.out, "detector.torchscript"))
-        except Exception as e:
-            print(f"  [detector] skipped: {e}", file=sys.stderr)
-
-    print("done. Point ncg_cli at data/face/{detector,facemesh,arcface}.torchscript")
+    from blazeface import BlazeFace
+    bf = BlazeFace(); bf.load_weights(os.path.join(bfdir, "blazeface.pth"))
+    bf.load_anchors(os.path.join(bfdir, "anchors.npy")); bf.eval()
+    traced = torch.jit.trace(bf, torch.rand(1, 3, 128, 128) * 2 - 1, check_trace=False)
+    anchors = torch.from_numpy(np.load(os.path.join(bfdir, "anchors.npy"))).float()
+    torch.jit.script(Det(traced, anchors)).save(os.path.join(args.out, "detector.torchscript"))
+    print("detector OK")
+    print("wrote", args.out, "/{detector,facemesh,arcface}.torchscript")
     return 0
 
 
