@@ -1540,7 +1540,7 @@ int cmd_gate(const ncg::app::Args& args) {
   const bool dump = args.has("dump");
   std::string ddir;
   if (dump) { ddir = args.get("dump", "gate_dump"); fs::create_directories(ddir); }
-  auto save_crop = [&](const Tensor& img, const Tensor& bbox, const std::string& fn) {
+  auto save_crop = [&](const torch::Tensor& img, const torch::Tensor& bbox, const std::string& fn) {
     namespace Fn = torch::nn::functional;
     const int64_t H = img.size(1), W = img.size(2);
     const auto b = bbox.to(at::kCPU);
@@ -1562,7 +1562,7 @@ int cmd_gate(const ncg::app::Args& args) {
       NCG_LOG_INFO("  [drop:{}] dist {:.3f}  {}", r.reason, r.embed_dist,
                    fs::path(r.path).filename().string());
     if (!dump || (!b.usable && b.rejected.empty())) continue;
-    Tensor img;
+    torch::Tensor img;
     try { img = ncg::io::load_image(b.path, 3); } catch (...) { continue; }
     if (b.usable) {
       char nm[64]; std::snprintf(nm, sizeof(nm), "%s/keep_%03d_t%02d.png", ddir.c_str(), ki++,
