@@ -45,12 +45,14 @@ TEST_CASE("face identity: neutral shape recovered from expression-varied landmar
   const auto beta_gt = torch::randn({NID});
   const auto S_gt = base + torch::einsum("lck,k->lc", {idb, beta_gt});  // GT neutral shape
 
-  auto synth = [&](bool diverse, double corrupt) {
+  // Expression always varies (the realistic, hard case); `pose_diverse` controls VIEW diversity,
+  // which is what makes 3D shape identifiable from 2D landmarks (structure-from-motion).
+  const auto M_fixed = rand_affine();
+  auto synth = [&](bool pose_diverse, double corrupt) {
     auto lm = torch::zeros({N, L, 2});
     for (int i = 0; i < N; ++i) {
-      const auto psi = diverse ? torch::randn({NEX}) : torch::ones({NEX}) * 0.3;  // expression
-      const auto q = S_gt + torch::einsum("lck,k->lc", {exb, psi});               // posed shape
-      const auto M = rand_affine();
+      const auto q = S_gt + torch::einsum("lck,k->lc", {exb, torch::randn({NEX})});  // varied expr
+      const auto M = pose_diverse ? rand_affine() : M_fixed;                          // view
       const auto t = torch::randn({2}) * 5.0;
       auto u = torch::matmul(q, M.t()) + t + torch::randn({L, 2}) * 0.3;  // project + noise
       if (corrupt > 0 && torch::rand({1}).item<double>() < corrupt)
