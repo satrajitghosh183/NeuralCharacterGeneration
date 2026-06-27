@@ -112,6 +112,17 @@ function loadGLB(url, revoke) {
   new GLTFLoader().load(url, gltf => {
     if (model) player.remove(model);
     model = gltf.scene;
+    // Render skinned meshes UN-skinned (in bind/rest pose): the geometry is clean, but engine
+    // skinning of these glbs can distort. We move the character by its root, so we don't need bones.
+    const skinned = [];
+    model.traverse(o => { if (o.isSkinnedMesh) skinned.push(o); });
+    skinned.forEach(sm => {
+      const plain = new THREE.Mesh(sm.geometry, sm.material);
+      plain.castShadow = true; plain.frustumCulled = false;
+      sm.matrix.decompose(plain.position, plain.quaternion, plain.scale);
+      sm.parent.add(plain);
+      sm.visible = false;
+    });
     model.traverse(o => { if (o.isMesh) { o.castShadow = true; o.frustumCulled = false; } });
     // normalize: drop the character's feet to y=0 and scale to ~1.8m tall
     const box = new THREE.Box3().setFromObject(model);
@@ -120,8 +131,7 @@ function loadGLB(url, revoke) {
     const box2 = new THREE.Box3().setFromObject(model);
     model.position.y -= box2.min.y; model.position.x -= (box2.min.x + box2.max.x) / 2 * 0 + 0;
     player.add(model);
-    mixer = gltf.animations.length ? new THREE.AnimationMixer(model) : null;
-    if (mixer) mixer.clipAction(gltf.animations[0]).play();
+    mixer = null;  // un-skinned render: skeletal clips target hidden bones, so skip the mixer
     document.getElementById('drop').classList.add('hide');
     if (revoke) URL.revokeObjectURL(url);
   }, undefined, err => { console.warn('load failed', err); });
