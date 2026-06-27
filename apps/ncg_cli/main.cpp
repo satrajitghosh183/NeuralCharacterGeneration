@@ -1634,8 +1634,8 @@ int cmd_geom(const ncg::app::Args& args) {
   cfg.lap_weight = args.get_float("lap", 5.0F);
   // Strong β prior: independent FaceMesh landmarks + an approximate embedding would otherwise drive
   // β to absurd values (which then absorb the off-subspace signal that should go to Δv).
-  cfg.id_ridge = args.get_float("id-ridge", 5.0F);
-  cfg.expr_ridge = args.get_float("expr-ridge", 2.0F);
+  cfg.id_ridge = args.get_float("id-ridge", 150.0F);  // keep β in the plausible SMPL-X range —
+  cfg.expr_ridge = args.get_float("expr-ridge", 2.0F);  // face-only landmarks under-constrain global β
   cfg.mag_weight = args.get_float("mag", 2.0F);
   cfg.max_dv = args.get_float("max-dv", 0.03F);  // ≤3 cm displacement on the (~0.2 m) SMPL-X face
   const auto R = ncg::geom::solve_geometry(v_template, id_dirs, ex_dirs, faces, lap, assoc, bary,
