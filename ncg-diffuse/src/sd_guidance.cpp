@@ -1,0 +1,98 @@
+#include <ncg/diffuse/sd_guidance.hpp>
+
+#include <ncg/core/error.hpp>
+#include <ncg/core/logging.hpp>
+#include <ncg/io/safetensors.hpp>
+
+#include <torch/script.h>
+#include <torch/torch.h>
+
+#include <filesystem>
+
+namespace ncg::diffuse {
+
+struct SdGuidance::Impl {
+  torch::jit::script::Module unet;
+  torch::jit::script::Module vae;
+  Tensor cond;    // [1,77,C]
+  Tensor uncond;  // [1,77,C]
+  at::Device device = at::kCPU;
+  SdGuidanceConfig cfg;
+};
+
+SdGuidance::SdGuidance() = default;
+SdGuidance::SdGuidance(SdGuidance&&) noexcept = default;
+SdGuidance& SdGuidance::operator=(SdGuidance&&) noexcept = default;
+SdGuidance::~SdGuidance() = default;
+
+namespace {
+void require_file(const std::string& p, const char* what) {
+  if (!std::filesystem::exists(p)) NCG_THROW("SdGuidance::load: missing {} '{}'", what, p);
+}
+}  // namespace
+
+SdGuidance SdGuidance::load(const std::string& unet_ts, const std::string& vae_ts,
+                            const std::string& cond_safetensors, at::Device device,
+                            const SdGuidanceConfig& cfg) {
+  require_file(unet_ts, "UNet TorchScript");
+  require_file(vae_ts, "VAE TorchScript");
+  require_file(cond_safetensors, "conditioning safetensors");
+
+  SdGuidance g;
+  g.impl_ = std::make_unique<Impl>();
+  g.impl_->device = device;
+  g.impl_->cfg = cfg;
+  try {
+    g.impl_->unet = torch::jit::load(unet_ts, device);
+    g.impl_->vae = torch::jit::load(vae_ts, device);
+  } catch (const std::exception& e) {
+    NCG_THROW("SdGuidance::load: torch::jit::load failed: {}", e.what());
+  }
+  g.impl_->unet.eval();
+  g.impl_->vae.eval();
+
+  // Precomputed CLIP text embeddings (a safetensors with "cond" and "uncond").
+  auto st = ncg::io::SafeTensors::open(cond_safetensors);
+  g.impl_->cond = st.view("cond").clone().to(device, at::kFloat);
+  g.impl_->uncond = st.view("uncond").clone().to(device, at::kFloat);
+  NCG_CHECK(g.impl_->cond.dim() == 3 && g.impl_->uncond.dim() == 3,
+            "SdGuidance: cond/uncond must be [1,77,C]");
+  NCG_LOG_INFO("SdGuidance: loaded UNet+VAE; ctx dim {}", g.impl_->cond.size(2));
+  return g;
+}
+
+at::Device SdGuidance::device() const { return impl_->device; }
+
+Tensor SdGuidance::encode_image(const Tensor& rgb) const {
+  NCG_CHECK(impl_, "SdGuidance: not loaded");
+  const auto x = rgb.to(impl_->device, at::kFloat);
+  // VAE encode returns the posterior mean already; scale to the UNet's latent convention.
+  auto module = impl_->vae;  // jit modules: method calls are non-const
+  const auto lat = module.run_method("encode", x).toTensor();
+  return impl_->cfg.vae_scale * lat;
+}
+
+Tensor SdGuidance::decode_latent(const Tensor& latent) const {
+  NCG_CHECK(impl_, "SdGuidance: not loaded");
+  auto module = impl_->vae;
+  const auto img = module.run_method("decode", latent / impl_->cfg.vae_scale).toTensor();
+  return img.clamp(0.0, 1.0);
+}
+
+NoisePredictor SdGuidance::predictor() const {
+  NCG_CHECK(impl_, "SdGuidance: not loaded");
+  Impl* p = impl_.get();
+  const float guidance = impl_->cfg.guidance;
+  return [p, guidance](const Tensor& x_t, const Tensor& t) -> Tensor {
+    const int64_t B = x_t.size(0);
+    auto unet = p->unet;
+    const auto tl = t.to(p->device, at::kLong);
+    const auto ctx_u = p->uncond.expand({B, p->uncond.size(1), p->uncond.size(2)});
+    const auto ctx_c = p->cond.expand({B, p->cond.size(1), p->cond.size(2)});
+    const auto eps_u = unet.forward({x_t, tl, ctx_u}).toTensor();
+    const auto eps_c = unet.forward({x_t, tl, ctx_c}).toTensor();
+    return cfg_eps(eps_u, eps_c, guidance);
+  };
+}
+
+}  // namespace ncg::diffuse
