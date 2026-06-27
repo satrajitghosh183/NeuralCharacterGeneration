@@ -48,7 +48,7 @@ TEST_CASE("sds: a PERFECT denoiser yields zero SDS gradient", "[diffuse]") {
 
   // A denoiser that reconstructs the exact injected noise from x_t given x0:
   //   x_t = sa*x0 + so*eps  =>  eps = (x_t - sa*x0)/so. eps_hat == eps => grad_SDS == 0.
-  const NoisePredictor perfect = [&](const Tensor& x_t, const Tensor& t) {
+  const NoisePredictor perfect = [&](const at::Tensor& x_t, const at::Tensor& t) {
     const auto sa = sch.sqrt_alpha_bar(t, x.dim());
     const auto so = sch.sqrt_one_minus_alpha_bar(t, x.dim());
     return (x_t - sa * x.detach()) / so;
@@ -65,7 +65,7 @@ TEST_CASE("sds: surrogate loss autograd equals the SDS gradient (composes in one
   auto x = torch::randn({2, 4, 8, 8}).requires_grad_(true);
 
   // A biased denoiser (returns zeros) => nonzero, well-defined gradient.
-  const NoisePredictor zero_pred = [&](const Tensor& x_t, const Tensor& t) {
+  const NoisePredictor zero_pred = [&](const at::Tensor& x_t, const at::Tensor& t) {
     return torch::zeros_like(x_t);
   };
   const auto r = sds_loss(x, sch, zero_pred, {});
