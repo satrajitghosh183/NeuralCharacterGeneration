@@ -58,8 +58,10 @@ TEST_CASE("subject_gate: dominant identity recovered, contamination rejected (C2
                  << "  (tp=" << tp << " fp=" << fp << " fn=" << fn << " tn=" << tn << ")");
 
   REQUIRE(g.n_subject == N_SUB);  // exactly the subject faces, no more no less
-  REQUIRE(precision == 1.0);      // no other-person face slips through
-  REQUIRE(recall == 1.0);         // no subject face dropped
+  REQUIRE(fp == 0);               // no other-person face slips through (precision == 1)
+  REQUIRE(fn == 0);               // no subject face dropped (recall == 1)
+  REQUIRE(tp == N_SUB);
+  (void)precision; (void)recall;  // reported in INFO above
 
   // Trust prior: high for subject, exactly zero for contamination.
   const auto w = g.w_prior.to(at::kCPU);
