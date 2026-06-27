@@ -446,3 +446,46 @@ recovered from data too inconsistent for any averaging method. *That intersectio
 > walking game character (validated: 2 textures, 55-channel animation). The full chain — incoherent
 > web data → robust identity → high-res albedo + photometric normals → textured/animated character →
 > playable browser game (`web/rock_game.html`) — is end to end.
+
+## 15. The novelty, precisely — compound-nuisance identity recovery (not a system of parts)
+
+A casual album of one person is observed through a **compound nuisance group**
+`G = G_light × G_pose × G_expr × G_garment × G_cam` acting per photo on the intrinsic identity `X`
+(geometry ⊕ albedo ⊕ material on a manifold `M`):
+
+```
+O_i = R(g_i · X) + ε_i ,   g_i ∈ G ,   R = differentiable renderer .          (15.1)
+```
+
+Every prior method fixes all-but-one factor of `G` and solves the rest (relighting fixes
+pose+expression; single-image face/clothed-human recon fixes light and *bakes* it; 3DGS fixes
+appearance and cannot relight). **None recover `X` as the joint invariant of the whole group.** That
+is the gap; closing it needs three results, and the pretrained front-ends (NLF, SMPL-X's FLAME head)
+are merely *coordinates on `M` and `G`* — replaceable, not the contribution.
+
+**Theorem 1 (compound-nuisance identifiability).** `X` is recoverable up to its stabilizer
+`H = {g ∈ G : R(g·X) ≡ R(X)}` — the *true gauge* (albedo↔light scale, identity-shape↔expression
+coupling, …) — **iff the album's `{g_i}` span a transverse section of `G/H`.** This *derives* the
+data condition (how much lighting **and** expression **and** pose diversity an album must contain)
+as a theorem; our C1 is the special case `G = G_light`. *Corollary (the demo):* the face maximises
+both the richness of `G` (expression) and the strength of the identity prior + observation count, so
+it is the region recovered **sharpest** — "indistinguishable face" is a consequence, not a trick.
+
+**Theorem 2 (robust Riemannian factorization).** A block-coordinate EM on the product `M × Gᴺ`
+(shape / expression+pose / SH-light / albedo steps, §14 made joint) with a per-observation
+consistency field `ν` (C2) rejecting expression outliers, occlusion and wrong-person, a canonical
+gauge fix (neutral expression, white-balanced albedo, A-pose = `H`), and a **breakdown point that
+grows with album diversity.** Self-aligns photometrically (no external landmark detector). This is
+the estimator declared in `ncg-recon/face_identity.hpp`; it is *new*, not Welsch-on-a-pile.
+
+**Theorem 3 (render-consistent intrinsic completion — the frontier).** Complete unobserved regions
+by posterior sampling **in intrinsic space**: `p(X | {O_i}) ∝ p({O_i} | X, {g_i}) · p(X)`, where the
+prior `p(X)` is over **albedo + geometry**, not radiance. Single-image diffusion samples *images*
+(bakes light, hallucinates the back); this samples *relightable intrinsics* tied to the photos
+through `R` and the recovered `{g_i}`. No prior work completes in relightable intrinsic space anchored
+to a robustly-recovered multi-illumination identity.
+
+**Equivariance (generalises C3).** Because `X` is recovered as a `G`-invariant, the operations
+animate / relight / re-express / re-light all **commute** on the avatar — a structural guarantee no
+baked (radiance) method can offer. *This* is the through-line: identity is the maximal
+nuisance-invariant, and the avatar is its canonical representative.
