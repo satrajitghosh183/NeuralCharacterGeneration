@@ -1481,9 +1481,10 @@ int cmd_face(const ncg::app::Args& args) {
   // ---- SMPL-X face front-end tensors (exported by tools/convert_smplx.py --num-face-id) --------
   auto st = ncg::io::SafeTensors::open(args.require("smplx"));
   auto own = [&](const std::string& k) {
-    NCG_CHECK(st.has(k), std::string("face: smplx asset missing '") + k +
-                             "' — re-export with tools/convert_smplx.py (carries face_id_dirs / "
-                             "face_expr_dirs / lmk_faces_idx / lmk_bary_coords)");
+    NCG_CHECK(st.has(k),
+              "face: smplx asset missing '{}' — re-export with tools/convert_smplx.py "
+              "(carries face_id_dirs / face_expr_dirs / lmk_faces_idx / lmk_bary_coords)",
+              k);
     return st.view(k).clone();
   };
   const auto v_template = own("v_template").to(at::kFloat);            // [V,3]
@@ -1550,8 +1551,7 @@ int cmd_face(const ncg::app::Args& args) {
     lm_list.push_back(torch::einsum("lc,lcd->ld", {lmk_bary, v2d_c}));             // [L,2]
     used.push_back(p);
   }
-  NCG_CHECK(lm_list.size() >= 2, "face: need >=2 usable detections; got " +
-                                     std::to_string(lm_list.size()));
+  NCG_CHECK(lm_list.size() >= 2, "face: need >=2 usable detections; got {}", lm_list.size());
   const auto landmarks2d = torch::stack(lm_list, 0);  // [N,L,2]
   NCG_LOG_INFO("face: {} photos -> {} usable detections; {} landmarks, {} id dims, {} expr dims",
                paths.size(), lm_list.size(), L, n_id, n_ex);
