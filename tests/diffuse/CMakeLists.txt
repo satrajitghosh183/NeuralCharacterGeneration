@@ -4,3 +4,8 @@ ncg_add_test(test_sds
   SOURCES test_sds.cpp
   DEPS    ncg::diffuse
   LABELS  "diffuse")
+
+ncg_add_test(test_completion
+  SOURCES test_completion.cpp
+  DEPS    ncg::diffuse
+  LABELS  "diffuse")

@@ -7,6 +7,7 @@ ncg_add_library(ncg-diffuse
   SOURCES
     src/scheduler.cpp
     src/sds.cpp
+    src/completion.cpp
   PUBLIC_DEPS
     ncg::core
     torch)
