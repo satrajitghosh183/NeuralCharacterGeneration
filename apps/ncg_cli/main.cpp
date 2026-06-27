@@ -1008,6 +1008,14 @@ int cmd_style(const ncg::app::Args& args) {
   return 0;
 }
 
+// A-pose: lower the arms from SMPL-X's T-pose (joints 16/17 = shoulders) so the rest mesh reads as
+// a relaxed standing person, not a mannequin. Cosmetic only — does not add hair/clothes/face detail.
+void apply_apose(torch::Tensor& pose, float s) {
+  if (pose.size(1) <= 17) return;
+  pose.index_put_({0, 16, 2}, -s);  // left shoulder down
+  pose.index_put_({0, 17, 2}, s);   // right shoulder down
+}
+
 // Per-texel robust albedo (C5 at high resolution): lift the C1/C2 inverse-render from per-vertex
 // (~10^4) to per-texel (T^2) over the SMPL-X UV layout. For each valid texel, barycentrically map to
 // the image in every frame, sample observation + normal + visibility, and run the same robust
@@ -1268,6 +1276,7 @@ int cmd_avatar(const ncg::app::Args& args) {
     ncg::body::SmplxParams rp;
     rp.betas = betas0;
     rp.pose_aa = torch::zeros({1, model.num_joints(), 3}, betas0.options());
+    apply_apose(rp.pose_aa, args.get_float("apose", 1.0F));  // arms down (not a T-pose mannequin)
     rp.transl = torch::zeros({1, 3}, betas0.options());
     const auto rest_v = model.forward(rp).vertices.squeeze(0);
 
@@ -1386,6 +1395,7 @@ int cmd_avatar(const ncg::app::Args& args) {
     ncg::body::SmplxParams rp;
     rp.betas = betas0;
     rp.pose_aa = torch::zeros({1, Jn, 3}, betas0.options());
+    if (identity) apply_apose(rp.pose_aa, args.get_float("apose", 1.0F));  // arms-down rest mesh
     rp.transl = torch::zeros({1, 3}, betas0.options());
     const auto ro = model.forward(rp);
     const auto rest_verts = ro.vertices.squeeze(0);  // [V,3]
