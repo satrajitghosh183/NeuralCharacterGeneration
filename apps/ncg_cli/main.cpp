@@ -12,6 +12,7 @@
 #include <ncg/core/logging.hpp>
 #include <ncg/fit/fit_avatar.hpp>
 #include <ncg/fit/fit_image.hpp>
+#include <ncg/fit/splat_bind.hpp>
 #include <ncg/geom/solve_geometry.hpp>
 #include <ncg/io/image.hpp>
 #include <ncg/io/npy.hpp>
@@ -1624,6 +1625,9 @@ int cmd_geom(const ncg::app::Args& args) {
   const auto faces = st.view("faces").clone().to(at::kLong);
   const auto id_dirs = st.view("face_id_dirs").clone().to(at::kFloat);
   const auto ex_dirs = st.view("face_expr_dirs").clone().to(at::kFloat);
+  const auto lbs_w = st.view("lbs_weights").clone().to(at::kFloat);   // [V,J] rig skin weights
+  const auto parents = st.view("parents").clone().to(at::kLong);      // [J]
+  const auto Jreg = st.view("J_regressor").clone().to(at::kFloat);    // [J,V]
 
   NCG_LOG_INFO("geom: {} usable photos, {} dense points; building cotangent Laplacian ({} verts)…",
                lm_l.size(), landmarks2d.size(1), v_template.size(0));
@@ -1633,17 +1637,27 @@ int cmd_geom(const ncg::app::Args& args) {
   // identity. SMPL-X's β is global; face landmarks alone under-constrain it, so we FIX β here and
   // let Phase B solve only the off-subspace Δv. (--nlf optional; without it β is solved from the
   // face landmarks, kept sane by --id-ridge.)
-  torch::Tensor beta_fixed;
+  torch::Tensor beta_fixed, albedo;
   if (args.has("nlf")) {
     const auto ndev = ncg::cuda_available() ? at::Device(at::kCUDA, 0) : at::Device(at::kCPU);
     auto nlf = ncg::body::Nlf::load(args.require("nlf"), ndev, {});
-    std::vector<torch::Tensor> betas;
+    const auto faces_cpu = faces.to(at::kCPU);
+    std::vector<torch::Tensor> betas, obs_l, nrm_l, vis_l;  // betas + per-photo appearance (texture)
     for (const auto& b : bundles) {
       if (!b.usable) continue;
-      try {
-        betas.push_back(nlf.detect(ncg::io::load_image(b.path, 3).to(ndev))
-                            .params.betas.reshape({-1}).to(at::kCPU));
-      } catch (const std::exception&) { /* NLF may miss a body; skip */ }
+      torch::Tensor img;
+      try { img = ncg::io::load_image(b.path, 3).to(ndev); } catch (const std::exception&) { continue; }
+      ncg::body::NlfPrediction pred;
+      try { pred = nlf.detect(img); } catch (const std::exception&) { continue; }
+      if (pred.vertices2d.size(0) != v_template.size(0)) continue;  // need the full mesh
+      betas.push_back(pred.params.betas.reshape({-1}).to(at::kCPU));
+      const auto v2d = pred.vertices2d.to(ndev);
+      nrm_l.push_back(
+          ncg::mesh::compute_vertex_normals({pred.vertices3d.to(at::kCPU), faces_cpu}).to(ndev));
+      obs_l.push_back(ncg::recon::sample_vertex_colors(img, v2d).clamp(0.0, 1.0));
+      vis_l.push_back(ncg::recon::vertex_visibility(v2d, pred.vertices3d.select(1, 2).to(ndev),
+                                                    static_cast<int64_t>(img.size(1)),
+                                                    static_cast<int64_t>(img.size(2))));
     }
     if (!betas.empty()) {
       const auto bavg = std::get<0>(torch::stack(betas, 0).median(0)).to(at::kFloat);  // robust avg
@@ -1652,6 +1666,16 @@ int cmd_geom(const ncg::app::Args& args) {
       beta_fixed.slice(0, 0, m).copy_(bavg.slice(0, 0, m));
       NCG_LOG_INFO("geom: β fixed from NLF over {} photos (|β|={:.3f})", betas.size(),
                    beta_fixed.norm().item<float>());
+    }
+    if (!obs_l.empty()) {  // recover relightable per-vertex albedo (C1/C2) for the textured export
+      ncg::recon::InverseRenderConfig ic;
+      ic.iterations = 60;
+      ic.robust = obs_l.size() >= 2;
+      albedo = ncg::recon::solve_inverse_render(torch::stack(obs_l, 0), torch::stack(nrm_l, 0),
+                                                torch::stack(vis_l, 0), ic)
+                   .albedo.clamp(0.0, 1.0)
+                   .to(at::kCPU);
+      NCG_LOG_INFO("geom: recovered per-vertex albedo from {} views", obs_l.size());
     }
   }
 
@@ -1676,6 +1700,31 @@ int cmd_geom(const ncg::app::Args& args) {
   ncg::mesh::write_obj({v_template, faces}, prefix + "_mean.obj");
   ncg::io::save_npy(prefix + "_obs.npy", R.obs.contiguous());
   ncg::io::save_npy(prefix + "_delta_v.npy", R.delta_v.contiguous());
+
+  // ---- Phase D: export the two-layer deployable character ----
+  if (albedo.defined()) {
+    const auto pcpu = pers.to(at::kCPU);
+    const auto normals = ncg::mesh::compute_vertex_normals({pcpu, faces});
+    const auto joints = torch::matmul(Jreg, pcpu);  // rest-pose joints of the displaced shaped body
+    // Layer 1: rigged + textured DISPLACED mesh (drives animation/physics/collision).
+    ncg::mesh::write_glb_skinned(pcpu, faces, normals, albedo, joints, parents, lbs_w,
+                                 prefix + "_character.glb");
+    // Layer 2: free splats on the displaced mesh, k-NN bound, exported with per-splat bone skinning
+    // (blend the bound verts' lbs_weights → top-4) so the engine GS component deforms them with the rig.
+    const auto pvs = ncg::recon::per_vertex_scale(pcpu, 0.75F);
+    auto cloud = ncg::recon::gaussians_on_body(pcpu, args.get_float("scale", 0.008F), albedo, pvs);
+    const auto cpos = cloud.positions.to(at::kCPU);
+    const auto bind = ncg::fit::bind_splats_knn(cpos, pcpu, 4);
+    const int64_t Ns = bind.idx.size(0), kk = bind.idx.size(1);
+    const auto vw = lbs_w.index_select(0, bind.idx.reshape({-1})).reshape({Ns, kk, lbs_w.size(1)});
+    const auto sb = (vw * bind.weight.unsqueeze(2)).sum(1);  // [N,J] per-splat bone weights
+    const auto t4 = sb.topk(4, 1);
+    auto sw = std::get<0>(t4);
+    sw = sw / sw.sum(1, true).clamp_min(1e-9);
+    ncg::mesh::write_gaussian_ply(cloud, prefix + "_character.ply", std::get<1>(t4).to(at::kLong), sw);
+    NCG_LOG_INFO("geom: two-layer character -> {}_character.glb (rigged textured displaced mesh) + "
+                 "{}_character.ply(+.skin) ({} k-NN-bound free splats)", prefix, prefix, cpos.size(0));
+  }
 
   const auto dvn = R.delta_v.norm(2, 1);
   NCG_LOG_INFO("geom: |β|={:.3f}  residual={:.3f}px  |Δv| mean={:.4f} max={:.4f}  "
