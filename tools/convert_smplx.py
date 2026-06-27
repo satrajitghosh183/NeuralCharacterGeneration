@@ -42,7 +42,13 @@ def main() -> int:
     m = load_model(args.inp)
 
     v_template = to_np(m["v_template"])                 # [V,3]
-    shapedirs = to_np(m["shapedirs"])[:, :, : args.num_betas]  # [V,3,nbetas]
+    # SMPL-X shapedirs is [V,3,~400]: the leading ~300 are IDENTITY shape (incl. the face), the
+    # tail ~100 are EXPRESSION. Keeping more identity dims is what lets the mesh represent a real,
+    # personalized FACE (10 betas only captures coarse body proportions). --num-betas controls it;
+    # default raised so the face front-end has geometry to fit into.
+    shapedirs_full = to_np(m["shapedirs"])
+    nshape = min(args.num_betas, shapedirs_full.shape[2])
+    shapedirs = shapedirs_full[:, :, :nshape]           # [V,3,nbetas]
     posedirs = to_np(m["posedirs"])                     # [V,3,9*(J-1)] or [V*3, 9*(J-1)]
     if posedirs.ndim == 2:
         posedirs = posedirs.reshape(v_template.shape[0], 3, -1)
