@@ -1,6 +1,8 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <ncg/diffuse/completion.hpp>
+#include <ncg/diffuse/scheduler.hpp>
+#include <ncg/diffuse/sds.hpp>
 
 #include <torch/torch.h>
 
@@ -57,6 +59,53 @@ TEST_CASE("completion: gate is monotone non-increasing and C¹ (smoothstep)", "[
   // Derivative vanishes at the seams o=obs_lo (idx~300) and o=obs_hi (idx~700).
   REQUIRE(std::abs(gp[300].item<float>()) < 0.2F);
   REQUIRE(std::abs(gp[700].item<float>()) < 0.2F);
+}
+
+TEST_CASE("completion: end-to-end loop COMPLETES unobserved while freezing observed identity",
+          "[diffuse]") {
+  // The full render-consistent completion dynamics on CPU, no SD weights. A denoiser tuned to a
+  // TARGET image x_tgt makes the SDS gradient reduce exactly to w(t)*(sa/so)*(x - x_tgt) (the eps
+  // cancels), so SDS pulls x toward the prior's manifold (= x_tgt here). Gate half the pixels as
+  // OBSERVED (o=1 → gate 0) and half UNOBSERVED (o=0 → gate 1), then run gated SDS descent.
+  DdpmSchedule sch;
+  torch::manual_seed(7);
+  CompletionConfig ccfg;
+
+  const auto x_tgt = torch::rand({1, 4, 8, 8});         // the "completed" manifold sample
+  auto x = torch::rand({1, 4, 8, 8});                   // current render (starts far from x_tgt)
+  const auto x0 = x.clone();
+
+  // Observability: left half observed (1.0), right half unobserved (0.0).
+  auto obs = torch::zeros({1, 1, 8, 8});
+  obs.index_put_({torch::indexing::Slice(), torch::indexing::Slice(),
+                  torch::indexing::Slice(), torch::indexing::Slice(0, 4)}, 1.0);
+  const auto obs_bchw = obs.expand({1, 4, 8, 8});
+  const auto observed = obs_bchw > 0.5;
+  const auto unobserved = obs_bchw < 0.5;
+
+  const NoisePredictor target_denoiser = [&](const at::Tensor& x_t, const at::Tensor& t) {
+    const auto sa = sch.sqrt_alpha_bar(t, x_t.dim());
+    const auto so = sch.sqrt_one_minus_alpha_bar(t, x_t.dim());
+    return (x_t - sa * x_tgt) / so;  // perfect denoiser FOR x_tgt
+  };
+
+  SdsConfig scfg;
+  scfg.clip_grad = false;  // clean dynamics for the test
+  const float lr = 6.0F;
+  for (int i = 0; i < 400; ++i) {
+    const auto r = sds_loss(x, sch, target_denoiser, scfg);
+    const auto gated = apply_completion_gate(r.grad, obs, ccfg);  // zero on observed half
+    x = x - lr * gated;
+  }
+
+  // Identity protection through the WHOLE loop: observed pixels are bit-exactly unchanged.
+  REQUIRE((x.index({observed}) - x0.index({observed})).abs().max().item<float>() == 0.0F);
+
+  // Completion: unobserved pixels converged toward the prior manifold x_tgt.
+  const auto err0 = (x0.index({unobserved}) - x_tgt.index({unobserved})).norm().item<float>();
+  const auto err1 = (x.index({unobserved}) - x_tgt.index({unobserved})).norm().item<float>();
+  INFO("unobserved err: " << err0 << " -> " << err1);
+  REQUIRE(err1 < 0.2F * err0);
 }
 
 TEST_CASE("completion: provenance mask labels synthesized vs photo-observed", "[diffuse]") {
