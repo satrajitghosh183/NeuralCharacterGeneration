@@ -53,8 +53,9 @@ class EmbW(nn.Module):
 
 
 class Det(nn.Module):
-    """BlazeFace detector: [3,H,W] in [0,1] -> [N,5] (x0,y0,x1,y1,score) in source px.
-    Letterboxes to 128, decodes anchors (vectorized), thresholds, NMS. Scripted (variable N)."""
+    """BlazeFace detector: [3,H,W] in [0,1] -> [N, 5+12] = (x0,y0,x1,y1,score, kp0x,kp0y..kp5x,kp5y)
+    in source px. The 6 keypoints (right eye, left eye, nose, mouth, R-ear, L-ear) drive face
+    ALIGNMENT before the identity embedder. Letterbox 128, decode anchors, threshold, NMS. Scripted."""
     def __init__(self, net, anchors, thr: float = 0.5, iou: float = 0.3):
         super().__init__()
         self.net = net
@@ -85,13 +86,19 @@ class Det(nn.Module):
         x1 = (xc + w / 2) * m
         y1 = (yc + h / 2) * m
         score = c[0, :, 0].clamp(-100.0, 100.0).sigmoid()
+        cols = [x0, y0, x1, y1, score]
+        for k in range(6):                                # 6 keypoints, decoded to source px
+            kx = (r[0, :, 4 + 2 * k] / 128.0 * a[:, 2] + a[:, 0]) * m
+            ky = (r[0, :, 5 + 2 * k] / 128.0 * a[:, 3] + a[:, 1]) * m
+            cols.append(kx)
+            cols.append(ky)
+        full = torch.stack(cols, dim=1)                   # [896, 17]
         keep = score >= self.thr
-        boxes = torch.stack([x0, y0, x1, y1], dim=1)[keep]
-        ss = score[keep]
-        if boxes.size(0) == 0:
-            return torch.zeros([0, 5])
-        idx = nms(boxes, ss, self.iou)
-        return torch.cat([boxes[idx], ss[idx].unsqueeze(1)], dim=1)
+        full = full[keep]
+        if full.size(0) == 0:
+            return torch.zeros([0, 17])
+        idx = nms(full[:, 0:4], full[:, 4], self.iou)
+        return full[idx]
 
 
 def main():

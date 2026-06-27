@@ -18,10 +18,14 @@ namespace ncg::body {
 //   • ArcFace       — a 512-d L2-normalized identity embedding for one face crop.
 // ============================================================================================
 
-/// One detected face: pixel bbox (x0,y0,x1,y1) and detector score.
+/// One detected face: pixel bbox (x0,y0,x1,y1), detector score, and 6 facial keypoints
+/// (right eye, left eye, nose, mouth, R-ear, L-ear) in image pixels — used to ALIGN the face
+/// (similarity transform to a canonical template) before the identity embedder. `kpts` may be
+/// undefined if the detector did not provide keypoints (then embedding falls back to a bbox crop).
 struct FaceBox {
   Tensor bbox;        // [4] float, image pixels (x0,y0,x1,y1)
   float score = 0;    // detector confidence
+  Tensor kpts;        // [6,2] float image pixels, or undefined
 };
 
 /// K dense facial landmarks for one face, in the canonical FaceMesh point order (so the fixed
