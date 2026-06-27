@@ -1525,6 +1525,8 @@ int cmd_gate(const ncg::app::Args& args) {
   ncg::body::AlbumGateModels models{&det, &mesh, &arc};
   ncg::body::AlbumGateConfig cfg;
   cfg.min_det_score = args.get_float("det-score", 0.5F);
+  cfg.subject.same_id_cos = args.get_float("same-cos", 0.5F);
+  cfg.subject.keep_cos = args.get_float("keep-cos", 0.45F);
 
   const auto bundles = ncg::body::gate_album(paths, models, cfg);
 
