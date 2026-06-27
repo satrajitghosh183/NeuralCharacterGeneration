@@ -28,14 +28,14 @@ Tensor cotangent_laplacian(const Tensor& verts_in, const Tensor& faces_in) {
   const auto a = f.select(1, 0), b = f.select(1, 1), c = f.select(1, 2);  // [F] vertex ids
   const auto va = v.index_select(0, a), vb = v.index_select(0, b), vc = v.index_select(0, c);
   // cot of the angle at each vertex = (e1·e2)/|e1×e2| for the two incident edges.
-  auto cot = [](const Tensor& p, const Tensor& q, const Tensor& r) {  // angle at p
+  auto cot_at = [](const Tensor& p, const Tensor& q, const Tensor& r) {  // cotangent of angle at p
     const auto e1 = q - p, e2 = r - p;
     const auto cross = torch::cross(e1, e2, 1).norm(2, 1).clamp_min(1e-9);
     return (e1 * e2).sum(1) / cross;  // [F]
   };
-  const auto cot_a = 0.5 * cot(va, vb, vc);  // weight for opposite edge (b,c)
-  const auto cot_b = 0.5 * cot(vb, vc, va);  // edge (c,a)
-  const auto cot_c = 0.5 * cot(vc, va, vb);  // edge (a,b)
+  const auto cot_a = 0.5 * cot_at(va, vb, vc);  // weight for opposite edge (b,c)
+  const auto cot_b = 0.5 * cot_at(vb, vc, va);  // edge (c,a)
+  const auto cot_c = 0.5 * cot_at(vc, va, vb);  // edge (a,b)
   // Accumulate off-diagonal -w and diagonal +w for each cotangent contribution (COO, coalesced).
   std::vector<Tensor> rows, cols, vals;
   auto add_edge = [&](const Tensor& i, const Tensor& j, const Tensor& w) {
@@ -152,7 +152,7 @@ GeomResult solve_geometry(const Tensor& base_in, const Tensor& idb_in, const Ten
     // L applied as a matvec (sparse-safe — never materialize LᵀL, which is dense [V,V]). L is
     // symmetric (cotangent/graph), so LᵀL·p = L·(L·p).
     auto Lmul = [&](const Tensor& x) {
-      return lap.is_sparse() ? torch::sparse::mm(lap, x) : torch::matmul(lap, x);
+      return lap.is_sparse() ? torch::mm(lap, x) : torch::matmul(lap, x);
     };
     auto apply = [&](const Tensor& p) {
       const auto gp = gather_dv(p);                                // [K,3]
