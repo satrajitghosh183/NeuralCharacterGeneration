@@ -1047,7 +1047,16 @@ torch::Tensor recover_uv_albedo(const ncg::body::SmplxModel& model,
     const auto tn = (nv * bary.unsqueeze(2)).sum(1);               // [T^2,3]
     nrm_l.push_back(tn / tn.norm(2, 1, true).clamp_min(1e-6));
     const auto vv = viss[f].to(device).index_select(0, geomv).reshape({TT, 3});
-    w_l.push_back(std::get<0>(vv.min(1)) * valid);                 // [T^2]
+    auto tw = std::get<0>(vv.min(1)) * valid;                      // visibility × valid
+    // Front-facing: camera-space normal z<0 = facing the camera. Grazing/back texels (which sample
+    // sky/background when the subject is small in frame) get ~0 weight — kills the background bleed.
+    const auto tnu = tn / tn.norm(2, 1, true).clamp_min(1e-6F);
+    tw = tw * torch::relu(-tnu.select(1, 2));
+    // In-bounds: reject texels that project outside the image (no edge background bleed).
+    const auto u = texel_uv.select(1, 0);
+    const auto vc = texel_uv.select(1, 1);
+    const auto inb = ((u >= 0) & (u <= W - 1) & (vc >= 0) & (vc <= H - 1)).to(at::kFloat);
+    w_l.push_back(tw * inb);                                       // [T^2]
   }
   ncg::recon::InverseRenderConfig ic;
   ic.iterations = 60;
