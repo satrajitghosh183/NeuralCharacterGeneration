@@ -37,6 +37,8 @@ def main() -> int:
     ap.add_argument("--in", dest="inp", required=True)
     ap.add_argument("--out", required=True)
     ap.add_argument("--num-betas", type=int, default=10)
+    ap.add_argument("--num-face-id", type=int, default=100,
+                    help="identity shapedirs exported for the face front-end (face_id_dirs)")
     args = ap.parse_args()
 
     m = load_model(args.inp)
@@ -68,6 +70,19 @@ def main() -> int:
     }
     if "f" in m:  # mesh triangles -> needed for vertex normals (relighting) + glTF export
         tensors["faces"] = np.ascontiguousarray(np.asarray(m["f"]), dtype=np.int64)
+
+    # --- Face front-end (the novel identity estimator, ncg-recon/face_identity) ---------------
+    # SMPL-X's 400 shapedirs split 300 IDENTITY + 100 EXPRESSION. The face module needs both bases
+    # (to factor a shared neutral identity out of per-photo expression) plus the 51-landmark
+    # embedding (lmk_faces_idx + lmk_bary_coords) to sample those bases at the face landmarks.
+    NSPLIT = 300  # SMPL-X identity/expression boundary
+    if shapedirs_full.shape[2] >= NSPLIT:
+        n_id = min(args.num_face_id, NSPLIT)
+        tensors["face_id_dirs"] = np.ascontiguousarray(shapedirs_full[:, :, :n_id], dtype=np.float32)
+        tensors["face_expr_dirs"] = np.ascontiguousarray(shapedirs_full[:, :, NSPLIT:], dtype=np.float32)
+    if "lmk_faces_idx" in m and "lmk_bary_coords" in m:
+        tensors["lmk_faces_idx"] = np.ascontiguousarray(np.asarray(m["lmk_faces_idx"]), dtype=np.int64)
+        tensors["lmk_bary_coords"] = np.ascontiguousarray(np.asarray(m["lmk_bary_coords"]), dtype=np.float32)
     # UV layout (texture coords + texture-face indices) -> per-texel albedo + textured glTF export.
     # `vt` [n_uv,2] are UV coords; `ft` [F,3] index into `vt` (separate from geometry `f` at seams).
     if "vt" in m:

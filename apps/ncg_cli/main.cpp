@@ -13,6 +13,8 @@
 #include <ncg/fit/fit_image.hpp>
 #include <ncg/io/image.hpp>
 #include <ncg/io/npy.hpp>
+#include <ncg/io/safetensors.hpp>
+#include <ncg/recon/face_identity.hpp>
 #include <ncg/mesh/extract.hpp>
 #include <ncg/nerf/nerf.hpp>
 #include <ncg/recon/appearance.hpp>
@@ -1462,6 +1464,131 @@ int cmd_avatar(const ncg::app::Args& args) {
   return 0;
 }
 
+// ============================================================================================
+// `face` — the novel identity estimator on a real album (ncg::recon::solve_face_identity).
+// Runs NLF over every photo to get each mesh's projected vertices, samples the 51 SMPL-X face
+// landmarks per photo (barycentric on lmk_faces_idx / lmk_bary_coords), then FUSES the album into
+// a single shared NEUTRAL identity face — the face no one photo shows — while factoring out each
+// photo's expression & head pose and robustly rejecting wrong-person / bad-detection frames. This
+// is the multi-photo consistency NLF (single-image) cannot do: NLF gives an inconsistent identity
+// per photo; we recover the one identity that explains the whole album. (docs/method.md Theorem 2.)
+// ============================================================================================
+int cmd_face(const ncg::app::Args& args) {
+  const auto device = ncg::cuda_available() ? at::Device(at::kCUDA, 0) : at::Device(at::kCPU);
+  auto rec = ncg::record::Recorder::create("runs", args.get("run", "face"));
+  namespace fs = std::filesystem;
+
+  // ---- SMPL-X face front-end tensors (exported by tools/convert_smplx.py --num-face-id) --------
+  auto st = ncg::io::SafeTensors::open(args.require("smplx"));
+  auto own = [&](const std::string& k) {
+    NCG_CHECK(st.has(k), std::string("face: smplx asset missing '") + k +
+                             "' — re-export with tools/convert_smplx.py (carries face_id_dirs / "
+                             "face_expr_dirs / lmk_faces_idx / lmk_bary_coords)");
+    return st.view(k).clone();
+  };
+  const auto v_template = own("v_template").to(at::kFloat);            // [V,3]
+  const auto faces = own("faces").to(at::kLong);                       // [F,3]
+  const auto id_dirs = own("face_id_dirs").to(at::kFloat);            // [V,3,n_id]
+  const auto expr_dirs = own("face_expr_dirs").to(at::kFloat);        // [V,3,n_ex]
+  const auto lmk_faces = own("lmk_faces_idx").to(at::kLong);          // [L]
+  const auto lmk_bary = own("lmk_bary_coords").to(at::kFloat);        // [L,3]
+  const int64_t V = v_template.size(0), L = lmk_faces.size(0);
+  const int64_t n_id = id_dirs.size(2), n_ex = expr_dirs.size(2);
+
+  // Landmark = barycentric blend of its triangle's 3 corner vertices. `corner` [L,3] vertex ids.
+  const auto corner = faces.index_select(0, lmk_faces);  // [L,3]
+  // base [L,3], id_basis [L,3,n_id], expr_basis [L,3,n_ex] sampled at the 51 landmarks.
+  const auto Vt_c = v_template.index_select(0, corner.reshape({-1})).reshape({L, 3, 3});      // [L,c,3]
+  const auto base_lm = torch::einsum("lc,lcd->ld", {lmk_bary, Vt_c});                          // [L,3]
+  const auto Id_c = id_dirs.index_select(0, corner.reshape({-1})).reshape({L, 3, 3, n_id});    // [L,c,3,K]
+  const auto id_basis = torch::einsum("lc,lcdk->ldk", {lmk_bary, Id_c});                        // [L,3,K]
+  const auto Ex_c = expr_dirs.index_select(0, corner.reshape({-1})).reshape({L, 3, 3, n_ex});
+  const auto expr_basis = torch::einsum("lc,lcdk->ldk", {lmk_bary, Ex_c});                      // [L,3,Kx]
+
+  // ---- album -> per-photo 2D landmarks via NLF -------------------------------------------------
+  std::vector<std::string> all;
+  for (const auto& e : fs::directory_iterator(args.require("frames"))) {
+    const auto ext = e.path().extension().string();
+    if (ext == ".jpg" || ext == ".jpeg" || ext == ".png" || ext == ".JPG" || ext == ".JPEG")
+      all.push_back(e.path().string());
+  }
+  std::sort(all.begin(), all.end());
+  NCG_CHECK(!all.empty(), "face: no images in --frames dir");
+  const int max_frames = args.get_int("max-frames", 80);
+  std::vector<std::string> paths;
+  if (static_cast<int>(all.size()) <= max_frames) {
+    paths = all;
+  } else {
+    const double step = static_cast<double>(all.size()) / max_frames;
+    for (int i = 0; i < max_frames; ++i) paths.push_back(all[static_cast<size_t>(i * step)]);
+  }
+
+  ncg::body::NlfConfig nc;
+  nc.detection = args.get_int("detection", 0);
+  auto nlf = ncg::body::Nlf::load(args.require("weights"), device, nc);
+
+  std::vector<torch::Tensor> lm_list;
+  std::vector<std::string> used;
+  for (const auto& p : paths) {
+    torch::Tensor img;
+    try {
+      img = ncg::io::load_image(p).to(device);
+    } catch (const std::exception& e) {
+      NCG_LOG_WARN("face: cannot read {} ({}), skipping", p, e.what());
+      continue;
+    }
+    ncg::body::NlfPrediction pred;
+    try {
+      pred = nlf.detect(img);
+    } catch (const std::exception& e) {
+      NCG_LOG_WARN("face: NLF failed on {} ({}), skipping", p, e.what());
+      continue;
+    }
+    if (pred.vertices2d.size(0) != V) continue;  // need full mesh to sample the landmarks
+    const auto v2d = pred.vertices2d.to(at::kCPU).to(at::kFloat);                  // [V,2]
+    const auto v2d_c = v2d.index_select(0, corner.reshape({-1})).reshape({L, 3, 2});
+    lm_list.push_back(torch::einsum("lc,lcd->ld", {lmk_bary, v2d_c}));             // [L,2]
+    used.push_back(p);
+  }
+  NCG_CHECK(lm_list.size() >= 2, "face: need >=2 usable detections; got " +
+                                     std::to_string(lm_list.size()));
+  const auto landmarks2d = torch::stack(lm_list, 0);  // [N,L,2]
+  NCG_LOG_INFO("face: {} photos -> {} usable detections; {} landmarks, {} id dims, {} expr dims",
+               paths.size(), lm_list.size(), L, n_id, n_ex);
+
+  // ---- the contribution: robust joint identity / expression / pose factorization ---------------
+  ncg::recon::FaceIdentityConfig cfg;
+  cfg.iterations = args.get_int("iters", 40);
+  cfg.id_ridge = std::stof(args.get("id-ridge", "0.01"));
+  cfg.expr_ridge = std::stof(args.get("expr-ridge", "0.1"));
+  cfg.robust = args.get_int("robust", 1) != 0;
+  const auto R = ncg::recon::solve_face_identity(base_lm, id_basis, expr_basis, landmarks2d, cfg);
+
+  // Personalized NEUTRAL identity mesh: v_template + id_dirs · β  (expression set to 0 = neutral).
+  const auto beta = R.id_shape.to(at::kCPU).to(at::kFloat);                         // [n_id]
+  const auto id_verts = v_template + torch::einsum("vck,k->vc", {id_dirs, beta});   // [V,3]
+
+  const auto prefix = (rec.dir() / args.get("out-prefix", "face")).string();
+  ncg::mesh::TriMesh neutral{id_verts, faces};
+  ncg::mesh::TriMesh mean{v_template, faces};
+  ncg::mesh::write_obj(neutral, prefix + "_identity.obj");
+  ncg::mesh::write_obj(mean, prefix + "_mean.obj");
+
+  // Report the recovery + per-photo trust (the C2 robustness signal).
+  NCG_LOG_INFO("face: identity recovered |β|={:.3f}  reproj-residual={:.3f}px", beta.norm().item<float>(),
+               R.residual);
+  const auto w = R.weight.to(at::kCPU);
+  for (size_t i = 0; i < used.size(); ++i)
+    NCG_LOG_INFO("  trust {:.3f}  {}", w[static_cast<int64_t>(i)].item<float>(),
+                 fs::path(used[i]).filename().string());
+  rec.log_scalar("face", "residual_px", R.residual);
+  rec.log_scalar("face", "beta_norm", beta.norm().item<double>());
+  rec.log_scalar("face", "n_used", static_cast<double>(lm_list.size()));
+  NCG_LOG_INFO("face: wrote personalized neutral identity -> {}_identity.obj (vs {}_mean.obj)",
+               prefix, prefix);
+  return 0;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -1470,7 +1597,7 @@ int main(int argc, char** argv) {
     std::fprintf(stderr,
                  "usage: ncg_cli "
                  "<pipeline|render|turntable|select|fitimg|fit|fuse|relight|export|benchmark|"
-                 "runtime|nerf|style|avatar> [--flags]\n");
+                 "runtime|nerf|style|avatar|face> [--flags]\n");
     return 2;
   }
   const std::string cmd = argv[1];
@@ -1490,6 +1617,7 @@ int main(int argc, char** argv) {
     if (cmd == "runtime") return cmd_runtime(args);
     if (cmd == "style") return cmd_style(args);
     if (cmd == "avatar") return cmd_avatar(args);
+    if (cmd == "face") return cmd_face(args);
     if (cmd == "nerf") return cmd_nerf(args);
     std::fprintf(stderr, "unknown command '%s'\n", cmd.c_str());
     return 2;
