@@ -33,3 +33,9 @@ ncg_add_test(test_uv_texture
   SOURCES test_uv_texture.cpp
   DEPS    ncg::recon
   LABELS  "recon")
+
+# The novel estimator: joint identity/expression/pose factorization (Theorem 2), CPU.
+ncg_add_test(test_face_identity
+  SOURCES test_face_identity.cpp
+  DEPS    ncg::recon
+  LABELS  "recon")

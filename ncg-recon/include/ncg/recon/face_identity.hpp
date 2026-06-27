@@ -36,31 +36,34 @@ namespace ncg::recon {
 // ============================================================================================
 
 struct FaceIdentityConfig {
-  int iterations = 40;          // outer block-coordinate sweeps
-  int n_id = 100;               // identity face shape dims to solve (SMPL-X has ~300)
-  int n_expr = 50;              // expression dims (SMPL-X has ~100)
-  float shape_ridge = 1e-2F;    // Tikhonov on β (identity prior)
-  float expr_ridge = 1e-1F;     // stronger prior on per-photo expression (toward neutral)
-  bool robust = true;           // C2 consistency field
-  float robust_scale = 0.0F;    // 0 => auto (1.4826·MAD)
+  int iterations = 30;        // outer block-coordinate sweeps
+  float id_ridge = 1e-2F;     // Tikhonov on β (identity prior)
+  float expr_ridge = 1e-1F;   // stronger prior on per-photo expression (pulls toward neutral)
+  bool robust = true;         // C2 per-photo consistency (rejects wrong-person / bad detections)
+  float robust_k = 3.0F;      // Welsch scale = robust_k · median residual (auto)
 };
 
+/// Result of the identity/expression/pose factorization. `id_shape` is the recovered NEUTRAL
+/// identity — the face no single photo shows — which is the invariant X_face of Theorem 2.
 struct FaceIdentityResult {
-  Tensor id_shape;     // [n_id]      the recovered NEUTRAL identity face (the invariant X_face)
-  Tensor expr;         // [N,n_expr]  per-photo expression (nuisance)
-  Tensor lights;       // [N,3,9]     per-photo SH light (nuisance)
-  Tensor albedo;       // [V_face,3]  relightable face albedo (recovered jointly)
-  Tensor consistency;  // [N,V_face]  per-observation consistency ν (Theorem 2)
-  double residual = 0; // final robust photometric residual
+  Tensor id_shape;     // [n_id]    neutral identity shape coefficients (the invariant)
+  Tensor expr;         // [N,n_expr] per-photo expression (nuisance, factored out)
+  Tensor scale;        // [N]       per-photo weak-perspective scale
+  Tensor rot;          // [N,3,3]   per-photo head rotation
+  Tensor trans;        // [N,2]     per-photo image translation
+  Tensor weight;       // [N]       per-photo consistency (Theorem 2's ν, 1=trusted)
+  double residual = 0; // final robust landmark reprojection RMS
 };
 
-/// Solve the joint factorization above. `obs` [N,Vf,3] per-photo face-vertex colors, `normals`
-/// [N,Vf,3] posed normals, `weights` [N,Vf] visibility; `id_basis` [Vf,3,n_id] + `expr_basis`
-/// [Vf,3,n_expr] are SMPL-X's FLAME identity/expression shapedirs restricted to the face, and
-/// `landmarks2d` [N,L,2] the per-photo seed landmarks. Recovers the neutral identity face + per-photo
-/// nuisance. (Implementation is the next milestone — this header pins the math being built.)
-FaceIdentityResult solve_face_identity(const Tensor& obs, const Tensor& normals,
-                                       const Tensor& weights, const Tensor& id_basis,
+/// Theorem 2 (shape core): recover the SHARED neutral identity face shape + per-photo expression &
+/// weak-perspective pose from per-photo 2D landmarks, by robust block-coordinate least squares —
+/// the identity/expression disentanglement that is the paper's novel kernel (no single photo shows
+/// the neutral face; it is the invariant across the album's expression diversity, recoverable per
+/// Theorem 1). `base` [L,3] mean landmark positions; `id_basis` [L,3,n_id] / `expr_basis`
+/// [L,3,n_expr] are SMPL-X's FLAME shapedirs sampled at the L landmarks; `landmarks2d` [N,L,2].
+/// Steps per sweep: per-photo (expr, pose) Gauss-Newton; shared-β linear solve stacking all photos;
+/// robust per-photo reweight. Identity is over-constrained ⇒ recovers sharply.
+FaceIdentityResult solve_face_identity(const Tensor& base, const Tensor& id_basis,
                                        const Tensor& expr_basis, const Tensor& landmarks2d,
                                        const FaceIdentityConfig& cfg);
 
