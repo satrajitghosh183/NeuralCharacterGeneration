@@ -2,6 +2,7 @@
 
 #include <ncg/body/face_models.hpp>
 #include <ncg/core/tensor.hpp>
+#include <ncg/select/subject_gate.hpp>
 
 #include <string>
 #include <vector>

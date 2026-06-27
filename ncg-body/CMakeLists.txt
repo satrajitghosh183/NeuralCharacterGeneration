@@ -8,7 +8,7 @@ ncg_add_library(ncg-body
     src/album_gate.cpp
   PUBLIC_DEPS
     ncg::core
+    ncg::select
     torch
   PRIVATE_DEPS
-    ncg::io
-    ncg::select)
+    ncg::io)
