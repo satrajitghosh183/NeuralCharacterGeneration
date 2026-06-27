@@ -212,7 +212,9 @@ GeomResult solve_geometry(const Tensor& base_in, const Tensor& idb_in, const Ten
   const auto ev = torch::linalg_eigvalsh(Tten + 1e-9 * torch::eye(3, fopt).unsqueeze(0));  // [V,3] asc
   const auto l1 = ev.select(1, 2).clamp_min(1e-9), l2 = ev.select(1, 1);
   const auto diversity = (l2 / l1).clamp(0.0, 1.0);                // ~1 if seen from ≥2 directions
-  const auto o = torch::sigmoid(8.0 * (diversity * torch::tanh(cover) - 0.15));  // [V]
+  // Observable = well-COVERED by confident points, credited extra for angular diversity (but a
+  // densely-covered near-frontal face still counts — diversity is a bonus, not a gate).
+  const auto o = torch::sigmoid(6.0 * (torch::tanh(cover) * (0.4 + 0.6 * diversity) - 0.25));  // [V]
   dv = dv * (o > cfg.o_solve).to(fopt).unsqueeze(1);              // HARD gate
 
   GeomResult R;
