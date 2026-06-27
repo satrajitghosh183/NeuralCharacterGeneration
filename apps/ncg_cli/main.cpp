@@ -5,6 +5,7 @@
 //   ncg_cli fit    --image photo.jpg --weights nlf.safetensors   (NLF port: not implemented)
 #include <args.hpp>
 
+#include <ncg/body/album_gate.hpp>
 #include <ncg/body/nlf.hpp>
 #include <ncg/body/smplx.hpp>
 #include <ncg/core/device.hpp>
@@ -1501,6 +1502,51 @@ int cmd_avatar(const ncg::app::Args& args) {
 }
 
 // ============================================================================================
+// `gate` — Phase A on a real album: detect→embed→robust subject gate→dense landmarks. Reports the
+// C2 contamination result (usable subject faces vs rejected other-person faces). CPU by default so
+// it never competes with a training GPU. Produces the PhotoBundle stream Phase B will consume.
+//   ncg_cli gate --frames dir/ --detector det.ts --facemesh fm.ts --arcface arc.ts
+int cmd_gate(const ncg::app::Args& args) {
+  const auto device = args.get_int("cuda", 0) != 0 && ncg::cuda_available() ? at::Device(at::kCUDA, 0)
+                                                                            : at::Device(at::kCPU);
+  namespace fs = std::filesystem;
+  std::vector<std::string> paths;
+  for (const auto& e : fs::directory_iterator(args.require("frames"))) {
+    const auto ext = e.path().extension().string();
+    if (ext == ".jpg" || ext == ".jpeg" || ext == ".png" || ext == ".JPG" || ext == ".JPEG")
+      paths.push_back(e.path().string());
+  }
+  std::sort(paths.begin(), paths.end());
+  NCG_CHECK(!paths.empty(), "gate: no images in --frames");
+
+  auto det = ncg::body::FaceDetector::load(args.require("detector"), device);
+  auto mesh = ncg::body::FaceMeshNet::load(args.require("facemesh"), device);
+  auto arc = ncg::body::ArcFace::load(args.require("arcface"), device);
+  ncg::body::AlbumGateModels models{&det, &mesh, &arc};
+  ncg::body::AlbumGateConfig cfg;
+  cfg.min_det_score = args.get_float("det-score", 0.5F);
+
+  const auto bundles = ncg::body::gate_album(paths, models, cfg);
+
+  int usable = 0, rejected = 0;
+  for (const auto& b : bundles) {
+    if (b.usable) ++usable;
+    rejected += static_cast<int>(b.rejected.size());
+  }
+  NCG_LOG_INFO("gate: {} photos → {} usable subject faces, {} other/contamination faces rejected",
+               paths.size(), usable, rejected);
+  for (const auto& b : bundles) {
+    if (b.usable)
+      NCG_LOG_INFO("  [keep] trust {:.3f}  {} ({} pts)", b.w_prior,
+                   fs::path(b.path).filename().string(), b.dense_uv.numel() / 2);
+    for (const auto& r : b.rejected)
+      NCG_LOG_INFO("  [drop:{}] dist {:.3f}  {}", r.reason, r.embed_dist,
+                   fs::path(r.path).filename().string());
+  }
+  return 0;
+}
+
+// ============================================================================================
 // `face` — the novel identity estimator on a real album (ncg::recon::solve_face_identity).
 // Runs NLF over every photo to get each mesh's projected vertices, samples the 51 SMPL-X face
 // landmarks per photo (barycentric on lmk_faces_idx / lmk_bary_coords), then FUSES the album into
@@ -1800,6 +1846,7 @@ int main(int argc, char** argv) {
     if (cmd == "runtime") return cmd_runtime(args);
     if (cmd == "style") return cmd_style(args);
     if (cmd == "avatar") return cmd_avatar(args);
+    if (cmd == "gate") return cmd_gate(args);
     if (cmd == "face") return cmd_face(args);
     if (cmd == "nerf") return cmd_nerf(args);
     std::fprintf(stderr, "unknown command '%s'\n", cmd.c_str());
