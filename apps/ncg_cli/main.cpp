@@ -12,6 +12,7 @@
 #include <ncg/core/logging.hpp>
 #include <ncg/fit/fit_avatar.hpp>
 #include <ncg/fit/fit_image.hpp>
+#include <ncg/geom/solve_geometry.hpp>
 #include <ncg/io/image.hpp>
 #include <ncg/io/npy.hpp>
 #include <ncg/io/safetensors.hpp>
@@ -1581,6 +1582,82 @@ int cmd_gate(const ncg::app::Args& args) {
 }
 
 // ============================================================================================
+// `geom` — Phase B on a real album: gate → dense FaceMesh correspondences → solve_geometry
+// (identity β + out-of-subspace Δv + observability). Exports the personalized neutral mesh
+// (v̄ + shapedirs·β + Δv), the SMPL-X mean for comparison, and the observability map.
+//   ncg_cli geom --frames dir/ --detector d.ts --facemesh f.ts --arcface a.ts \
+//                --embed facemesh_smplx_embed.safetensors --smplx smplx.safetensors
+int cmd_geom(const ncg::app::Args& args) {
+  const auto device = at::Device(at::kCPU);  // CPU: gate nets are tiny, solve is CPU; training-safe
+  auto rec = ncg::record::Recorder::create("runs", args.get("run", "geom"));
+  namespace fs = std::filesystem;
+  std::vector<std::string> paths;
+  for (const auto& e : fs::directory_iterator(args.require("frames"))) {
+    const auto ext = e.path().extension().string();
+    if (ext == ".jpg" || ext == ".jpeg" || ext == ".png" || ext == ".JPG") paths.push_back(e.path().string());
+  }
+  std::sort(paths.begin(), paths.end());
+  NCG_CHECK(!paths.empty(), "geom: no images in --frames");
+
+  // ---- Phase A: gate the album ----
+  auto det = ncg::body::FaceDetector::load(args.require("detector"), device);
+  auto mesh = ncg::body::FaceMeshNet::load(args.require("facemesh"), device);
+  auto arc = ncg::body::ArcFace::load(args.require("arcface"), device);
+  ncg::body::AlbumGateModels gm{&det, &mesh, &arc};
+  const auto bundles = ncg::body::gate_album(paths, gm, {});
+
+  std::vector<torch::Tensor> lm_l, cf_l;
+  std::vector<float> wp;
+  for (const auto& b : bundles)
+    if (b.usable) { lm_l.push_back(b.dense_uv); cf_l.push_back(b.dense_conf); wp.push_back(b.w_prior); }
+  NCG_CHECK(lm_l.size() >= 3, "geom: need >=3 usable subject photos; got {}", lm_l.size());
+  const auto landmarks2d = torch::stack(lm_l, 0);                       // [N,K,2]
+  const auto conf = torch::stack(cf_l, 0);                             // [N,K]
+  const auto w_prior = torch::tensor(wp);                             // [N]
+
+  // ---- assets: FaceMesh→SMPL-X embedding + SMPL-X bases ----
+  auto emb = ncg::io::SafeTensors::open(args.require("embed"));
+  const auto assoc = emb.view("assoc").clone().to(at::kLong);          // [K]
+  const auto bary = emb.view("bary").clone().to(at::kFloat);           // [K,3]
+  auto st = ncg::io::SafeTensors::open(args.require("smplx"));
+  const auto v_template = st.view("v_template").clone().to(at::kFloat);
+  const auto faces = st.view("faces").clone().to(at::kLong);
+  const auto id_dirs = st.view("face_id_dirs").clone().to(at::kFloat);
+  const auto ex_dirs = st.view("face_expr_dirs").clone().to(at::kFloat);
+
+  NCG_LOG_INFO("geom: {} usable photos, {} dense points; building cotangent Laplacian ({} verts)…",
+               lm_l.size(), landmarks2d.size(1), v_template.size(0));
+  const auto lap = ncg::geom::cotangent_laplacian(v_template, faces);
+
+  ncg::geom::GeomConfig cfg;
+  cfg.iterations = args.get_int("iters", 20);
+  cfg.lap_weight = args.get_float("lap", 5.0F);
+  cfg.mag_weight = args.get_float("mag", 0.5F);
+  const auto R = ncg::geom::solve_geometry(v_template, id_dirs, ex_dirs, faces, lap, assoc, bary,
+                                           landmarks2d, conf, w_prior, cfg);
+
+  const auto beta = R.beta;
+  const auto id_verts = v_template + torch::einsum("vck,k->vc", {id_dirs, beta});  // identity (β only)
+  const auto pers = id_verts + R.delta_v;                                          // + Δv
+  const auto prefix = (rec.dir() / args.get("out-prefix", "geom")).string();
+  ncg::mesh::write_obj({pers, faces}, prefix + "_personalized.obj");
+  ncg::mesh::write_obj({id_verts, faces}, prefix + "_identity.obj");
+  ncg::mesh::write_obj({v_template, faces}, prefix + "_mean.obj");
+  ncg::io::save_npy(prefix + "_obs.npy", R.obs.contiguous());
+  ncg::io::save_npy(prefix + "_delta_v.npy", R.delta_v.contiguous());
+
+  const auto dvn = R.delta_v.norm(2, 1);
+  NCG_LOG_INFO("geom: |β|={:.3f}  residual={:.3f}px  |Δv| mean={:.4f} max={:.4f}  "
+               "observed verts(o>0.5)={}  → {}_personalized.obj",
+               beta.norm().item<float>(), R.residual, dvn.mean().item<float>(),
+               dvn.max().item<float>(), (R.obs > 0.5F).sum().item<int64_t>(), prefix);
+  rec.log_scalar("geom", "residual_px", R.residual);
+  rec.log_scalar("geom", "dv_max", dvn.max().item<double>());
+  rec.log_scalar("geom", "n_observed", (R.obs > 0.5F).sum().item<double>());
+  return 0;
+}
+
+// ============================================================================================
 // `face` — the novel identity estimator on a real album (ncg::recon::solve_face_identity).
 // Runs NLF over every photo to get each mesh's projected vertices, samples the 51 SMPL-X face
 // landmarks per photo (barycentric on lmk_faces_idx / lmk_bary_coords), then FUSES the album into
@@ -1881,6 +1958,7 @@ int main(int argc, char** argv) {
     if (cmd == "style") return cmd_style(args);
     if (cmd == "avatar") return cmd_avatar(args);
     if (cmd == "gate") return cmd_gate(args);
+    if (cmd == "geom") return cmd_geom(args);
     if (cmd == "face") return cmd_face(args);
     if (cmd == "nerf") return cmd_nerf(args);
     std::fprintf(stderr, "unknown command '%s'\n", cmd.c_str());

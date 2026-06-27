@@ -87,7 +87,8 @@ def main():
         assoc[k] = cand[best]; bary[k] = np.clip(bc[best], 0, 1)
         bary[k] /= bary[k].sum()
     print(f"derived embedding: {inside}/468 points inside a SMPL-X face, {len(cand)} candidate faces")
-    np.savez(args.out, assoc=assoc, bary=bary)
+    from safetensors.numpy import save_file
+    save_file({"assoc": np.ascontiguousarray(assoc), "bary": np.ascontiguousarray(bary)}, args.out)
     print("wrote", args.out)
     return 0
 
