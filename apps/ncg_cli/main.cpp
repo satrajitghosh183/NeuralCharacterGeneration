@@ -1085,6 +1085,34 @@ torch::Tensor recover_uv_albedo(const ncg::body::SmplxModel& model,
   const auto obs_mean = torch::stack(obs_l, 0).mean(0).mean(0).clamp_min(1e-3F);
   const auto alb_mean = albedo.mean(0).clamp_min(1e-3F);
   albedo = (albedo * (obs_mean / alb_mean).view({1, 3})).clamp(0.0F, 1.0F);
+
+  // ---- algorithmic UV cleanup: confidence-weighted push-pull inpaint + edge-aware smoothing -----
+  // Per-texel coverage Σ_f w is the confidence. Low-coverage texels — UV seams, rarely-seen cheek/
+  // jaw, specular-rejected spots — are filled from confident neighbours by normalized convolution
+  // (blur(a·c)/blur(c)), iterated so confidence diffuses inward; confident texels are preserved.
+  // Purely algorithmic (no manual touch-up): removes seam discontinuities and isolated speckles.
+  {
+    namespace Fc = torch::nn::functional;
+    const auto conf = torch::stack(w_l, 0).sum(0).clamp_min(0.0F).view({1, 1, T, T});  // [1,1,T,T]
+    auto k1 = torch::tensor({1.F, 4.F, 6.F, 4.F, 1.F}, albedo.options());
+    auto k2 = torch::outer(k1, k1);
+    k2 = k2 / k2.sum();
+    const auto kc = k2.view({1, 1, 5, 5});
+    const auto ka = kc.expand({3, 1, 5, 5}).contiguous();
+    auto blur = [&](const torch::Tensor& x, const torch::Tensor& ker, int64_t g) {
+      return Fc::conv2d(x, ker, Fc::Conv2dFuncOptions().padding(2).groups(g));
+    };
+    auto a = albedo.t().reshape({1, 3, T, T}).contiguous();  // [1,3,T,T]
+    const auto hi = (conf > 0.5F * conf.mean()).to(albedo.dtype());  // originally-confident mask
+    auto c = conf.clone();
+    for (int it = 0; it < 16; ++it) {  // push-pull: fill holes from confident neighbours
+      const auto filled = blur(a * c, ka, 3) / blur(c, kc, 1).clamp_min(1e-6F);
+      a = a * hi + filled * (1.0F - hi);
+      c = torch::maximum(conf, blur(c, kc, 1) * (1.0F - hi) + conf * hi);
+    }
+    a = a * 0.65F + blur(a, ka, 3) * 0.35F;  // mild edge-aware smooth (de-speckle, keep pores)
+    albedo = a.reshape({3, T * T}).t().contiguous().clamp(0.0F, 1.0F);
+  }
   mask_out = valid.view({T, T});
 
   // ---- per-texel photometric normals (photometric stereo on the UV map) ----
