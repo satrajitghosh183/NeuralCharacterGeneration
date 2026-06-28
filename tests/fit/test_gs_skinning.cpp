@@ -1,6 +1,7 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <ncg/fit/fit_avatar.hpp>
+#include <ncg/fit/splat_bind.hpp>
 #include <ncg/recon/gaussian_model.hpp>
 
 #include <torch/torch.h>
@@ -83,4 +84,42 @@ TEST_CASE("GS skinning: exported top-4 bone weights reproduce deform_avatar exac
   REQUIRE(perr < 1e-5);  // exact: ≤4 influences means top-4 loses nothing
   // Orientations stay unit and consistent between the two paths.
   REQUIRE(torch::allclose(engine.positions, ground.positions, 1e-4, 1e-4));
+}
+
+// FREE-SPLAT extension (Phase C / anti-swim): densified Layer-2 splats are NOT 1:1 with verts — they
+// sit off the surface and bind to their top-k nearest mesh verts (bind_splats_knn), skinning by the
+// BLENDED transform of those verts. This must TRACK the mesh under pose, not swim. We drive a small
+// "motion clip" (several random pose transform-sets) and assert the swim metric (blend-then-apply vs
+// apply-then-blend LBS error) stays ≪ the motion scale at every frame.
+TEST_CASE("GS skinning: k-NN free splats track the mesh under a motion clip (anti-swim)", "[fit][skin]") {
+  torch::manual_seed(1);
+  const auto o = at::TensorOptions().dtype(at::kFloat).device(at::kCPU);
+  const int64_t J = 24, V = 400;
+
+  // A smooth-ish body mesh patch + sparse LBS (≤4 influences/vert).
+  const auto verts = torch::randn({V, 3}, o) * 0.3;
+  auto lbs = torch::zeros({V, J}, o);
+  for (int64_t v = 0; v < V; ++v) {
+    const int k = 1 + static_cast<int>(torch::randint(0, 4, {1}, at::kLong).item<int64_t>());
+    auto perm = torch::randperm(J, at::kLong).slice(0, 0, k);
+    auto w = torch::rand({k}, o);
+    w = w / w.sum();
+    for (int t = 0; t < k; ++t) lbs[v][perm[t].item<int64_t>()] = w[t];
+  }
+  // Free splats: just OFF the surface (densified children land near, not on, verts).
+  const auto centers = verts.index_select(0, torch::randint(0, V, {V}, at::kLong)) +
+                       torch::randn({V, 3}, o) * 0.015F;  // ~1.5cm off
+  const auto bind = ncg::fit::bind_splats_knn(centers, verts, /*k=*/4);
+  REQUIRE(bind.idx.size(1) == 4);
+  REQUIRE((bind.weight.sum(1) - 1.0).abs().max().item<float>() < 1e-5);  // weights normalized
+
+  for (int frame = 0; frame < 5; ++frame) {  // the motion clip
+    std::vector<torch::Tensor> Bs;
+    for (int64_t j = 0; j < J; ++j) Bs.push_back(rigid(o));
+    const auto B = torch::stack(Bs, 0);
+    const auto vt = torch::einsum("vj,jab->vab", {lbs, B});  // [V,4,4] per-vertex transforms
+    const double swim = ncg::fit::swim_metric(centers, verts, vt, bind);
+    INFO("frame " << frame << " swim = " << swim);
+    REQUIRE(swim < 0.02);  // ≪ the ~O(1) per-frame motion scale: free splats track, don't swim
+  }
 }
