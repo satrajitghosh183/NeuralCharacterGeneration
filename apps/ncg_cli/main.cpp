@@ -1226,6 +1226,15 @@ torch::Tensor recover_uv_albedo(const ncg::body::SmplxModel& model,
     const int nb = static_cast<int>(4 + 26 * seam);
     for (int it = 0; it < nb; ++it) a = nblur(a);
     albedo = a.reshape({3, T * T}).t().contiguous().clamp(0.0F, 1.0F);
+    // CHROMA cleanup: skin colour is spatially smooth. Heavily smooth the CHROMA (keeps luminance
+    // detail) to remove residual colour outliers (seam-edge tints, specular residue) + mildly
+    // desaturate toward neutral skin → drops saturation variance (GATE2).
+    const auto lum = albedo.mean(1).clamp_min(0.02F).view({T * T, 1});  // [T^2,1]
+    auto ch = (albedo / lum).t().reshape({1, 3, T, T}).contiguous();    // chroma ratio image
+    for (int it = 0; it < 10; ++it) ch = nblur(ch);
+    auto chf = ch.reshape({3, T * T}).t();                             // [T^2,3]
+    chf = (1.0F + (chf - 1.0F) * 0.72F);                               // mild desaturate toward neutral
+    albedo = (lum * chf).clamp(0.0F, 1.0F);
   }
 
   // ---- DETAIL TRANSFER: real high-frequency skin detail from the single SHARPEST view per texel ---
