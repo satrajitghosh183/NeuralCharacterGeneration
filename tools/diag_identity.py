@@ -56,9 +56,9 @@ def main():
     ap.add_argument("--detector", required=True); ap.add_argument("--arcface", required=True)
     ap.add_argument("--n-real", type=int, default=12)
     a = ap.parse_args()
-    dev = "cuda" if torch.cuda.is_available() else "cpu"
-    det = torch.jit.load(a.detector).eval().to(dev)
-    arc = torch.jit.load(a.arcface).eval().to(dev)
+    dev = "cpu"  # traced detector has CPU weights baked in
+    det = torch.jit.load(a.detector).eval()
+    arc = torch.jit.load(a.arcface).eval()
 
     reals = []
     for p in sorted(glob.glob(f"{a.album}/*.jpg"))[: a.n_real * 3]:
