@@ -1,5 +1,6 @@
 #include <catch2/catch_test_macros.hpp>
 
+#include <ncg/core/device.hpp>
 #include <ncg/core/tensor.hpp>
 #include <ncg/diffuse/scheduler.hpp>
 #include <ncg/diffuse/sd_guidance.hpp>
