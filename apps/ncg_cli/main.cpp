@@ -1219,13 +1219,13 @@ torch::Tensor recover_uv_albedo(const ncg::body::SmplxModel& model,
                  Fc::conv2d(vmask, kc, Fc::Conv2dFuncOptions().padding(2).groups(1)).clamp_min(1e-6F) *
                  vmask + x * (1.0F - vmask);
     };
+    // Heavily smooth to dissolve the mid-frequency seam STEPS (a frequency split can't separate a
+    // step-edge from a pore — both are broadband — so we smooth here and let the per-view DETAIL pass
+    // below re-add pores from a SINGLE view, which carries no cross-view seam).
     auto a = albedo.t().reshape({1, 3, T, T}).contiguous();
-    const auto fine = a - nblur(a);                                   // high-freq pores (1 small blur)
-    auto base = a.clone();
-    const int nb = static_cast<int>(4 + 12 * seam);                  // heavy low-pass across seams
-    for (int it = 0; it < nb; ++it) base = nblur(base);
-    a = (base + fine).clamp(0.0F, 1.0F);
-    albedo = a.reshape({3, T * T}).t().contiguous();
+    const int nb = static_cast<int>(4 + 26 * seam);
+    for (int it = 0; it < nb; ++it) a = nblur(a);
+    albedo = a.reshape({3, T * T}).t().contiguous().clamp(0.0F, 1.0F);
   }
 
   // ---- DETAIL TRANSFER: real high-frequency skin detail from the single SHARPEST view per texel ---
@@ -1260,7 +1260,7 @@ torch::Tensor recover_uv_albedo(const ncg::body::SmplxModel& model,
   {
     const auto skin = albedo.index({valid > 0.5F});                         // [P,3] valid texels
     const auto cur = skin.mean(0).clamp_min(0.05F);
-    const auto target = torch::tensor({0.76F, 0.60F, 0.52F}, albedo.options());  // warm skin ref
+    const auto target = torch::tensor({0.72F, 0.645F, 0.605F}, albedo.options());  // natural skin (chroma~0.16)
     const auto gain = (target / cur).clamp(0.6F, 1.7F);
     albedo = (albedo * gain.view({1, 3})).clamp(0.0F, 1.0F);
   }
