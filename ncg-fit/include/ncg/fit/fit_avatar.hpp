@@ -42,6 +42,9 @@ struct AvatarFitConfig {
   // Adaptive density control (off by default). Densified Gaussians inherit their parent's vertex
   // binding, so they still skin. Requires lr_position > 0 to produce a position-gradient signal.
   bool densify = false;
+  // Deviation regularizer λ_dev: pull each (free) splat toward its bound vertex's REST position so
+  // densified splats add surface detail without flying off into floaters. 0 = off (legacy).
+  double position_reg = 0.0;
   int densify_from = 500;
   int densify_until = 2500;
   int densify_every = 200;

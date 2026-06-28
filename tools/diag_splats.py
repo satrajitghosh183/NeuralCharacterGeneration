@@ -31,13 +31,14 @@ def main():
     # opacity -> probability (stored as logit in Inria convention)
     prob = 1.0 / (1.0 + np.exp(-op))
 
-    # floaters: opaque splats far from ANY mesh vertex (subsample mesh for speed)
-    vs = v[np.random.RandomState(0).choice(len(v), min(4000, len(v)), replace=False)]
-    # nearest mesh-vertex distance for opaque splats
+    # floaters: opaque splats far from ANY mesh vertex (full mesh, chunked for memory)
     opaque = xyz[prob > 0.5]
-    if len(opaque) > 20000:
-        opaque = opaque[np.random.RandomState(1).choice(len(opaque), 20000, replace=False)]
-    d2 = ((opaque[:, None, :] - vs[None, :, :]) ** 2).sum(2).min(1) ** 0.5
+    if len(opaque) > 30000:
+        opaque = opaque[np.random.RandomState(1).choice(len(opaque), 30000, replace=False)]
+    d2 = np.empty(len(opaque), np.float32)
+    for i in range(0, len(opaque), 2000):
+        ch = opaque[i:i + 2000]
+        d2[i:i + 2000] = ((ch[:, None, :] - v[None, :, :]) ** 2).sum(2).min(1) ** 0.5
     # scale: head ~0.22m → mm
     head_h = float(y.max() - np.quantile(y, args.head_q))
     mm = 0.22 / max(head_h, 1e-6) * 1000

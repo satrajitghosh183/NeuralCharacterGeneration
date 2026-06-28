@@ -226,7 +226,12 @@ AvatarFitResult fit_avatar(const body::SmplxModel& model, const Tensor& betas_in
     } else {
       l1 = torch::l1_loss(pred, tgt);
     }
-    const auto loss = (1.0 - cfg.lambda_dssim) * l1 + cfg.lambda_dssim * (1.0 - ssim(pred, tgt));
+    auto loss = (1.0 - cfg.lambda_dssim) * l1 + cfg.lambda_dssim * (1.0 - ssim(pred, tgt));
+    // Deviation regularizer (anti-floater): pull each splat toward its bound vertex's rest position.
+    if (cfg.position_reg > 0.0 && lr_pos > 0) {
+      const auto anchor = rest_verts.index_select(0, binding);  // [N,3] bound-vertex rest position
+      loss = loss + cfg.position_reg * (positions - anchor).pow(2).sum(1).mean();
+    }
     // Skip a non-finite step rather than poison Adam's moments with NaN.
     if (!std::isfinite(loss.item<double>())) {
       optimizer->zero_grad();
