@@ -1361,9 +1361,9 @@ int cmd_avatar(const ncg::app::Args& args) {
       const int T = args.get_int("uv-texture", 512);
       const auto pfx = args.get("out-prefix", "avatar");
       if (args.get_int("uv-pertexel", 0) != 0) {
-        torch::Tensor uvmask, uvnrm;
+        torch::Tensor uvmask, uvnrm, uvpos;
         const auto uvtex =
-            recover_uv_albedo(model, id_img, id_v2d, id_nrm, id_w, T, rest_v, uvmask, uvnrm);
+            recover_uv_albedo(model, id_img, id_v2d, id_nrm, id_w, T, rest_v, uvmask, uvnrm, uvpos);
         ncg::io::save_png(pfx + "_albedo_uv.png", uvtex.permute({2, 0, 1}).contiguous().detach());
         ncg::io::save_png(pfx + "_normal_uv.png", uvnrm.permute({2, 0, 1}).contiguous().detach());
       } else {
