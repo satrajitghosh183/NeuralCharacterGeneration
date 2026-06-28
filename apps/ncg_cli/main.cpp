@@ -13,6 +13,10 @@
 #include <ncg/fit/fit_avatar.hpp>
 #include <ncg/fit/fit_image.hpp>
 #include <ncg/fit/splat_bind.hpp>
+#include <ncg/diffuse/completion.hpp>
+#include <ncg/diffuse/scheduler.hpp>
+#include <ncg/diffuse/sd_guidance.hpp>
+#include <ncg/diffuse/sds.hpp>
 #include <ncg/geom/solve_geometry.hpp>
 #include <ncg/io/image.hpp>
 #include <ncg/io/npy.hpp>
@@ -1637,7 +1641,7 @@ int cmd_geom(const ncg::app::Args& args) {
   // identity. SMPL-X's β is global; face landmarks alone under-constrain it, so we FIX β here and
   // let Phase B solve only the off-subspace Δv. (--nlf optional; without it β is solved from the
   // face landmarks, kept sane by --id-ridge.)
-  torch::Tensor beta_fixed, albedo;
+  torch::Tensor beta_fixed, albedo, app_obs;
   if (args.has("nlf")) {
     const auto ndev = ncg::cuda_available() ? at::Device(at::kCUDA, 0) : at::Device(at::kCPU);
     auto nlf = ncg::body::Nlf::load(args.require("nlf"), ndev, {});
@@ -1675,7 +1679,12 @@ int cmd_geom(const ncg::app::Args& args) {
                                                 torch::stack(vis_l, 0), ic)
                    .albedo.clamp(0.0, 1.0)
                    .to(at::kCPU);
-      NCG_LOG_INFO("geom: recovered per-vertex albedo from {} views", obs_l.size());
+      // APPEARANCE observability: how confidently each vertex was actually colored by the photos
+      // (sum of per-view visibility). This is the firewall the Phase-E completion gate consumes —
+      // the appearance analog of the Phase-B geometry o(v). Saturating sum → [0,1]-ish coverage.
+      app_obs = (torch::stack(vis_l, 0).sum(0) / 3.0).clamp(0.0, 1.0).to(at::kCPU);  // [V]
+      NCG_LOG_INFO("geom: recovered per-vertex albedo from {} views ({} verts well-covered)",
+                   obs_l.size(), (app_obs > 0.5F).sum().item<int64_t>());
     }
   }
 
@@ -1709,6 +1718,10 @@ int cmd_geom(const ncg::app::Args& args) {
     // Layer 1: rigged + textured DISPLACED mesh (drives animation/physics/collision).
     ncg::mesh::write_glb_skinned(pcpu, faces, normals, albedo, joints, parents, lbs_w,
                                  prefix + "_character.glb");
+    // Save the raw identity tensors so `complete` can rebuild the cloud without re-running NLF.
+    ncg::io::save_npy(prefix + "_verts.npy", pcpu.contiguous());
+    ncg::io::save_npy(prefix + "_albedo.npy", albedo.contiguous());
+    if (app_obs.defined()) ncg::io::save_npy(prefix + "_appobs.npy", app_obs.contiguous());
     // Layer 2: free splats on the displaced mesh, k-NN bound, exported with per-splat bone skinning
     // (blend the bound verts' lbs_weights → top-4) so the engine GS component deforms them with the rig.
     const auto pvs = ncg::recon::per_vertex_scale(pcpu, 0.75F);
@@ -1754,6 +1767,122 @@ int cmd_geom(const ncg::app::Args& args) {
   rec.log_scalar("geom", "residual_px", R.residual);
   rec.log_scalar("geom", "dv_max", dvn.max().item<double>());
   rec.log_scalar("geom", "n_observed", (R.obs > 0.5F).sum().item<double>());
+  return 0;
+}
+
+// ============================================================================================
+// `complete` — PHASE E CAPSTONE. Render-consistent, observability-gated SDS completion of the
+// personalized character (docs/method.md §M10/§M11). Takes the geom outputs (verts/albedo +
+// APPEARANCE observability) + the ported SD prior, then for random novel views: renders the avatar,
+// VAE-encodes to a latent, computes the SDS gradient (the diffusion prior pulling the render toward
+// the data manifold), GATES it by the per-pixel observability (BIT-EXACT zero on well-photographed
+// surface, full on the unseen back/sides), and backprops through the differentiable VAE+renderer to
+// the splat appearance. Net effect: the unseen regions get plausible, view-consistent detail while
+// the photographed identity is never diffusion-rewritten. Exports the completed splat .ply + a
+// before/after turntable.
+// ============================================================================================
+int cmd_complete(const ncg::app::Args& args) {
+  NCG_CHECK(ncg::cuda_available(), "complete requires a CUDA device");
+  const auto device = at::Device(at::kCUDA, 0);
+  auto rec = ncg::record::Recorder::create("runs", args.get("run", "complete"));
+  const auto prefix = (rec.dir() / args.get("out-prefix", "completed")).string();
+
+  // Identity tensors from the geom run.
+  const auto verts = ncg::io::load_npy(args.require("verts")).to(device, at::kFloat);    // [V,3]
+  const auto albedo0 = ncg::io::load_npy(args.require("albedo")).to(device, at::kFloat);  // [V,3]
+  auto app_obs = ncg::io::load_npy(args.require("appobs")).to(device, at::kFloat);        // [V]
+  if (app_obs.dim() == 2) app_obs = app_obs.select(1, 0);
+  const int64_t V = verts.size(0);
+
+  // One splat per vertex; appearance (colors) is the optimized parameter, geometry stays fixed.
+  const auto pvs = ncg::recon::per_vertex_scale(verts.to(at::kCPU), 0.75).to(device);
+  auto cloud = ncg::recon::gaussians_on_body(verts, args.get_float("scale", 0.008F), albedo0, pvs);
+  cloud.colors = albedo0.clone().detach().requires_grad_(true);  // leaf parameter
+  // Per-splat observability cloud (colors = app_obs), rendered no-grad to get the per-pixel gate.
+  auto obs_cloud = cloud;
+  obs_cloud.colors = app_obs.unsqueeze(1).expand({V, 3}).contiguous();
+
+  // The ported SD prior + schedule.
+  const std::string sd = args.require("sd-dir");
+  ncg::diffuse::SdGuidanceConfig gcfg;
+  gcfg.guidance = args.get_float("guidance", 50.0F);
+  auto guide = ncg::diffuse::SdGuidance::load(sd + "/sd_unet.ts", sd + "/sd_vae.ts",
+                                              sd + "/sd_cond.safetensors", device, gcfg);
+  const ncg::diffuse::DdpmSchedule sch({}, device);
+  const auto pred = guide.predictor();
+  ncg::diffuse::SdsConfig scfg;
+  ncg::diffuse::CompletionConfig ccfg;
+  ccfg.obs_lo = args.get_float("obs-lo", 0.15F);
+  ccfg.obs_hi = args.get_float("obs-hi", 0.35F);
+
+  const int res = args.get_int("res", 512);
+  const float radius = args.get_float("radius", 2.4F);
+  const auto center = cloud.positions.mean(0);
+  torch::optim::Adam opt({cloud.colors}, torch::optim::AdamOptions(args.get_float("lr", 0.02F)));
+
+  // Front view (azimuth 0) as the identity-protection witness: it must NOT drift.
+  const auto front_cam = ncg::runtime::Camera::orbit(center, radius, 0.0F, 0.0F, 50.0F, res, res, device);
+  const auto front_before =
+      ncg::runtime::render_soft_aniso(cloud, front_cam).image.detach().clone();
+
+  const int iters = args.get_int("iters", 300);
+  for (int it = 0; it < iters; ++it) {
+    // Bias views toward the UNDER-observed back/sides (azimuth away from frontal), some elevation.
+    const float az = static_cast<float>((it * 47) % 360);
+    const float el = static_cast<float>(((it * 13) % 41) - 20);  // [-20,20] deg
+    const auto cam = ncg::runtime::Camera::orbit(center, radius, az, el, 50.0F, res, res, device);
+
+    const auto out = ncg::runtime::render_soft_aniso(cloud, cam);
+    const auto rgb = out.image.unsqueeze(0);  // [1,3,H,W], graph-connected to cloud.colors
+
+    torch::Tensor obs_latent;
+    {
+      torch::NoGradGuard ng;
+      const auto obs_img = ncg::runtime::render_soft_aniso(obs_cloud, cam).image.narrow(0, 0, 1);
+      obs_latent = torch::adaptive_avg_pool2d(obs_img.unsqueeze(0), {res / 8, res / 8});  // [1,1,h,w]
+    }
+
+    const auto latent = guide.encode_image(rgb);          // [1,4,h,w] differentiable
+    const auto r = ncg::diffuse::sds_loss(latent, sch, pred, scfg);
+    const auto gated = ncg::diffuse::apply_completion_gate(r.grad, obs_latent, ccfg);  // zero on observed
+    const auto target = (latent - gated).detach();
+    const auto loss = 0.5 * torch::nn::functional::mse_loss(
+                                latent, target,
+                                torch::nn::functional::MSELossFuncOptions().reduction(torch::kSum));
+    opt.zero_grad();
+    loss.backward();
+    opt.step();
+    {
+      torch::NoGradGuard ng;
+      cloud.colors.clamp_(0.0, 1.0);
+      cloud.colors.copy_(torch::nan_to_num(cloud.colors, 0.5, 1.0, 0.0));
+    }
+    if (it % 25 == 0) {
+      NCG_LOG_INFO("complete: iter {}/{} sds_grad_norm={:.4f}", it, iters, r.grad_norm);
+      rec.log_scalar("complete", "sds_grad_norm", r.grad_norm);
+    }
+  }
+
+  // Identity-protection witness: the frontal (well-observed) render must be ~unchanged.
+  const auto front_after = ncg::runtime::render_soft_aniso(cloud, front_cam).image.detach();
+  NCG_LOG_INFO("complete: front-view drift (observed identity) = {:.4f} (should be small)",
+               (front_after - front_before).abs().mean().item<double>());
+
+  // Export the completed splat cloud + a turntable to SEE the filled-in back/sides.
+  auto out_cloud = cloud;
+  out_cloud.colors = cloud.colors.detach();
+  ncg::mesh::write_gaussian_ply(out_cloud, prefix + "_completed.ply");
+  const int nv = args.get_int("turn", 8);
+  const auto cams =
+      ncg::runtime::orbit_trajectory(center, radius, 0.0F, nv, 50.0F, res, res, device);
+  for (int i = 0; i < nv; ++i) {
+    const auto im = ncg::runtime::render_soft_aniso(out_cloud, cams[i]).image.detach().to(at::kCPU);
+    char name[96];
+    std::snprintf(name, sizeof(name), "%s_turn%02d.png", prefix.c_str(), i);
+    ncg::io::save_png(name, im);
+  }
+  NCG_LOG_INFO("complete: wrote completed character -> {}_completed.ply + {} turntable views",
+               prefix, nv);
   return 0;
 }
 
@@ -2037,7 +2166,7 @@ int main(int argc, char** argv) {
     std::fprintf(stderr,
                  "usage: ncg_cli "
                  "<pipeline|render|turntable|select|fitimg|fit|fuse|relight|export|benchmark|"
-                 "runtime|nerf|style|avatar|face> [--flags]\n");
+                 "runtime|nerf|style|avatar|gate|geom|complete|face> [--flags]\n");
     return 2;
   }
   const std::string cmd = argv[1];
@@ -2059,6 +2188,7 @@ int main(int argc, char** argv) {
     if (cmd == "avatar") return cmd_avatar(args);
     if (cmd == "gate") return cmd_gate(args);
     if (cmd == "geom") return cmd_geom(args);
+    if (cmd == "complete") return cmd_complete(args);
     if (cmd == "face") return cmd_face(args);
     if (cmd == "nerf") return cmd_nerf(args);
     std::fprintf(stderr, "unknown command '%s'\n", cmd.c_str());
