@@ -2263,6 +2263,88 @@ int cmd_face(const ncg::app::Args& args) {
         }
         NCG_LOG_INFO("face: texture-resolution face render ({} texel splats) -> {}_face_sharp_*.png "
                      "+ shaded {}_face_lit_*.png", P, prefix, prefix);
+
+        // ---- LEARNED-PRIOR REFINEMENT: UV-texture-field SDS (task 16) ----------------------------
+        // Photoreal skin/eyes need a learned prior the analytic pipeline can't synthesize. Optimize
+        // the UV ALBEDO IMAGE (a contiguous 2D texture — SD's native, spatially-coherent domain, NOT
+        // independent per-splat colours that speckle) with the diffusion prior: render the dense
+        // texel cloud (differentiable) to near-frontal views, push the render toward the SD manifold
+        // via SDS (LOW noise = refine, not regenerate), and constrain with TV smoothness + a strong
+        // anchor to the analytic albedo so identity is preserved. Re-bake → _face_refined_*.png.
+        torch::Tensor refined_uvtex;
+        if (args.get_int("refine-sds", 0) != 0 && args.has("sd-dir")) {
+          const std::string sdd = args.require("sd-dir");
+          ncg::diffuse::SdGuidanceConfig gc;
+          gc.guidance = args.get_float("guidance", 12.0F);
+          auto guide = ncg::diffuse::SdGuidance::load(sdd + "/sd_unet.ts", sdd + "/sd_vae.ts",
+                                                      sdd + "/sd_cond.safetensors", device, gc);
+          const ncg::diffuse::DdpmSchedule sch({}, device);
+          const auto pred = guide.predictor();
+          ncg::diffuse::SdsConfig scfg;
+          scfg.t_min = 20;
+          scfg.t_max = args.get_int("refine-tmax", 550);  // cap noise: REFINE, don't regenerate
+          auto Tuv = uvtex.permute({2, 0, 1}).unsqueeze(0).contiguous().clone().detach()
+                         .requires_grad_(true);                                  // [1,3,T,T]
+          const auto Tuv0 = Tuv.detach().clone();
+          const auto vimg = uvmask.view({1, 1, T, T});
+          const auto midx = m.nonzero().squeeze(1);                              // [P] valid texels
+          torch::optim::Adam opt({Tuv}, torch::optim::AdamOptions(args.get_float("refine-lr", 0.008F)));
+          const float wA = args.get_float("refine-anchor", 5.0F);
+          const float wTV = args.get_float("refine-tv", 0.4F);
+          const int rit = args.get_int("refine-iters", 80);
+          const int64_t sub = args.get_int("refine-sub", 160000);               // texels/iter (speed)
+          for (int it = 0; it < rit; ++it) {
+            const auto colflat = Tuv.reshape({3, T * T}).t();                    // [T^2,3] diff'able
+            const auto fc_cur = colflat.index_select(0, midx);                  // [P,3]
+            torch::Tensor sel;
+            if (P > sub) sel = torch::randperm(P, midx.options()).slice(0, 0, sub);
+            else sel = torch::arange(P, midx.options());
+            ncg::recon::GaussianCloud rc;
+            rc.positions = fp.index_select(0, sel);
+            rc.colors = fc_cur.index_select(0, sel);
+            rc.scales = torch::full({sel.size(0), 3},
+                                    args.get_float("texel-scale", 0.0016F) * 1.7F, fp.options());
+            rc.opacities = torch::ones({sel.size(0), 1}, fp.options());
+            rc.rotations = torch::zeros({sel.size(0), 4}, fp.options());
+            rc.rotations.select(1, 0).fill_(1.0F);
+            const float az = static_cast<float>(((it * 37) % 61) - 30);         // [-30,30] near-front
+            const auto cam =
+                ncg::runtime::Camera::orbit(hc, 0.42F, az, 5.0F, 28.0F, 512, 512, device);
+            const auto rgb = ncg::runtime::render_soft_aniso(rc, cam).image.unsqueeze(0);
+            const auto latent = guide.encode_image(rgb);
+            const auto r = ncg::diffuse::sds_loss(latent, sch, pred, scfg);
+            const auto target = (latent - r.grad).detach();
+            const auto sds_surr = 0.5 * torch::nn::functional::mse_loss(
+                latent, target, torch::nn::functional::MSELossFuncOptions().reduction(torch::kSum));
+            const auto anchor = wA * ((Tuv - Tuv0) * vimg).pow(2).mean();
+            const auto dx = (Tuv.slice(3, 1) - Tuv.slice(3, 0, T - 1)).abs().mean();
+            const auto dy = (Tuv.slice(2, 1) - Tuv.slice(2, 0, T - 1)).abs().mean();
+            const auto loss = sds_surr + anchor + wTV * (dx + dy);
+            opt.zero_grad();
+            loss.backward();
+            opt.step();
+            {
+              torch::NoGradGuard ng;
+              Tuv.clamp_(0.0, 1.0);
+              Tuv.copy_(torch::nan_to_num(Tuv, 0.5, 1.0, 0.0));
+            }
+            if (it % 20 == 0)
+              NCG_LOG_INFO("face: refine-sds iter {}/{} sds_grad_norm={:.4f}", it, rit, r.grad_norm);
+          }
+          refined_uvtex = Tuv.squeeze(0).permute({1, 2, 0}).detach().contiguous();  // [T,T,3]
+          const auto rfc = refined_uvtex.reshape({T * T, 3}).index({m}).clamp(0.0F, 1.0F);
+          ncg::recon::GaussianCloud rcl = tc;
+          rcl.colors = rfc;
+          for (int k = 0; k < 5; ++k) {
+            const float az = -40.0F + 20.0F * static_cast<float>(k);
+            const auto cam =
+                ncg::runtime::Camera::orbit(hc, 0.42F, az, 5.0F, 28.0F, pres, pres, device);
+            char nm[36];
+            std::snprintf(nm, sizeof(nm), "_face_refined_%+03d.png", static_cast<int>(az));
+            ncg::io::save_png(prefix + nm, ncg::runtime::render_gaussians(rcl, cam).image);
+          }
+          NCG_LOG_INFO("face: SDS-refined face -> {}_face_refined_*.png", prefix);
+        }
       }
       ncg::io::save_png(prefix + "_albedo_uv.png", uvtex.permute({2, 0, 1}).contiguous().detach());
       ncg::io::save_png(prefix + "_normal_uv.png", uvnrm.permute({2, 0, 1}).contiguous().detach());
