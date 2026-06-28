@@ -1,6 +1,7 @@
 #pragma once
 
 #include <ncg/core/tensor.hpp>
+#include <ncg/diffuse/scheduler.hpp>
 #include <ncg/diffuse/sds.hpp>
 
 #include <memory>
@@ -46,6 +47,13 @@ class SdGuidance {
   // A NoisePredictor closing over the stored {cond, uncond} embeddings + guidance: runs the UNet
   // twice (uncond, cond) and CFG-combines. Drop straight into sds_loss(...).
   NoisePredictor predictor() const;
+
+  // SDEdit / img2img: encode `init_rgb` [B,3,H,W] in [0,1], add noise to timestep `strength`·T,
+  // then deterministically DDIM-denoise back to 0 (`steps` UNet evaluations with CFG). At moderate
+  // strength this keeps the input's structure/identity while pulling it onto the photoreal manifold —
+  // a STRONGER learned signal than SDS-as-loss. Returns the refined RGB [B,3,H,W] in [0,1].
+  Tensor img2img(const Tensor& init_rgb, float strength, int steps,
+                 const DdpmSchedule& schedule) const;
 
   at::Device device() const;
 

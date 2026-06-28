@@ -7,7 +7,10 @@
 #include <torch/script.h>
 #include <torch/torch.h>
 
+#include <algorithm>
+#include <cmath>
 #include <filesystem>
+#include <vector>
 
 namespace ncg::diffuse {
 
@@ -77,6 +80,42 @@ Tensor SdGuidance::decode_latent(const Tensor& latent) const {
   auto module = impl_->vae;
   const auto img = module.run_method("decode", latent / impl_->cfg.vae_scale).toTensor();
   return img.clamp(0.0, 1.0);
+}
+
+Tensor SdGuidance::img2img(const Tensor& init_rgb, float strength, int steps,
+                           const DdpmSchedule& schedule) const {
+  NCG_CHECK(impl_, "SdGuidance: not loaded");
+  NCG_CHECK(steps >= 1, "img2img: steps must be >= 1");
+  torch::NoGradGuard ng;
+  const int T = schedule.num_timesteps();
+  const int t_start = std::min(T - 1, std::max(1, static_cast<int>(strength * (T - 1))));
+  const auto abar = schedule.alphas_cumprod().to(impl_->device);  // [T]
+  const auto pred = predictor();
+
+  auto z0 = encode_image(init_rgb);                               // [B,4,h,w]
+  const auto opts_l = at::TensorOptions().dtype(at::kLong).device(impl_->device);
+
+  // Descending DDIM timestep schedule t_start -> 0.
+  std::vector<int64_t> ts;
+  ts.reserve(static_cast<size_t>(steps) + 1);
+  for (int i = 0; i < steps; ++i)
+    ts.push_back(static_cast<int64_t>(std::llround(t_start * (1.0 - static_cast<double>(i) / steps))));
+  ts.push_back(0);
+
+  // Start from z0 noised to t_start (SDEdit).
+  auto z = schedule.add_noise(z0, torch::randn_like(z0),
+                              torch::full({z0.size(0)}, ts.front(), opts_l));
+  for (size_t i = 0; i + 1 < ts.size(); ++i) {
+    const auto t = torch::full({z0.size(0)}, ts[i], opts_l);
+    const auto eps = pred(z, t);                                  // CFG noise estimate
+    const double at = abar[ts[i]].item<double>();
+    const double an = abar[ts[i + 1]].item<double>();
+    // predicted x0, then deterministic DDIM step to the next timestep (eta = 0).
+    auto z0p = (z - std::sqrt(1.0 - at) * eps) / std::sqrt(at);
+    z0p = z0p.clamp(-4.0, 4.0);
+    z = std::sqrt(an) * z0p + std::sqrt(1.0 - an) * eps;
+  }
+  return decode_latent(z);
 }
 
 NoisePredictor SdGuidance::predictor() const {

@@ -2345,6 +2345,77 @@ int cmd_face(const ncg::app::Args& args) {
           }
           NCG_LOG_INFO("face: SDS-refined face -> {}_face_refined_*.png", prefix);
         }
+
+        // ---- IMG2IMG MULTI-VIEW BAKE (task 16+): the stronger learned signal ----------------------
+        // SDS-as-loss is a weak refiner. Instead, for each of several views: render the face from the
+        // CURRENT UV texture, run SDEdit/img2img (a real DDIM denoise toward the photoreal manifold,
+        // structure-preserving at moderate strength), then BACK-PROJECT the refined pixels into the UV
+        // texture, keeping each texel's MOST-FRONTAL view (sharp, seam-free). Sequential: each view
+        // renders from the texture the previous views already refined → 3D-consistent. Bakes real
+        // skin/eye detail the analytic pipeline can't synthesize, without per-splat speckle.
+        if (args.get_int("refine-bake", 0) != 0 && args.has("sd-dir")) {
+          namespace Fn = torch::nn::functional;
+          const std::string sdd = args.require("sd-dir");
+          ncg::diffuse::SdGuidanceConfig gc;
+          gc.guidance = args.get_float("bake-guidance", 7.5F);
+          auto guide = ncg::diffuse::SdGuidance::load(sdd + "/sd_unet.ts", sdd + "/sd_vae.ts",
+                                                      sdd + "/sd_cond.safetensors", device, gc);
+          const ncg::diffuse::DdpmSchedule sch({}, device);
+          const float strength = args.get_float("bake-strength", 0.35F);
+          const int steps = args.get_int("bake-steps", 30);
+          const int br = 512;  // SD native render size for img2img
+
+          auto uvcur = uvtex.reshape({T * T, 3}).clone();          // [T^2,3] mutable texture
+          auto conf = torch::zeros({P}, fp.options());             // per-texel best frontality so far
+          const auto pidx = m.nonzero().squeeze(1);                // [P] texel flat indices
+          const std::vector<std::pair<float, float>> views = {
+              {0, 0}, {-22, 0}, {22, 0}, {0, -15}, {0, 12}, {-40, 5}, {40, 5}};
+          for (size_t vi = 0; vi < views.size(); ++vi) {
+            const float az = views[vi].first, el = views[vi].second;
+            auto rc = tc;
+            rc.colors = uvcur.index({m});                          // [P,3] current colours
+            const auto cam = ncg::runtime::Camera::orbit(hc, 0.42F, az, el, 28.0F, br, br, device);
+            const auto rendered = ncg::runtime::render_gaussians(rc, cam).image;       // [3,br,br]
+            const auto refined =
+                guide.img2img(rendered.unsqueeze(0), strength, steps, sch).squeeze(0);  // [3,br,br]
+            // Project texels into this camera + frontality from the geometric normal.
+            torch::Tensor uvp, depth;
+            cam.project(fp, uvp, depth);                           // uvp [P,2], depth [P]
+            const auto ncam = torch::matmul(fn, cam.R.t());        // normals in camera space [P,3]
+            const auto front = torch::relu(-ncam.select(1, 2)) *
+                               (depth > 0).to(fp.dtype());         // [P] frontality, in front of cam
+            const auto gx = uvp.select(1, 0) / (br - 1) * 2 - 1;
+            const auto gy = uvp.select(1, 1) / (br - 1) * 2 - 1;
+            const auto grid = torch::stack({gx, gy}, 1).view({1, P, 1, 2});
+            const auto samp = Fn::grid_sample(refined.unsqueeze(0), grid,
+                                              Fn::GridSampleFuncOptions().mode(torch::kBilinear)
+                                                  .padding_mode(torch::kZeros).align_corners(true))
+                                  .view({3, P}).t();                // [P,3] refined colour per texel
+            const auto inb = ((uvp.select(1, 0) >= 0) & (uvp.select(1, 0) <= br - 1) &
+                              (uvp.select(1, 1) >= 0) & (uvp.select(1, 1) <= br - 1))
+                                 .to(fp.dtype());
+            const auto w = front * inb;                            // [P] this view's quality
+            const auto better = (w > conf).to(fp.dtype()).unsqueeze(1);  // keep most-frontal view
+            const auto old = uvcur.index_select(0, pidx);
+            uvcur.index_copy_(0, pidx, samp * better + old * (1.0F - better));
+            conf = torch::maximum(conf, w);
+            NCG_LOG_INFO("face: bake view {}/{} (az={:.0f}) baked", vi + 1, views.size(), az);
+          }
+          const auto rfc = uvcur.index({m}).clamp(0.0F, 1.0F);
+          auto rcl = tc;
+          rcl.colors = rfc;
+          for (int k = 0; k < 5; ++k) {
+            const float az = -40.0F + 20.0F * static_cast<float>(k);
+            const auto cam =
+                ncg::runtime::Camera::orbit(hc, 0.42F, az, 5.0F, 28.0F, pres, pres, device);
+            char nm[36];
+            std::snprintf(nm, sizeof(nm), "_face_baked_%+03d.png", static_cast<int>(az));
+            ncg::io::save_png(prefix + nm, ncg::runtime::render_gaussians(rcl, cam).image);
+          }
+          ncg::io::save_png(prefix + "_albedo_baked_uv.png",
+                            uvcur.reshape({T, T, 3}).permute({2, 0, 1}).contiguous());
+          NCG_LOG_INFO("face: img2img-baked photoreal face -> {}_face_baked_*.png", prefix);
+        }
       }
       ncg::io::save_png(prefix + "_albedo_uv.png", uvtex.permute({2, 0, 1}).contiguous().detach());
       ncg::io::save_png(prefix + "_normal_uv.png", uvnrm.permute({2, 0, 1}).contiguous().detach());
