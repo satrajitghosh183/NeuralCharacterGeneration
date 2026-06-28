@@ -31,12 +31,13 @@ def render(verts, faces, uv, uvfaces, tex, res, zdir, dev):
     TEX = torch.tensor(np.asarray(tex, np.float32) / 255.0, device=dev)
 
     y = V[:, 1]
-    # Frame TIGHT on the FACE band (below the crown), not the whole skull.
-    faceband = V[(y > torch.quantile(y, 0.80)) & (y < torch.quantile(y, 0.93))]
-    c = faceband.mean(0)
-    half = float((faceband[:, 0].max() - faceband[:, 0].min())) * 0.7
-    sx = (V[:, 0] - (c[0] - half)) / (2 * half) * res
-    sy = (1.0 - (V[:, 1] - (c[1] - half)) / (2 * half)) * res
+    headv = V[y > torch.quantile(y, 0.72)]                  # whole head
+    yh0 = float(headv[:, 1].min()); yh1 = float(headv[:, 1].max())
+    cx = float(headv[:, 0].mean())
+    cy = yh0 + 0.52 * (yh1 - yh0)                           # center vertically on the face
+    half = (yh1 - yh0) * 0.60                               # frame the head height
+    sx = (V[:, 0] - (cx - half)) / (2 * half) * res
+    sy = (1.0 - (V[:, 1] - (cy - half)) / (2 * half)) * res
     depth = zdir * V[:, 2]  # larger = nearer
 
     # keep head triangles only (all 3 verts above the neck) to cut work
