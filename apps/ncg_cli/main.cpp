@@ -1682,9 +1682,14 @@ int cmd_geom(const ncg::app::Args& args) {
       // APPEARANCE observability: how confidently each vertex was actually colored by the photos
       // (sum of per-view visibility). This is the firewall the Phase-E completion gate consumes —
       // the appearance analog of the Phase-B geometry o(v). Saturating sum → [0,1]-ish coverage.
-      app_obs = (torch::stack(vis_l, 0).sum(0) / 3.0).clamp(0.0, 1.0).to(at::kCPU);  // [V]
-      NCG_LOG_INFO("geom: recovered per-vertex albedo from {} views ({} verts well-covered)",
-                   obs_l.size(), (app_obs > 0.5F).sum().item<int64_t>());
+      // Fraction of views that saw each vertex front-facing/unoccluded — discriminates the
+      // poorly-seen back/sides (→ completion) from the well-photographed front (→ frozen).
+      app_obs = torch::stack(vis_l, 0).to(at::kFloat).mean(0).clamp(0.0, 1.0).to(at::kCPU);  // [V]
+      NCG_LOG_INFO("geom: albedo from {} views; appearance coverage min/med/max={:.2f}/{:.2f}/{:.2f}"
+                   ", {} verts <0.2 (need completion)", obs_l.size(),
+                   app_obs.min().item<float>(),
+                   app_obs.median().item<float>(), app_obs.max().item<float>(),
+                   (app_obs < 0.2F).sum().item<int64_t>());
     }
   }
 
