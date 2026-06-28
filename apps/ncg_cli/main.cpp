@@ -1814,6 +1814,8 @@ int cmd_complete(const ncg::app::Args& args) {
   const auto Lap = ncg::geom::cotangent_laplacian(verts.to(at::kCPU), faces).to(device);
   const float w_anchor = args.get_float("anchor", 6.0F);   // stay near the photographed albedo
   const float w_lap = args.get_float("color-lap", 8.0F);   // spatial smoothness on splat colours
+  const int diffuse_steps = args.get_int("diffuse", 2);    // explicit heat-smoothing steps / iter
+  const float diffuse_mu = args.get_float("diffuse-mu", 0.2F);
 
   // The ported SD prior + schedule.
   const std::string sd = args.require("sd-dir");
@@ -1874,6 +1876,14 @@ int cmd_complete(const ncg::app::Args& args) {
       torch::NoGradGuard ng;
       cloud.colors.clamp_(0.0, 1.0);
       cloud.colors.copy_(torch::nan_to_num(cloud.colors, 0.5, 1.0, 0.0));
+      // Explicit mesh heat-diffusion projection: directly removes the per-splat high-frequency
+      // speckle SDS injects each step (gradient-domain smoothness alone can't keep up with it).
+      for (int s = 0; s < diffuse_steps; ++s) {
+        const auto Lc2 = Lap.is_sparse() ? torch::mm(Lap, cloud.colors)
+                                         : torch::matmul(Lap, cloud.colors);
+        cloud.colors.add_(Lc2, -diffuse_mu);
+        cloud.colors.clamp_(0.0, 1.0);
+      }
     }
     if (it % 25 == 0) {
       NCG_LOG_INFO("complete: iter {}/{} sds_grad_norm={:.4f}", it, iters, r.grad_norm);
