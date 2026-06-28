@@ -2234,7 +2234,7 @@ int cmd_face(const ncg::app::Args& args) {
         ncg::recon::GaussianCloud tc;
         tc.positions = fp;
         tc.colors = fc;
-        tc.scales = torch::full({P, 3}, args.get_float("texel-scale", 0.0016F), fp.options());
+        tc.scales = torch::full({P, 3}, args.get_float("texel-scale", 0.0010F), fp.options());
         tc.opacities = torch::ones({P, 1}, fp.options());
         tc.rotations = torch::zeros({P, 4}, fp.options());
         tc.rotations.select(1, 0).fill_(1.0F);  // identity quaternion (w,x,y,z)
@@ -2303,7 +2303,7 @@ int cmd_face(const ncg::app::Args& args) {
             rc.positions = fp.index_select(0, sel);
             rc.colors = fc_cur.index_select(0, sel);
             rc.scales = torch::full({sel.size(0), 3},
-                                    args.get_float("texel-scale", 0.0016F) * 1.7F, fp.options());
+                                    args.get_float("texel-scale", 0.0010F) * 1.7F, fp.options());
             rc.opacities = torch::ones({sel.size(0), 1}, fp.options());
             rc.rotations = torch::zeros({sel.size(0), 4}, fp.options());
             rc.rotations.select(1, 0).fill_(1.0F);
