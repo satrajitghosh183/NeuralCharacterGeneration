@@ -1211,6 +1211,17 @@ torch::Tensor recover_uv_albedo(const ncg::body::SmplxModel& model,
     albedo = (albedo + detail_weight * detail * bestw).clamp(0.0F, 1.0F);    // broadcast to 3 ch
   }
 
+  // WHITE BALANCE: casual indoor/shade photos leave a cool (blue) cast that survives delighting → the
+  // skin reads purple-grey. Gray-world the texture toward a natural warm skin reference so the tone is
+  // right (bounded gain; only shifts global colour — identity/detail/luminance untouched).
+  {
+    const auto skin = albedo.index({valid > 0.5F});                         // [P,3] valid texels
+    const auto cur = skin.mean(0).clamp_min(0.05F);
+    const auto target = torch::tensor({0.76F, 0.60F, 0.52F}, albedo.options());  // warm skin ref
+    const auto gain = (target / cur).clamp(0.6F, 1.7F);
+    albedo = (albedo * gain.view({1, 3})).clamp(0.0F, 1.0F);
+  }
+
   // Per-texel 3D surface position (barycentric on the rest mesh) — lets the caller render a
   // TEXTURE-RESOLUTION point cloud (one splat per texel) instead of a vertex-count-limited one.
   pos_out = (rest_verts.to(device).index_select(0, geomv).reshape({TT, 3, 3}) * bary.unsqueeze(2))
