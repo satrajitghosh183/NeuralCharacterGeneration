@@ -31,11 +31,10 @@ def render(verts, faces, uv, uvfaces, tex, res, zdir, dev):
     TEX = torch.tensor(np.asarray(tex, np.float32) / 255.0, device=dev)
 
     y = V[:, 1]
-    headv = V[y > torch.quantile(y, 0.80)]
-    c = headv.mean(0)
-    ext = (headv - c).abs().max(0).values
-    half = float(max(ext[0], ext[1])) * 1.15
-    # orthographic screen coords
+    # Frame TIGHT on the FACE band (below the crown), not the whole skull.
+    faceband = V[(y > torch.quantile(y, 0.80)) & (y < torch.quantile(y, 0.93))]
+    c = faceband.mean(0)
+    half = float((faceband[:, 0].max() - faceband[:, 0].min())) * 0.7
     sx = (V[:, 0] - (c[0] - half)) / (2 * half) * res
     sy = (1.0 - (V[:, 1] - (c[1] - half)) / (2 * half)) * res
     depth = zdir * V[:, 2]  # larger = nearer
@@ -51,15 +50,15 @@ def render(verts, faces, uv, uvfaces, tex, res, zdir, dev):
     # face normals (for shading) in world space
     n = torch.cross(V[b] - V[a], V[cc] - V[a], dim=1)
     n = n / n.norm(dim=1, keepdim=True).clamp_min(1e-8)
-    shade = (0.55 + 0.45 * (zdir * n[:, 2]).clamp(0, 1))  # frontal Lambertian-ish
+    facing = zdir * n[:, 2]                                 # >0 => triangle faces the camera
+    shade = (0.5 + 0.5 * facing.clamp(0, 1))               # frontal Lambertian-ish
 
     img = torch.zeros(res, res, 3, device=dev)
     zbuf = torch.full((res, res), -1e9, device=dev)
     area = (pb[:, 0] - pa[:, 0]) * (pc[:, 1] - pa[:, 1]) - (pb[:, 1] - pa[:, 1]) * (pc[:, 0] - pa[:, 0])
-    front = (area * zdir) if False else area  # keep all; sign handles winding below
     for i in range(F.shape[0]):
         A = area[i]
-        if abs(A.item()) < 1e-6:
+        if abs(A.item()) < 1e-6 or facing[i].item() <= 0.05:  # backface cull
             continue
         x0 = int(max(0, torch.floor(torch.min(torch.stack([pa[i, 0], pb[i, 0], pc[i, 0]]))).item()))
         x1 = int(min(res - 1, torch.ceil(torch.max(torch.stack([pa[i, 0], pb[i, 0], pc[i, 0]]))).item()))
@@ -104,15 +103,10 @@ def main():
     uvfaces = np.load(f"{d}/{args.prefix}_uvfaces.npy").astype(np.int64)
     tex = Image.open(f"{d}/{args.tex}").convert("RGB")
     dev = "cuda" if torch.cuda.is_available() else "cpu"
-    # pick facing side by brightness
-    best = None
-    for zdir in (1.0, -1.0):
+    for zdir, nm in ((1.0, "zpos"), (-1.0, "zneg")):
         im = render(verts, faces, uv, uvfaces, tex, args.res, zdir, dev)
-        b = im.mean()
-        if best is None or b > best[0]:
-            best = (b, im, zdir)
-    Image.fromarray(best[1]).save(f"{args.out}_front.png")
-    print(f"[raster] front zdir={best[2]} -> {args.out}_front.png")
+        Image.fromarray(im).save(f"{args.out}_{nm}.png")
+        print(f"[raster] {nm} (cover={float((im.mean(2)>8).mean()):.2f}) -> {args.out}_{nm}.png")
 
 
 if __name__ == "__main__":
