@@ -1807,10 +1807,18 @@ int cmd_complete(const ncg::app::Args& args) {
   auto obs_cloud = cloud;
   obs_cloud.colors = app_obs.unsqueeze(1).expand({V, 3}).contiguous();
 
+  // Spatial coherence prior: a cotangent Laplacian on the mesh so neighbouring splats keep similar
+  // colour — without it, SDS drives each splat independently into rainbow high-frequency noise.
+  const auto faces = ncg::io::SafeTensors::open(args.require("smplx"))
+                         .view("faces").clone().to(at::kLong);
+  const auto Lap = ncg::geom::cotangent_laplacian(verts.to(at::kCPU), faces).to(device);
+  const float w_anchor = args.get_float("anchor", 6.0F);   // stay near the photographed albedo
+  const float w_lap = args.get_float("color-lap", 8.0F);   // spatial smoothness on splat colours
+
   // The ported SD prior + schedule.
   const std::string sd = args.require("sd-dir");
   ncg::diffuse::SdGuidanceConfig gcfg;
-  gcfg.guidance = args.get_float("guidance", 50.0F);
+  gcfg.guidance = args.get_float("guidance", 15.0F);
   auto guide = ncg::diffuse::SdGuidance::load(sd + "/sd_unet.ts", sd + "/sd_vae.ts",
                                               sd + "/sd_cond.safetensors", device, gcfg);
   const ncg::diffuse::DdpmSchedule sch({}, device);
@@ -1851,9 +1859,14 @@ int cmd_complete(const ncg::app::Args& args) {
     const auto r = ncg::diffuse::sds_loss(latent, sch, pred, scfg);
     const auto gated = ncg::diffuse::apply_completion_gate(r.grad, obs_latent, ccfg);  // zero on observed
     const auto target = (latent - gated).detach();
-    const auto loss = 0.5 * torch::nn::functional::mse_loss(
-                                latent, target,
-                                torch::nn::functional::MSELossFuncOptions().reduction(torch::kSum));
+    const auto sds_surrogate = 0.5 * torch::nn::functional::mse_loss(
+                                         latent, target,
+                                         torch::nn::functional::MSELossFuncOptions().reduction(torch::kSum));
+    // Regularizers keep SDS honest: anchor to the recovered albedo + Laplacian color smoothness.
+    const auto anchor = w_anchor * (cloud.colors - albedo0).pow(2).mean();
+    const auto Lc = Lap.is_sparse() ? torch::mm(Lap, cloud.colors) : torch::matmul(Lap, cloud.colors);
+    const auto smooth = w_lap * Lc.pow(2).mean();
+    const auto loss = sds_surrogate + anchor + smooth;
     opt.zero_grad();
     loss.backward();
     opt.step();
