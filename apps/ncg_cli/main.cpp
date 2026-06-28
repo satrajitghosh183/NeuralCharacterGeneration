@@ -1035,7 +1035,8 @@ torch::Tensor recover_uv_albedo(const ncg::body::SmplxModel& model,
                                 const std::vector<torch::Tensor>& nrms,
                                 const std::vector<torch::Tensor>& viss, int T,
                                 const torch::Tensor& rest_verts, torch::Tensor& mask_out,
-                                torch::Tensor& normal_out) {
+                                torch::Tensor& normal_out, torch::Tensor& pos_out,
+                                float detail_weight = 1.5F) {
   const auto device = model.uv_coords().device();
   const auto ras = ncg::recon::uv_rasterize(model.uv_coords(), model.uv_faces(), T);
   const auto face = ras.face.to(device);                              // [T^2]
@@ -1120,6 +1121,33 @@ torch::Tensor recover_uv_albedo(const ncg::body::SmplxModel& model,
     a = a * 0.65F + blur(a, ka, 3) * 0.35F;  // mild edge-aware smooth (de-speckle, keep pores)
     albedo = a.reshape({3, T * T}).t().contiguous().clamp(0.0F, 1.0F);
   }
+
+  // ---- DETAIL TRANSFER: real high-frequency skin detail from the single SHARPEST view per texel ---
+  // The averaged+cleaned base above is clean, delit and relightable — but SMOOTH (averaging across
+  // views destroys pores/edges/stubble). Recover crispness by adding the HIGH-PASS of the best view
+  // per texel (the most frontal/visible/unspecular observation). Subtracting that view's own low-pass
+  // removes its lighting, so only fine DETAIL transfers — relightability of the base is preserved.
+  if (detail_weight > 0.0F) {
+    namespace Fc = torch::nn::functional;
+    const auto Wst = torch::stack(w_l, 0);                                   // [N,T^2]
+    const auto Ost = torch::stack(obs_l, 0);                                 // [N,T^2,3]
+    const auto bestv = std::get<1>(Wst.max(0));                              // [T^2] sharpest view
+    const auto bestw = std::get<0>(Wst.max(0)).clamp(0.0F, 1.0F).unsqueeze(1);  // its confidence
+    const auto sharp = Ost.gather(0, bestv.view({1, TT, 1}).expand({1, TT, 3})).squeeze(0);  // [T^2,3]
+    auto dk1 = torch::tensor({1.F, 4.F, 6.F, 4.F, 1.F}, albedo.options());
+    auto dk2 = torch::outer(dk1, dk1);
+    dk2 = dk2 / dk2.sum();
+    const auto dka = dk2.view({1, 1, 5, 5}).expand({3, 1, 5, 5}).contiguous();
+    const auto simg = sharp.t().reshape({1, 3, T, T}).contiguous();
+    const auto sblur = Fc::conv2d(simg, dka, Fc::Conv2dFuncOptions().padding(2).groups(3));
+    const auto detail = (simg - sblur).reshape({3, T * T}).t();              // [T^2,3] high-pass
+    albedo = (albedo + detail_weight * detail * bestw).clamp(0.0F, 1.0F);
+  }
+
+  // Per-texel 3D surface position (barycentric on the rest mesh) — lets the caller render a
+  // TEXTURE-RESOLUTION point cloud (one splat per texel) instead of a vertex-count-limited one.
+  pos_out = (rest_verts.to(device).index_select(0, geomv).reshape({TT, 3, 3}) * bary.unsqueeze(2))
+                .sum(1);  // [T^2,3]
   mask_out = valid.view({T, T});
 
   // ---- per-texel photometric normals (photometric stereo on the UV map) ----
@@ -1991,7 +2019,7 @@ int cmd_face(const ncg::app::Args& args) {
   const auto model = texture ? ncg::body::SmplxModel::load(args.require("smplx"), device)
                              : ncg::body::SmplxModel::load(args.require("smplx"), at::kCPU);
   namespace Fn = torch::nn::functional;
-  const int samp_res = args.get_int("sample-res", 1024);
+  const int samp_res = args.get_int("sample-res", 2560);  // keep face detail (was 1024 → ~300px face)
   auto downscale = [&](const torch::Tensor& img) {  // -> (scaled CHW, scale factor) for per-texel
     const double s = std::min(1.0, static_cast<double>(samp_res) /
                                        static_cast<double>(std::max(img.size(1), img.size(2))));
@@ -2105,9 +2133,40 @@ int cmd_face(const ncg::app::Args& args) {
       std::vector<torch::Tensor> viss_t;  // visibility × identity trust (coherent robustness)
       for (int64_t i = 0; i < Nt; ++i)
         viss_t.push_back(vis_l[static_cast<size_t>(i)] * R.weight[i].to(device).clamp_min(0.05));
-      torch::Tensor uvmask, uvnrm;
+      torch::Tensor uvmask, uvnrm, uvpos;
       const auto uvtex =
-          recover_uv_albedo(model, uv_img, uv_v2d, nrm_l, viss_t, T, verts_dev, uvmask, uvnrm);
+          recover_uv_albedo(model, uv_img, uv_v2d, nrm_l, viss_t, T, verts_dev, uvmask, uvnrm, uvpos,
+                            args.get_float("detail", 1.5F));
+      // TEXTURE-RESOLUTION render: turn each valid UV texel into a 3D surface splat coloured by the
+      // sharp per-texel albedo. Render detail = texture resolution (T²), not the ~10⁴ vertex count —
+      // this is what actually makes the rendered face sharp (the splat portraits below were
+      // vertex-limited). Saved + rendered as the primary face view.
+      {
+        const auto m = (uvmask.reshape({T * T}) > 0.5F);
+        const auto fp = uvpos.index({m});                                // [P,3] surface points
+        const auto fc = uvtex.reshape({T * T, 3}).index({m}).clamp(0.0F, 1.0F);
+        const int64_t P = fp.size(0);
+        ncg::recon::GaussianCloud tc;
+        tc.positions = fp;
+        tc.colors = fc;
+        tc.scales = torch::full({P, 3}, args.get_float("texel-scale", 0.0016F), fp.options());
+        tc.opacities = torch::ones({P, 1}, fp.options());
+        tc.rotations = torch::zeros({P, 4}, fp.options());
+        tc.rotations.select(1, 0).fill_(1.0F);  // identity quaternion (w,x,y,z)
+        const auto hthr = torch::quantile(id_verts.select(1, 1), 0.88).item<float>();
+        const auto hmask = (id_verts.select(1, 1).to(device) > hthr).unsqueeze(1);  // [V,1]
+        const auto hc = verts_dev.masked_select(hmask).reshape({-1, 3}).mean(0);    // head centroid
+        const int pres = args.get_int("portrait-res", 768);
+        for (int k = 0; k < 5; ++k) {
+          const float az = -40.0F + 20.0F * static_cast<float>(k);
+          const auto cam = ncg::runtime::Camera::orbit(hc, 0.42F, az, 5.0F, 28.0F, pres, pres, device);
+          char nm[32];
+          std::snprintf(nm, sizeof(nm), "_face_sharp_%+03d.png", static_cast<int>(az));
+          ncg::io::save_png(prefix + nm, ncg::runtime::render_gaussians(tc, cam).image);
+        }
+        NCG_LOG_INFO("face: texture-resolution face render ({} texel splats) -> {}_face_sharp_*.png",
+                     P, prefix);
+      }
       ncg::io::save_png(prefix + "_albedo_uv.png", uvtex.permute({2, 0, 1}).contiguous().detach());
       ncg::io::save_png(prefix + "_normal_uv.png", uvnrm.permute({2, 0, 1}).contiguous().detach());
       ncg::io::save_npy(prefix + "_uvcoords.npy", model.uv_coords().to(at::kCPU).contiguous());
