@@ -1814,7 +1814,7 @@ int cmd_complete(const ncg::app::Args& args) {
   const auto Lap = ncg::geom::cotangent_laplacian(verts.to(at::kCPU), faces).to(device);
   const float w_anchor = args.get_float("anchor", 6.0F);   // stay near the photographed albedo
   const float w_lap = args.get_float("color-lap", 8.0F);   // spatial smoothness on splat colours
-  const int diffuse_steps = args.get_int("diffuse", 2);    // explicit heat-smoothing steps / iter
+  const int diffuse_steps = args.get_int("diffuse", 8);    // heat-smoothing steps on the SDS gradient
   const float diffuse_mu = args.get_float("diffuse-mu", 0.2F);
 
   // The ported SD prior + schedule.
@@ -1871,19 +1871,27 @@ int cmd_complete(const ncg::app::Args& args) {
     const auto loss = sds_surrogate + anchor + smooth;
     opt.zero_grad();
     loss.backward();
+    {
+      // SMOOTH THE UPDATE, NOT THE COLORS. SDS produces a spatially-incoherent per-splat gradient
+      // (the speckle source). Heat-diffuse the gradient on the mesh before the optimizer step so
+      // only LOW-FREQUENCY, coherent colour changes are applied — the original photographed albedo
+      // detail is untouched (we never smooth the colours themselves), but speckle can't accumulate.
+      torch::NoGradGuard ng;
+      auto g = cloud.colors.mutable_grad();
+      if (g.defined()) {
+        g = torch::nan_to_num(g, 0.0, 0.0, 0.0);
+        for (int s = 0; s < diffuse_steps; ++s) {
+          const auto Lg = Lap.is_sparse() ? torch::mm(Lap, g) : torch::matmul(Lap, g);
+          g.add_(Lg, -diffuse_mu);  // heat diffusion on the gradient field
+        }
+        cloud.colors.mutable_grad().copy_(g);
+      }
+    }
     opt.step();
     {
       torch::NoGradGuard ng;
       cloud.colors.clamp_(0.0, 1.0);
       cloud.colors.copy_(torch::nan_to_num(cloud.colors, 0.5, 1.0, 0.0));
-      // Explicit mesh heat-diffusion projection: directly removes the per-splat high-frequency
-      // speckle SDS injects each step (gradient-domain smoothness alone can't keep up with it).
-      for (int s = 0; s < diffuse_steps; ++s) {
-        const auto Lc2 = Lap.is_sparse() ? torch::mm(Lap, cloud.colors)
-                                         : torch::matmul(Lap, cloud.colors);
-        cloud.colors.add_(Lc2, -diffuse_mu);
-        cloud.colors.clamp_(0.0, 1.0);
-      }
     }
     if (it % 25 == 0) {
       NCG_LOG_INFO("complete: iter {}/{} sds_grad_norm={:.4f}", it, iters, r.grad_norm);
