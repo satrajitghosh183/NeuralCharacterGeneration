@@ -1749,11 +1749,13 @@ int cmd_geom(const ncg::app::Args& args) {
   // let Phase B solve only the off-subspace Δv. (--nlf optional; without it β is solved from the
   // face landmarks, kept sane by --id-ridge.)
   torch::Tensor beta_fixed, albedo, app_obs;
+  std::vector<torch::Tensor> nrm_l, vis_l, uv_img, uv_v2d;  // hoisted for the per-texel UV texture
+  const auto ndev = ncg::cuda_available() ? at::Device(at::kCUDA, 0) : at::Device(at::kCPU);
   if (args.has("nlf")) {
-    const auto ndev = ncg::cuda_available() ? at::Device(at::kCUDA, 0) : at::Device(at::kCPU);
     auto nlf = ncg::body::Nlf::load(args.require("nlf"), ndev, {});
     const auto faces_cpu = faces.to(at::kCPU);
-    std::vector<torch::Tensor> betas, obs_l, nrm_l, vis_l;  // betas + per-photo appearance (texture)
+    const int sr = args.get_int("sample-res", 2560);
+    std::vector<torch::Tensor> betas, obs_l;
     for (const auto& b : bundles) {
       if (!b.usable) continue;
       torch::Tensor img;
@@ -1769,6 +1771,13 @@ int cmd_geom(const ncg::app::Args& args) {
       vis_l.push_back(ncg::recon::vertex_visibility(v2d, pred.vertices3d.select(1, 2).to(ndev),
                                                     static_cast<int64_t>(img.size(1)),
                                                     static_cast<int64_t>(img.size(2))));
+      // downscaled image + scaled v2d for the high-res per-texel UV texture (the sharp face path).
+      const double s = std::min(1.0, static_cast<double>(sr) / std::max(img.size(1), img.size(2)));
+      uv_img.push_back(torch::nn::functional::interpolate(
+          img.unsqueeze(0), torch::nn::functional::InterpolateFuncOptions()
+                                .scale_factor(std::vector<double>{s, s})
+                                .mode(torch::kBilinear).align_corners(false)).squeeze(0));
+      uv_v2d.push_back(v2d * static_cast<float>(s));
     }
     if (!betas.empty()) {
       const auto bavg = std::get<0>(torch::stack(betas, 0).median(0)).to(at::kFloat);  // robust avg
@@ -1830,6 +1839,32 @@ int cmd_geom(const ncg::app::Args& args) {
     // Layer 1: rigged + textured DISPLACED mesh (drives animation/physics/collision).
     ncg::mesh::write_glb_skinned(pcpu, faces, normals, albedo, joints, parents, lbs_w,
                                  prefix + "_character.glb");
+    // Layer 1b: SHARP + white-balanced UV-textured version (the improved face pipeline on the FULL
+    // body) — pore-level per-texel albedo + photometric normal map instead of per-vertex colour.
+    if (ncg::cuda_available() && !uv_img.empty()) {
+      try {
+        auto smodel = ncg::body::SmplxModel::load(args.require("smplx"), ndev);
+        if (smodel.has_uv()) {
+          const int T = args.get_int("tex-res", 1024);
+          torch::Tensor uvmask, uvnrm, uvpos, uvgn;
+          const auto uvtex = recover_uv_albedo(
+              smodel, uv_img, uv_v2d, nrm_l, vis_l, T, pers.to(ndev), uvmask, uvnrm, uvpos, uvgn,
+              args.get_float("detail", 0.7F), args.get_float("deshade", 0.5F),
+              args.get_float("chroma", 0.6F));
+          ncg::io::save_png(prefix + "_albedo_uv.png", uvtex.permute({2, 0, 1}).contiguous().detach());
+          ncg::io::save_png(prefix + "_normal_uv.png", uvnrm.permute({2, 0, 1}).contiguous().detach());
+          ncg::io::save_npy(prefix + "_uvcoords.npy", smodel.uv_coords().to(at::kCPU).contiguous());
+          ncg::io::save_npy(prefix + "_uvfaces.npy", smodel.uv_faces().to(at::kInt).contiguous());
+          ncg::mesh::write_glb_textured(pcpu, faces, normals, smodel.uv_coords(), smodel.uv_faces(),
+                                        joints, parents, lbs_w, prefix + "_albedo_uv.png",
+                                        prefix + "_char_textured.glb", prefix + "_normal_uv.png");
+          NCG_LOG_INFO("geom: SHARP UV-textured character -> {}_char_textured.glb (+ _albedo_uv.png)",
+                       prefix);
+        }
+      } catch (const std::exception& e) {
+        NCG_LOG_WARN("geom: textured export skipped ({})", e.what());
+      }
+    }
     // Save the raw identity tensors so `complete` can rebuild the cloud without re-running NLF.
     ncg::io::save_npy(prefix + "_verts.npy", pcpu.contiguous());
     ncg::io::save_npy(prefix + "_albedo.npy", albedo.contiguous());
