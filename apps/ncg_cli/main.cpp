@@ -2370,13 +2370,18 @@ int cmd_face(const ncg::app::Args& args) {
           auto uvcur = uvtex.reshape({T * T, 3}).clone();          // [T^2,3] mutable texture
           auto conf = torch::zeros({P}, fp.options());             // per-texel best frontality so far
           const auto pidx = m.nonzero().squeeze(1);                // [P] texel flat indices
+          // Frame TIGHT on the face centroid (not the head top) so the face fills the 512 SD frame —
+          // SD then resolves fine skin detail instead of smoothing a small face in a big frame.
+          const auto face_c = fp.mean(0);
+          const float brad = args.get_float("bake-radius", 0.30F);
+          const float bfov = args.get_float("bake-fov", 24.0F);
           const std::vector<std::pair<float, float>> views = {
               {0, 0}, {-22, 0}, {22, 0}, {0, -15}, {0, 12}, {-40, 5}, {40, 5}};
           for (size_t vi = 0; vi < views.size(); ++vi) {
             const float az = views[vi].first, el = views[vi].second;
             auto rc = tc;
             rc.colors = uvcur.index({m});                          // [P,3] current colours
-            const auto cam = ncg::runtime::Camera::orbit(hc, 0.42F, az, el, 28.0F, br, br, device);
+            const auto cam = ncg::runtime::Camera::orbit(face_c, brad, az, el, bfov, br, br, device);
             const auto rendered = ncg::runtime::render_gaussians(rc, cam).image;       // [3,br,br]
             // Project texels into this camera + frontality from the geometric normal.
             torch::Tensor uvp, depth;
