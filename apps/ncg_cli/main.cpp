@@ -2415,6 +2415,21 @@ int cmd_face(const ncg::app::Args& args) {
             conf = torch::maximum(conf, w);
             NCG_LOG_INFO("face: bake view {}/{} (az={:.0f}) baked", vi + 1, views.size(), az);
           }
+          // BEST OF BOTH: keep the ControlNet's clean, even, photoreal skin as the base, and re-inject
+          // the ANALYTIC texture's identity-specific high-frequency LUMINANCE detail (the real pores
+          // /edges from the photos that diffusion smoothed away). Clean skin tone + your micro-detail.
+          const float bdw = args.get_float("bake-detail", 0.9F);
+          if (bdw > 0.0F) {
+            namespace Fb = torch::nn::functional;
+            auto bk1 = torch::tensor({1.F, 4.F, 6.F, 4.F, 1.F}, uvcur.options());
+            auto bk2 = torch::outer(bk1, bk1);
+            bk2 = bk2 / bk2.sum();
+            const auto bk = bk2.view({1, 1, 5, 5});
+            const auto olum = uvtex.reshape({T * T, 3}).mean(1).reshape({1, 1, T, T});  // analytic lum
+            const auto oblur = Fb::conv2d(olum, bk, Fb::Conv2dFuncOptions().padding(2));
+            const auto detail = (olum - oblur).reshape({T * T, 1});                     // identity hi-freq
+            uvcur = (uvcur + bdw * detail).clamp(0.0F, 1.0F);                            // onto clean base
+          }
           const auto rfc = uvcur.index({m}).clamp(0.0F, 1.0F);
           auto rcl = tc;
           rcl.colors = rfc;
