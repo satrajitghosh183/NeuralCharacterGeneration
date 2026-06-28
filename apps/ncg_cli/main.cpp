@@ -1147,39 +1147,40 @@ torch::Tensor recover_uv_albedo(const ncg::body::SmplxModel& model,
     albedo = (albedo * gain.view({T * T, 1})).clamp(0.0F, 1.0F);
   }
 
-  // ---- CHROMA SMOOTHING: kill green/magenta patches from per-photo white-balance inconsistency ----
-  // Real skin COLOUR is spatially smooth; only LUMINANCE carries high-frequency detail (pores, hair).
-  // Fusing photos with different white balance leaves high-freq CHROMA noise (the coloured blotches).
-  // Decompose into luminance × chroma, heavily low-pass ONLY the chroma (over the valid UV region),
-  // recombine. Detail and shading-flattened luminance are untouched; the colour becomes natural.
+  // ---- ROBUST PER-TEXEL CHROMA from a MEDIAN across views (kills WB-outlier colour patches) --------
+  // The green/magenta patches are LOW-freq colour outliers: a rarely-seen texel gets its colour from
+  // one or two bad-white-balance photos, and weighted-MEAN fusion can't reject them. Skin colour is
+  // smooth, so recover each texel's chroma as the MEDIAN of its per-view chromas (robust to a minority
+  // of outlier photos) — preserving REGIONAL skin tone (no graying) while rejecting the bad views.
+  // Keep the (detailed, deshaded) luminance; only the colour is replaced.
   if (chroma > 0.0F) {
     namespace Fc = torch::nn::functional;
+    const auto O = torch::stack(obs_l, 0);                                  // [N,T^2,3] per-view RGB
+    const auto Wn = torch::stack(w_l, 0);                                   // [N,T^2] per-view weight
+    const auto Ol = O.mean(2, true).clamp_min(0.02F);                       // [N,T^2,1] per-view lum
+    auto Oc = O / Ol;                                                       // [N,T^2,3] per-view chroma
+    // Neutralize low-visibility views (which sample background/grazing) so they can't skew the median:
+    // replace their chroma with the per-texel weighted-mean chroma.
+    const auto wmean = (Wn.unsqueeze(2) * Oc).sum(0) /
+                       Wn.sum(0).clamp_min(1e-6F).unsqueeze(1);            // [T^2,3]
+    const auto good = (Wn > 0.2F).unsqueeze(2);                            // [N,T^2,1]
+    Oc = torch::where(good, Oc, wmean.unsqueeze(0).expand_as(Oc));
+    auto chs = std::get<0>(Oc.median(0));                                   // [T^2,3] robust chroma
+    // light spatial smooth of the chroma to remove residual speckle (colour is smooth anyway).
     auto ck1 = torch::tensor({1.F, 4.F, 6.F, 4.F, 1.F}, albedo.options());
     auto ck2 = torch::outer(ck1, ck1);
     ck2 = ck2 / ck2.sum();
+    const auto ckc = ck2.view({1, 1, 5, 5}).expand({3, 1, 5, 5}).contiguous();
     const auto ck = ck2.view({1, 1, 5, 5});
-    const auto ckc = ck.expand({3, 1, 5, 5}).contiguous();
-    auto cblur1 = [&](const torch::Tensor& x, const torch::Tensor& kk, int64_t g) {
-      return Fc::conv2d(x, kk, Fc::Conv2dFuncOptions().padding(2).groups(g));
-    };
     const auto vmask = valid.view({1, 1, T, T});
-    const auto lum = albedo.mean(1).clamp_min(0.02F).view({T * T, 1});      // [T^2,1]
-    const auto chr = (albedo / lum);                                        // [T^2,3] chroma ratio
-    auto cimg = chr.t().reshape({1, 3, T, T}).contiguous();
-    const auto iters = static_cast<int>(8 + 24 * chroma);
-    for (int it = 0; it < iters; ++it)                                      // big low-pass on chroma
-      cimg = cblur1(cimg * vmask, ckc, 3) / cblur1(vmask, ck, 1).clamp_min(1e-6F) * vmask +
+    auto cimg = chs.t().reshape({1, 3, T, T}).contiguous();
+    for (int it = 0; it < 6; ++it)
+      cimg = Fc::conv2d(cimg * vmask, ckc, Fc::Conv2dFuncOptions().padding(2).groups(3)) /
+                 Fc::conv2d(vmask, ck, Fc::Conv2dFuncOptions().padding(2).groups(1)).clamp_min(1e-6F) *
+                 vmask +
              cimg * (1.0F - vmask);
-    auto chs = cimg.reshape({3, T * T}).t();                                // [T^2,3] smooth chroma
-    // ROBUST OUTLIER REJECTION: green/magenta patches are LOW-freq colour outliers (a few bad-WB
-    // photos colouring rarely-seen texels) — smoothing can't fix them. Skin is essentially ONE hue,
-    // so pull texels whose chroma deviates from the global MEDIAN skin chroma toward it; texels near
-    // the median (normal skin variation — redness, freckles) are kept.
-    const auto vsel = (valid > 0.5F);
-    const auto med = std::get<0>((chs.index({vsel})).median(0)).view({1, 3});  // [1,3] skin chroma
-    const auto dev = (chs - med).norm(2, 1, true);                          // [T^2,1] deviation
-    const auto wout = torch::sigmoid((dev - 0.10F) * 30.0F);                // 1 where colour-outlier
-    chs = chs * (1.0F - wout) + med * wout;                                 // pull outliers to skin
+    chs = cimg.reshape({3, T * T}).t();
+    const auto lum = albedo.mean(1).clamp_min(0.02F).view({T * T, 1});      // [T^2,1] keep luminance
     albedo = (lum * chs).clamp(0.0F, 1.0F);
   }
 
