@@ -55,6 +55,13 @@ class SdGuidance {
   Tensor img2img(const Tensor& init_rgb, float strength, int steps,
                  const DdpmSchedule& schedule) const;
 
+  // GEOMETRY-CONDITIONED img2img: identical DDIM/SDEdit, but the UNet module is a ControlNet+UNet
+  // (control_unet.ts) and every denoise step is conditioned on `control_rgb` [B,3,H,W] in [0,1] — the
+  // rendered NORMAL map of the face. The diffusion stays locked to the surface, so it adds photoreal
+  // skin detail WITHOUT drifting off identity or seaming across views (the failure of plain img2img).
+  Tensor img2img_control(const Tensor& init_rgb, const Tensor& control_rgb, float strength, int steps,
+                         const DdpmSchedule& schedule) const;
+
   at::Device device() const;
 
   SdGuidance();

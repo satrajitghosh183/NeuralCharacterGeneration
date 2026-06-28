@@ -2358,8 +2358,10 @@ int cmd_face(const ncg::app::Args& args) {
           const std::string sdd = args.require("sd-dir");
           ncg::diffuse::SdGuidanceConfig gc;
           gc.guidance = args.get_float("bake-guidance", 7.5F);
-          auto guide = ncg::diffuse::SdGuidance::load(sdd + "/sd_unet.ts", sdd + "/sd_vae.ts",
-                                                      sdd + "/sd_cond.safetensors", device, gc);
+          const bool ctrl = args.get_int("bake-control", 0) != 0;  // geometry-conditioned (ControlNet)
+          auto guide = ncg::diffuse::SdGuidance::load(
+              sdd + (ctrl ? "/control_unet.ts" : "/sd_unet.ts"), sdd + "/sd_vae.ts",
+              sdd + "/sd_cond.safetensors", device, gc);
           const ncg::diffuse::DdpmSchedule sch({}, device);
           const float strength = args.get_float("bake-strength", 0.35F);
           const int steps = args.get_int("bake-steps", 30);
@@ -2376,12 +2378,24 @@ int cmd_face(const ncg::app::Args& args) {
             rc.colors = uvcur.index({m});                          // [P,3] current colours
             const auto cam = ncg::runtime::Camera::orbit(hc, 0.42F, az, el, 28.0F, br, br, device);
             const auto rendered = ncg::runtime::render_gaussians(rc, cam).image;       // [3,br,br]
-            const auto refined =
-                guide.img2img(rendered.unsqueeze(0), strength, steps, sch).squeeze(0);  // [3,br,br]
             // Project texels into this camera + frontality from the geometric normal.
             torch::Tensor uvp, depth;
             cam.project(fp, uvp, depth);                           // uvp [P,2], depth [P]
             const auto ncam = torch::matmul(fn, cam.R.t());        // normals in camera space [P,3]
+            torch::Tensor refined;
+            if (ctrl) {
+              // Render a NORMAL MAP of this view to condition the ControlNet (locks diffusion to the
+              // face surface → photoreal detail without drift/seams). Normal-as-colour, flip to the
+              // normal-map convention (camera +z toward scene → outward normal has -z).
+              auto nrc = rc;
+              nrc.colors = (torch::stack({ncam.select(1, 0), -ncam.select(1, 1), -ncam.select(1, 2)}, 1)
+                                * 0.5F + 0.5F).clamp(0.0F, 1.0F);
+              const auto nmap = ncg::runtime::render_gaussians(nrc, cam).image;        // [3,br,br]
+              refined = guide.img2img_control(rendered.unsqueeze(0), nmap.unsqueeze(0), strength,
+                                              steps, sch).squeeze(0);
+            } else {
+              refined = guide.img2img(rendered.unsqueeze(0), strength, steps, sch).squeeze(0);
+            }
             const auto front = torch::relu(-ncam.select(1, 2)) *
                                (depth > 0).to(fp.dtype());         // [P] frontality, in front of cam
             const auto gx = uvp.select(1, 0) / (br - 1) * 2 - 1;
