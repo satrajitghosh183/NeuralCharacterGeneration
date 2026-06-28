@@ -40,8 +40,8 @@ def embed(img01, det, arc, dev):  # img01 [3,H,W] cuda
     grid = torch.tensor(np.stack([gx, gy], -1)[None], dtype=torch.float32, device=dev)
     crop = F.grid_sample(img01[None], grid, align_corners=True)  # [1,3,112,112]
     with torch.no_grad():
-        e = arc((crop * 2 - 1))
-    return F.normalize(e, dim=1).cpu().numpy()[0]
+        e = arc((crop * 2 - 1)).reshape(-1)
+    return (e / e.norm().clamp_min(1e-9)).cpu().numpy()
 
 
 def load01(p, dev):
