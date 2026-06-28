@@ -1113,22 +1113,40 @@ torch::Tensor recover_uv_albedo(const ncg::body::SmplxModel& model,
       eqg = g.view({Nph, 1, 3});
     }
     O = (O * eqg).clamp(0.0F, 2.0F);
-    const double va = shared_var(O);
-    NCG_LOG_INFO("equalize(GATE1): shared-texel var {:.6f} -> {:.6f} ({:.2f}x)", vb, va,
-                 vb / std::max(va, 1e-12));
+    NCG_LOG_INFO("equalize-gain: shared-texel var {:.6f} -> {:.6f} ({:.2f}x global exposure/WB)", vb,
+                 shared_var(O), vb / std::max(shared_var(O), 1e-12));
     for (int64_t i = 0; i < Nph; ++i) obs_l[static_cast<size_t>(i)] = O[i].contiguous();
   }
-  // ============ STEP 2: robust per-texel MEDIAN merge (rejects the residual specular/occluded view a
-  // mean smears in). solve_inverse_render is kept ONLY for the per-view lights → photometric normals.
+  // ============ STEP 2: per-photo SH DELIGHT (removes the SPATIALLY-VARYING lighting that a global gain
+  // can't — shadows/highlights) + robust per-texel MEDIAN merge. solve_inverse_render gives per-view
+  // lights; divide each view by its SH shading → delit observations that agree across photos; the
+  // MEDIAN of those rejects the residual specular/occluded outlier a mean would smear in.
   ncg::recon::InverseRenderConfig ic;
-  ic.iterations = 60;
+  ic.iterations = 80;
   ic.robust = true;
-  const auto ir = ncg::recon::solve_inverse_render(O, torch::stack(nrm_l, 0), W, ic);  // lights→normals
+  const auto Nrm = torch::stack(nrm_l, 0);                                        // [N,T^2,3]
+  const auto ir = ncg::recon::solve_inverse_render(O, Nrm, W, ic);
+  const auto bb = ncg::recon::sh_basis(Nrm);                                      // [N,T^2,9]
+  const auto shd = torch::einsum("nck,ntk->ntc", {ir.lights, bb}).clamp_min(0.12F);  // [N,T^2,3]
+  const auto delit = (O / shd).clamp(0.0F, 2.0F);                                 // per-view albedo
+  {  // GATE1: cross-photo shared-skin variance, raw O vs delit (full radiometric equalization)
+    const auto Wt = W.unsqueeze(2);
+    const auto cnt2 = (((W > 0.2F).to(at::kFloat).sum(0)) >= 2.0F).to(at::kFloat).unsqueeze(1);
+    auto sv = [&](const torch::Tensor& X) {
+      const auto wm = (Wt * X).sum(0) / Wt.sum(0).clamp_min(1e-6F);
+      const auto v = (Wt * (X - wm.unsqueeze(0)).pow(2)).sum(0) / Wt.sum(0).clamp_min(1e-6F);
+      return ((v * cnt2).sum() / cnt2.sum().clamp_min(1.0F)).item<double>();
+    };
+    const double vr = sv(O), vd = sv(delit);
+    NCG_LOG_INFO("equalize(GATE1): shared-texel var raw {:.6f} -> delit {:.6f} ({:.2f}x)", vr, vd,
+                 vr / std::max(vd, 1e-12));
+  }
   torch::Tensor albedo;
-  {
+  {  // robust per-texel MEDIAN of the delit observations
     const auto good = (W > 0.2F).unsqueeze(2);                                    // [N,T^2,1]
-    const auto wmean = (W.unsqueeze(2) * O).sum(0) / W.unsqueeze(2).sum(0).clamp_min(1e-6F);
-    const auto Om = torch::where(good, O, torch::full_like(O, std::numeric_limits<float>::quiet_NaN()));
+    const auto wmean = (W.unsqueeze(2) * delit).sum(0) / W.unsqueeze(2).sum(0).clamp_min(1e-6F);
+    const auto Om = torch::where(good, delit,
+                                 torch::full_like(delit, std::numeric_limits<float>::quiet_NaN()));
     const auto med = std::get<0>(torch::nanmedian(Om, 0));                        // [T^2,3]
     albedo = torch::where(torch::isnan(med), wmean, med).clamp(0.0F, 1.0F);
   }
