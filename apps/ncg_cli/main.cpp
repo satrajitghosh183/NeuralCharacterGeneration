@@ -1724,6 +1724,26 @@ int cmd_geom(const ncg::app::Args& args) {
     ncg::mesh::write_gaussian_ply(cloud, prefix + "_character.ply", std::get<1>(t4).to(at::kLong), sw);
     NCG_LOG_INFO("geom: two-layer character -> {}_character.glb (rigged textured displaced mesh) + "
                  "{}_character.ply(+.skin) ({} k-NN-bound free splats)", prefix, prefix, cpos.size(0));
+
+    // STOP-AND-LOOK: novel-view turntable of the personalized character (needs a GPU; the solve is
+    // CPU). Render the same albedo-colored splat cloud on-device so we can eyeball the likeness.
+    if (ncg::cuda_available()) {
+      const auto dv = at::Device(at::kCUDA, 0);
+      const int res = args.get_int("res", 640);
+      auto rcloud = ncg::recon::gaussians_on_body(pcpu.to(dv), args.get_float("scale", 0.008F),
+                                                  albedo.to(dv), pvs.to(dv));
+      const int nv = args.get_int("turn", 8);
+      const auto cams = ncg::runtime::orbit_trajectory(rcloud.positions.mean(0),
+                                                       args.get_float("radius", 2.4F), 0.0F, nv,
+                                                       50.0F, res, res, dv);
+      for (int i = 0; i < nv; ++i) {
+        const auto im = ncg::runtime::render_soft_aniso(rcloud, cams[i]).image.detach().to(at::kCPU);
+        char name[96];
+        std::snprintf(name, sizeof(name), "%s_turn%02d.png", prefix.c_str(), i);
+        ncg::io::save_png(name, im);
+      }
+      NCG_LOG_INFO("geom: wrote {} turntable views -> {}_turn*.png", nv, prefix);
+    }
   }
 
   const auto dvn = R.delta_v.norm(2, 1);
