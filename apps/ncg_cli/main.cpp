@@ -1954,10 +1954,12 @@ int cmd_geom(const ncg::app::Args& args) {
             fc.lr_color = 0.0;            // FREEZE colour — preserve the clean albedo
             fc.lr_position = 2e-4;        // small position freedom (densify needs a position gradient)
             fc.densify = true;
-            fc.position_reg = args.get_float("dev-reg", 50.0F);  // anti-floater: stay near the mesh
+            fc.position_reg = args.get_float("dev-reg", 120.0F);  // anti-floater: stay near the mesh
+            fc.densify_grad = args.get_float("densify-grad", 3e-5F);  // lower → denser face
+            fc.densify_until = args.get_int("densify-iters", 1800) - 300;
             fc.per_view_exposure = true;
             fc.robust = true;
-            fc.max_gaussians = args.get_int("max-splats", 80000);
+            fc.max_gaussians = args.get_int("max-splats", 90000);
             fc.init_scale = args.get_float("scale", 0.008F);
             const auto bb = body_betas.slice(0, 0, std::min<int64_t>(body_betas.size(0),
                                                                      smodel.num_betas())).to(ndev);
