@@ -31,7 +31,7 @@ def render(verts, faces, uv, uvfaces, tex, res, zdir, dev):
     TEX = torch.tensor(np.asarray(tex, np.float32) / 255.0, device=dev)
 
     y = V[:, 1]
-    headv = V[y > torch.quantile(y, 0.63)]                  # whole head
+    headv = V[y > torch.quantile(y, 0.55)]                  # whole head
     yh0 = float(headv[:, 1].min()); yh1 = float(headv[:, 1].max())
     cx = float(headv[:, 0].mean())
     cy = yh0 + 0.46 * (yh1 - yh0)                           # center vertically on the face
@@ -41,7 +41,7 @@ def render(verts, faces, uv, uvfaces, tex, res, zdir, dev):
     depth = zdir * V[:, 2]  # larger = nearer
 
     # keep head triangles only (all 3 verts above the neck) to cut work
-    keep = (y[F] > torch.quantile(y, 0.63)).all(1)
+    keep = (y[F] > torch.quantile(y, 0.55)).all(1)
     F = F[keep]; UVF = UVF[keep]
     a, b, cc = F[:, 0], F[:, 1], F[:, 2]
     pa = torch.stack([sx[a], sy[a]], 1); pb = torch.stack([sx[b], sy[b]], 1)
@@ -59,7 +59,7 @@ def render(verts, faces, uv, uvfaces, tex, res, zdir, dev):
     area = (pb[:, 0] - pa[:, 0]) * (pc[:, 1] - pa[:, 1]) - (pb[:, 1] - pa[:, 1]) * (pc[:, 0] - pa[:, 0])
     for i in range(F.shape[0]):
         A = area[i]
-        if abs(A.item()) < 1e-6 or facing[i].item() <= 0.05:  # backface cull
+        if abs(A.item()) < 1e-6 or facing[i].item() <= -0.25:  # backface cull
             continue
         x0 = int(max(0, torch.floor(torch.min(torch.stack([pa[i, 0], pb[i, 0], pc[i, 0]]))).item()))
         x1 = int(min(res - 1, torch.ceil(torch.max(torch.stack([pa[i, 0], pb[i, 0], pc[i, 0]]))).item()))
