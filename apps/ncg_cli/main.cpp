@@ -1977,6 +1977,25 @@ int cmd_geom(const ncg::app::Args& args) {
             ncg::mesh::write_gaussian_ply(fcloud, prefix + "_free.ply", std::get<1>(t4).to(at::kLong), sw);
             NCG_LOG_INFO("geom: FREE-SPLAT layer -> {}_free.ply  N={} (was {} verts) opacity_std={:.4f}",
                          prefix, Nf, pcpu.size(0), fcloud.opacities.std().item<float>());
+            // Before/after render: baseline 1:1 vertex splats vs the densified free splats, same view.
+            {
+              auto base = ncg::recon::gaussians_on_body(pers.to(ndev), 0.008F, vcol.to(ndev),
+                                                        ncg::recon::per_vertex_scale(pcpu, 0.75F).to(ndev));
+              auto fr = fcloud; fr.to_(ndev);
+              const auto hthr = torch::quantile(pcpu.select(1, 1), 0.86F).item<float>();
+              const auto hm = (pers.to(ndev).select(1, 1) > hthr).unsqueeze(1);
+              const auto hc = pers.to(ndev).masked_select(hm).reshape({-1, 3}).mean(0);
+              for (int k = 0; k < 5; ++k) {
+                const float az = -40.0F + 20.0F * k;
+                const auto cam = ncg::runtime::Camera::orbit(hc, 0.42F, az, 5.0F, 28.0F, 768, 768, ndev);
+                char nm[40];
+                std::snprintf(nm, sizeof(nm), "_free_turn%+03d.png", (int)az);
+                ncg::io::save_png(prefix + nm, ncg::runtime::render_soft_aniso(fr, cam).image.detach().to(at::kCPU));
+                std::snprintf(nm, sizeof(nm), "_base_turn%+03d.png", (int)az);
+                ncg::io::save_png(prefix + nm, ncg::runtime::render_soft_aniso(base, cam).image.detach().to(at::kCPU));
+              }
+              NCG_LOG_INFO("geom: free-splat before/after renders -> {}_base_turn* / {}_free_turn*", prefix, prefix);
+            }
           }
         }
       } catch (const std::exception& e) {
