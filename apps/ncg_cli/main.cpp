@@ -1036,7 +1036,7 @@ torch::Tensor recover_uv_albedo(const ncg::body::SmplxModel& model,
                                 const std::vector<torch::Tensor>& viss, int T,
                                 const torch::Tensor& rest_verts, torch::Tensor& mask_out,
                                 torch::Tensor& normal_out, torch::Tensor& pos_out,
-                                float detail_weight = 1.5F, float deshade = 0.5F) {
+                                float detail_weight = 1.5F, float deshade = 0.5F, float chroma = 0.6F) {
   const auto device = model.uv_coords().device();
   const auto ras = ncg::recon::uv_rasterize(model.uv_coords(), model.uv_faces(), T);
   const auto face = ras.face.to(device);                              // [T^2]
@@ -1145,6 +1145,33 @@ torch::Tensor recover_uv_albedo(const ncg::body::SmplxModel& model,
     const auto tgt = (lum * vmask).sum() / vmask.sum().clamp_min(1e-6F);  // global mean luminance
     auto gain = (tgt / lp.clamp_min(0.05F)).clamp(1.0F - deshade, 1.0F + deshade);  // bounded
     albedo = (albedo * gain.view({T * T, 1})).clamp(0.0F, 1.0F);
+  }
+
+  // ---- CHROMA SMOOTHING: kill green/magenta patches from per-photo white-balance inconsistency ----
+  // Real skin COLOUR is spatially smooth; only LUMINANCE carries high-frequency detail (pores, hair).
+  // Fusing photos with different white balance leaves high-freq CHROMA noise (the coloured blotches).
+  // Decompose into luminance × chroma, heavily low-pass ONLY the chroma (over the valid UV region),
+  // recombine. Detail and shading-flattened luminance are untouched; the colour becomes natural.
+  if (chroma > 0.0F) {
+    namespace Fc = torch::nn::functional;
+    auto ck1 = torch::tensor({1.F, 4.F, 6.F, 4.F, 1.F}, albedo.options());
+    auto ck2 = torch::outer(ck1, ck1);
+    ck2 = ck2 / ck2.sum();
+    const auto ck = ck2.view({1, 1, 5, 5});
+    const auto ckc = ck.expand({3, 1, 5, 5}).contiguous();
+    auto cblur1 = [&](const torch::Tensor& x, const torch::Tensor& kk, int64_t g) {
+      return Fc::conv2d(x, kk, Fc::Conv2dFuncOptions().padding(2).groups(g));
+    };
+    const auto vmask = valid.view({1, 1, T, T});
+    const auto lum = albedo.mean(1).clamp_min(0.02F).view({T * T, 1});      // [T^2,1]
+    const auto chr = (albedo / lum);                                        // [T^2,3] chroma ratio
+    auto cimg = chr.t().reshape({1, 3, T, T}).contiguous();
+    const auto iters = static_cast<int>(8 + 24 * chroma);
+    for (int it = 0; it < iters; ++it)                                      // big low-pass on chroma
+      cimg = cblur1(cimg * vmask, ckc, 3) / cblur1(vmask, ck, 1).clamp_min(1e-6F) * vmask +
+             cimg * (1.0F - vmask);
+    const auto chs = cimg.reshape({3, T * T}).t();                          // [T^2,3] smooth chroma
+    albedo = (lum * chs).clamp(0.0F, 1.0F);
   }
 
   // ---- DETAIL TRANSFER: real high-frequency skin detail from the single SHARPEST view per texel ---
@@ -2161,7 +2188,8 @@ int cmd_face(const ncg::app::Args& args) {
       torch::Tensor uvmask, uvnrm, uvpos;
       const auto uvtex =
           recover_uv_albedo(model, uv_img, uv_v2d, nrm_l, viss_t, T, verts_dev, uvmask, uvnrm, uvpos,
-                            args.get_float("detail", 0.7F), args.get_float("deshade", 0.5F));
+                            args.get_float("detail", 0.7F), args.get_float("deshade", 0.5F),
+                            args.get_float("chroma", 0.6F));
       // TEXTURE-RESOLUTION render: turn each valid UV texel into a 3D surface splat coloured by the
       // sharp per-texel albedo. Render detail = texture resolution (T²), not the ~10⁴ vertex count —
       // this is what actually makes the rendered face sharp (the splat portraits below were
