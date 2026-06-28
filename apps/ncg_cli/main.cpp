@@ -1186,14 +1186,18 @@ torch::Tensor recover_uv_albedo(const ncg::body::SmplxModel& model,
     const auto bestv = std::get<1>(Wst.max(0));                              // [T^2] sharpest view
     const auto bestw = std::get<0>(Wst.max(0)).clamp(0.0F, 1.0F).unsqueeze(1);  // its confidence
     const auto sharp = Ost.gather(0, bestv.view({1, TT, 1}).expand({1, TT, 3})).squeeze(0);  // [T^2,3]
+    // LUMINANCE-ONLY detail: pores/edges live in luminance, not colour. Adding per-channel detail
+    // would re-inject the very white-balance chroma noise we just smoothed away — so high-pass the
+    // best view's LUMINANCE and add it equally to all channels.
+    const auto slum = sharp.mean(1, /*keepdim=*/true);                       // [T^2,1]
     auto dk1 = torch::tensor({1.F, 4.F, 6.F, 4.F, 1.F}, albedo.options());
     auto dk2 = torch::outer(dk1, dk1);
     dk2 = dk2 / dk2.sum();
-    const auto dka = dk2.view({1, 1, 5, 5}).expand({3, 1, 5, 5}).contiguous();
-    const auto simg = sharp.t().reshape({1, 3, T, T}).contiguous();
-    const auto sblur = Fc::conv2d(simg, dka, Fc::Conv2dFuncOptions().padding(2).groups(3));
-    const auto detail = (simg - sblur).reshape({3, T * T}).t();              // [T^2,3] high-pass
-    albedo = (albedo + detail_weight * detail * bestw).clamp(0.0F, 1.0F);
+    const auto dka = dk2.view({1, 1, 5, 5});
+    const auto simg = slum.t().reshape({1, 1, T, T}).contiguous();
+    const auto sblur = Fc::conv2d(simg, dka, Fc::Conv2dFuncOptions().padding(2).groups(1));
+    const auto detail = (simg - sblur).reshape({1, T * T}).t();              // [T^2,1] lum high-pass
+    albedo = (albedo + detail_weight * detail * bestw).clamp(0.0F, 1.0F);    // broadcast to 3 ch
   }
 
   // Per-texel 3D surface position (barycentric on the rest mesh) — lets the caller render a
