@@ -1800,8 +1800,10 @@ int cmd_geom(const ncg::app::Args& args) {
   // identity. SMPL-X's β is global; face landmarks alone under-constrain it, so we FIX β here and
   // let Phase B solve only the off-subspace Δv. (--nlf optional; without it β is solved from the
   // face landmarks, kept sane by --id-ridge.)
-  torch::Tensor beta_fixed, albedo, app_obs;
+  torch::Tensor beta_fixed, albedo, app_obs, body_betas;
   std::vector<torch::Tensor> nrm_l, vis_l, uv_img, uv_v2d;  // hoisted for the per-texel UV texture
+  std::vector<ncg::fit::AvatarFrame> aframes;               // posed frames for the free-splat fit
+  const bool densify = args.get_int("densify", 0) != 0;     // Phase-C free-splat / adaptive layer
   const auto ndev = ncg::cuda_available() ? at::Device(at::kCUDA, 0) : at::Device(at::kCPU);
   if (args.has("nlf")) {
     auto nlf = ncg::body::Nlf::load(args.require("nlf"), ndev, {});
@@ -1830,9 +1832,26 @@ int cmd_geom(const ncg::app::Args& args) {
                                 .scale_factor(std::vector<double>{s, s})
                                 .mode(torch::kBilinear).align_corners(false)).squeeze(0));
       uv_v2d.push_back(v2d * static_cast<float>(s));
+      // Free-splat layer: collect this gated photo as a posed supervision frame (pose+camera+image).
+      if (densify) {
+        ncg::fit::AvatarFrame fr;
+        fr.pose_aa = pred.params.pose_aa.reshape({-1, 3}).to(ndev);  // [J,3]
+        fr.transl = pred.params.transl.reshape({-1}).to(ndev);       // [3]
+        const int dr = args.get_int("densify-res", 256);
+        const double sd = std::min(1.0, static_cast<double>(dr) / std::max(img.size(1), img.size(2)));
+        fr.target = torch::nn::functional::interpolate(
+            img.unsqueeze(0), torch::nn::functional::InterpolateFuncOptions()
+                                  .scale_factor(std::vector<double>{sd, sd})
+                                  .mode(torch::kBilinear).align_corners(false)).squeeze(0).clamp(0, 1);
+        fr.camera = ncg::runtime::solve_pinhole_camera(
+            pred.vertices3d.to(ndev), (v2d * static_cast<float>(sd)),
+            static_cast<int>(fr.target.size(2)), static_cast<int>(fr.target.size(1)));
+        aframes.push_back(fr);
+      }
     }
     if (!betas.empty()) {
       const auto bavg = std::get<0>(torch::stack(betas, 0).median(0)).to(at::kFloat);  // robust avg
+      body_betas = bavg.clone();  // whole-body SMPL-X shape for the free-splat fit (fit_avatar)
       const int64_t nid = id_dirs.size(2), m = std::min<int64_t>(bavg.size(0), nid);
       beta_fixed = torch::zeros({nid}, at::kFloat);
       beta_fixed.slice(0, 0, m).copy_(bavg.slice(0, 0, m));
@@ -1912,9 +1931,53 @@ int cmd_geom(const ncg::app::Args& args) {
                                         prefix + "_char_textured.glb", prefix + "_normal_uv.png");
           NCG_LOG_INFO("geom: SHARP UV-textured character -> {}_char_textured.glb (+ _albedo_uv.png)",
                        prefix);
+
+          // ===== FREE-SPLAT LAYER (Phase C): the resolution fix. Seed Layer-2 from the CLEAN albedo
+          // (sampled per-vertex from the fusion-fixed UV), FREEZE colour (lr_color=0 → densify adds
+          // RESOLUTION, not colour, so it can't undo the fusion fix), run fit_avatar with adaptive
+          // densification against the gated photos, then k-NN-bind the free splats to the displaced
+          // mesh so they skin with the rig (anti-swim). Layer-1 mesh/rig is unchanged. =====
+          if (densify && aframes.size() >= 3 && body_betas.defined()) {
+            namespace Fn2 = torch::nn::functional;
+            const auto fl = faces.reshape(-1).to(ndev).to(at::kLong);
+            const auto uvl = smodel.uv_faces().reshape(-1).to(at::kLong);
+            auto vuv = torch::zeros({pcpu.size(0), 2}, uvtex.options());     // [V,2] per-vertex UV
+            vuv.index_put_({fl}, smodel.uv_coords().index_select(0, uvl));
+            const auto grid = torch::stack({vuv.select(1, 0) * 2 - 1, (1 - vuv.select(1, 1)) * 2 - 1}, 1)
+                                  .view({1, -1, 1, 2});
+            const auto vcol = Fn2::grid_sample(uvtex.permute({2, 0, 1}).unsqueeze(0), grid,
+                                  Fn2::GridSampleFuncOptions().mode(torch::kBilinear)
+                                      .padding_mode(torch::kBorder).align_corners(true))
+                                  .squeeze(3).squeeze(0).t().contiguous().clamp(0.0, 1.0);  // [V,3]
+            ncg::fit::AvatarFitConfig fc;
+            fc.iterations = args.get_int("densify-iters", 1800);
+            fc.lr_color = 0.0;            // FREEZE colour — preserve the clean albedo
+            fc.lr_position = 2e-4;        // small position freedom (densify needs a position gradient)
+            fc.densify = true;
+            fc.per_view_exposure = true;
+            fc.robust = true;
+            fc.max_gaussians = args.get_int("max-splats", 60000);
+            fc.init_scale = args.get_float("scale", 0.008F);
+            const auto bb = body_betas.slice(0, 0, std::min<int64_t>(body_betas.size(0),
+                                                                     smodel.num_betas())).to(ndev);
+            auto fit = ncg::fit::fit_avatar(smodel, bb, aframes, vcol.to(ndev), fc);
+            auto fcloud = fit.canonical;
+            fcloud.to_(at::kCPU);
+            const int64_t Nf = fcloud.size();
+            const auto bind = ncg::fit::bind_splats_knn(fcloud.positions, pcpu, 4);  // k-NN to mesh
+            const auto vw = lbs_w.index_select(0, bind.idx.reshape({-1}))
+                                .reshape({Nf, bind.idx.size(1), lbs_w.size(1)});
+            const auto sb = (vw * bind.weight.unsqueeze(2)).sum(1);                 // [N,J] blended lbs
+            const auto t4 = sb.topk(4, 1);
+            auto sw = std::get<0>(t4);
+            sw = sw / sw.sum(1, true).clamp_min(1e-9);
+            ncg::mesh::write_gaussian_ply(fcloud, prefix + "_free.ply", std::get<1>(t4).to(at::kLong), sw);
+            NCG_LOG_INFO("geom: FREE-SPLAT layer -> {}_free.ply  N={} (was {} verts) opacity_std={:.4f}",
+                         prefix, Nf, pcpu.size(0), fcloud.opacities.std().item<float>());
+          }
         }
       } catch (const std::exception& e) {
-        NCG_LOG_WARN("geom: textured export skipped ({})", e.what());
+        NCG_LOG_WARN("geom: textured/free-splat export skipped ({})", e.what());
       }
     }
     // Save the raw identity tensors so `complete` can rebuild the cloud without re-running NLF.
