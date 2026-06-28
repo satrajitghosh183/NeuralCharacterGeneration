@@ -1036,7 +1036,8 @@ torch::Tensor recover_uv_albedo(const ncg::body::SmplxModel& model,
                                 const std::vector<torch::Tensor>& viss, int T,
                                 const torch::Tensor& rest_verts, torch::Tensor& mask_out,
                                 torch::Tensor& normal_out, torch::Tensor& pos_out,
-                                float detail_weight = 1.5F, float deshade = 0.5F, float chroma = 0.6F) {
+                                torch::Tensor& gnrm_out, float detail_weight = 1.5F,
+                                float deshade = 0.5F, float chroma = 0.6F) {
   const auto device = model.uv_coords().device();
   const auto ras = ncg::recon::uv_rasterize(model.uv_coords(), model.uv_faces(), T);
   const auto face = ras.face.to(device);                              // [T^2]
@@ -1255,6 +1256,7 @@ torch::Tensor recover_uv_albedo(const ncg::body::SmplxModel& model,
     };
     auto ng = bw(vnorm);
     ng = ng / ng.norm(2, 1, true).clamp_min(1e-6F);
+    gnrm_out = ng.clone();  // per-texel object-space geometric normal (for shaded preview render)
     auto tg = bw(vtan);
     tg = tg - ng * (ng * tg).sum(1, true);  // Gram-Schmidt orthogonalize
     tg = tg / tg.norm(2, 1, true).clamp_min(1e-6F);
@@ -1427,9 +1429,9 @@ int cmd_avatar(const ncg::app::Args& args) {
       const int T = args.get_int("uv-texture", 512);
       const auto pfx = args.get("out-prefix", "avatar");
       if (args.get_int("uv-pertexel", 0) != 0) {
-        torch::Tensor uvmask, uvnrm, uvpos;
-        const auto uvtex =
-            recover_uv_albedo(model, id_img, id_v2d, id_nrm, id_w, T, rest_v, uvmask, uvnrm, uvpos);
+        torch::Tensor uvmask, uvnrm, uvpos, uvgn;
+        const auto uvtex = recover_uv_albedo(model, id_img, id_v2d, id_nrm, id_w, T, rest_v, uvmask,
+                                             uvnrm, uvpos, uvgn);
         ncg::io::save_png(pfx + "_albedo_uv.png", uvtex.permute({2, 0, 1}).contiguous().detach());
         ncg::io::save_png(pfx + "_normal_uv.png", uvnrm.permute({2, 0, 1}).contiguous().detach());
       } else {
@@ -2148,7 +2150,22 @@ int cmd_face(const ncg::app::Args& args) {
 
   // Personalized NEUTRAL identity mesh: v_template + id_dirs · β  (expression set to 0 = neutral).
   const auto beta = R.id_shape.to(at::kCPU).to(at::kFloat);                         // [n_id]
-  const auto id_verts = v_template + torch::einsum("vck,k->vc", {id_dirs, beta});   // [V,3]
+  auto id_verts = v_template + torch::einsum("vck,k->vc", {id_dirs, beta});         // [V,3]
+  // GEOMETRY UPGRADE: optionally render the texture on the Phase-B personalized OUT-OF-SUBSPACE
+  // geometry (a geom run's `_verts.npy`, which carries Δv beyond the identity subspace) so the
+  // texture sits on the person's real bone structure, not the SMPL-X average. Texture SAMPLING is
+  // unchanged (it uses each photo's NLF projection); only the rendered/exported rest shape changes.
+  if (args.has("geom-verts")) {
+    const auto gv = ncg::io::load_npy(args.require("geom-verts")).to(at::kCPU).to(at::kFloat);
+    if (gv.sizes() == id_verts.sizes()) {
+      id_verts = gv.contiguous();
+      NCG_LOG_INFO("face: rendering on personalized Phase-B geometry ({} verts) from {}",
+                   id_verts.size(0), args.require("geom-verts"));
+    } else {
+      NCG_LOG_WARN("face: --geom-verts shape {}x{} != mesh {}x{}; ignoring", gv.size(0),
+                   gv.size(1), id_verts.size(0), id_verts.size(1));
+    }
+  }
 
   const auto prefix = (rec.dir() / args.get("out-prefix", "face")).string();
   ncg::mesh::TriMesh neutral{id_verts, faces};
@@ -2199,10 +2216,10 @@ int cmd_face(const ncg::app::Args& args) {
       std::vector<torch::Tensor> viss_t;  // visibility × identity trust (coherent robustness)
       for (int64_t i = 0; i < Nt; ++i)
         viss_t.push_back(vis_l[static_cast<size_t>(i)] * R.weight[i].to(device).clamp_min(0.05));
-      torch::Tensor uvmask, uvnrm, uvpos;
+      torch::Tensor uvmask, uvnrm, uvpos, uvgn;
       const auto uvtex =
           recover_uv_albedo(model, uv_img, uv_v2d, nrm_l, viss_t, T, verts_dev, uvmask, uvnrm, uvpos,
-                            args.get_float("detail", 0.7F), args.get_float("deshade", 0.5F),
+                            uvgn, args.get_float("detail", 0.7F), args.get_float("deshade", 0.5F),
                             args.get_float("chroma", 0.6F));
       // TEXTURE-RESOLUTION render: turn each valid UV texel into a 3D surface splat coloured by the
       // sharp per-texel albedo. Render detail = texture resolution (T²), not the ~10⁴ vertex count —
@@ -2212,6 +2229,7 @@ int cmd_face(const ncg::app::Args& args) {
         const auto m = (uvmask.reshape({T * T}) > 0.5F);
         const auto fp = uvpos.index({m});                                // [P,3] surface points
         const auto fc = uvtex.reshape({T * T, 3}).index({m}).clamp(0.0F, 1.0F);
+        const auto fn = uvgn.index({m});                                 // [P,3] geometric normals
         const int64_t P = fp.size(0);
         ncg::recon::GaussianCloud tc;
         tc.positions = fp;
@@ -2224,15 +2242,27 @@ int cmd_face(const ncg::app::Args& args) {
         const auto hmask = (id_verts.select(1, 1).to(device) > hthr).unsqueeze(1);  // [V,1]
         const auto hc = verts_dev.masked_select(hmask).reshape({-1, 3}).mean(0);    // head centroid
         const int pres = args.get_int("portrait-res", 768);
+        // SHADED preview: flat albedo reads as wax; add gentle FORM shading from the per-texel
+        // geometric normal (soft frontal key + strong ambient) so it reads as a lit 3D face. The
+        // exported asset stays pure albedo + normal map; this only affects the preview render.
+        const float shade = args.get_float("shade", 0.45F);
+        auto ld = torch::tensor({0.25F, 0.25F, 1.0F}, fp.options());
+        ld = ld / ld.norm();
+        const auto ndl = (fn * ld).sum(1, true).clamp(0.0F, 1.0F);                  // [P,1]
+        const auto shaded = (fc * ((1.0F - shade) + shade * 2.0F * ndl)).clamp(0.0F, 1.0F);
         for (int k = 0; k < 5; ++k) {
           const float az = -40.0F + 20.0F * static_cast<float>(k);
           const auto cam = ncg::runtime::Camera::orbit(hc, 0.42F, az, 5.0F, 28.0F, pres, pres, device);
           char nm[32];
           std::snprintf(nm, sizeof(nm), "_face_sharp_%+03d.png", static_cast<int>(az));
+          tc.colors = fc;
+          ncg::io::save_png(prefix + nm, ncg::runtime::render_gaussians(tc, cam).image);
+          std::snprintf(nm, sizeof(nm), "_face_lit_%+03d.png", static_cast<int>(az));
+          tc.colors = shaded;
           ncg::io::save_png(prefix + nm, ncg::runtime::render_gaussians(tc, cam).image);
         }
-        NCG_LOG_INFO("face: texture-resolution face render ({} texel splats) -> {}_face_sharp_*.png",
-                     P, prefix);
+        NCG_LOG_INFO("face: texture-resolution face render ({} texel splats) -> {}_face_sharp_*.png "
+                     "+ shaded {}_face_lit_*.png", P, prefix, prefix);
       }
       ncg::io::save_png(prefix + "_albedo_uv.png", uvtex.permute({2, 0, 1}).contiguous().detach());
       ncg::io::save_png(prefix + "_normal_uv.png", uvnrm.permute({2, 0, 1}).contiguous().detach());
