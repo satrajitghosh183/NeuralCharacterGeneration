@@ -1170,7 +1170,16 @@ torch::Tensor recover_uv_albedo(const ncg::body::SmplxModel& model,
     for (int it = 0; it < iters; ++it)                                      // big low-pass on chroma
       cimg = cblur1(cimg * vmask, ckc, 3) / cblur1(vmask, ck, 1).clamp_min(1e-6F) * vmask +
              cimg * (1.0F - vmask);
-    const auto chs = cimg.reshape({3, T * T}).t();                          // [T^2,3] smooth chroma
+    auto chs = cimg.reshape({3, T * T}).t();                                // [T^2,3] smooth chroma
+    // ROBUST OUTLIER REJECTION: green/magenta patches are LOW-freq colour outliers (a few bad-WB
+    // photos colouring rarely-seen texels) — smoothing can't fix them. Skin is essentially ONE hue,
+    // so pull texels whose chroma deviates from the global MEDIAN skin chroma toward it; texels near
+    // the median (normal skin variation — redness, freckles) are kept.
+    const auto vsel = (valid > 0.5F);
+    const auto med = std::get<0>((chs.index({vsel})).median(0)).view({1, 3});  // [1,3] skin chroma
+    const auto dev = (chs - med).norm(2, 1, true);                          // [T^2,1] deviation
+    const auto wout = torch::sigmoid((dev - 0.10F) * 30.0F);                // 1 where colour-outlier
+    chs = chs * (1.0F - wout) + med * wout;                                 // pull outliers to skin
     albedo = (lum * chs).clamp(0.0F, 1.0F);
   }
 
