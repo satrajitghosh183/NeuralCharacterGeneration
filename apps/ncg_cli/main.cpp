@@ -2143,7 +2143,7 @@ int cmd_face(const ncg::app::Args& args) {
   // ---- the contribution: robust joint identity / expression / pose factorization ---------------
   ncg::recon::FaceIdentityConfig cfg;
   cfg.iterations = args.get_int("iters", 40);
-  cfg.id_ridge = std::stof(args.get("id-ridge", "0.01"));
+  cfg.id_ridge = std::stof(args.get("id-ridge", "3.0"));  // keep |β|~2 (0.01 over-fit → |β|=27, warped)
   cfg.expr_ridge = std::stof(args.get("expr-ridge", "0.1"));
   cfg.robust = args.get_int("robust", 1) != 0;
   const auto R = ncg::recon::solve_face_identity(base_lm, id_basis, expr_basis, landmarks2d, cfg);
