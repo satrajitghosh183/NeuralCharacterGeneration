@@ -41,6 +41,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <limits>
 #include <cstdio>
 #include <exception>
 #include <filesystem>
@@ -1037,7 +1038,7 @@ torch::Tensor recover_uv_albedo(const ncg::body::SmplxModel& model,
                                 const torch::Tensor& rest_verts, torch::Tensor& mask_out,
                                 torch::Tensor& normal_out, torch::Tensor& pos_out,
                                 torch::Tensor& gnrm_out, float detail_weight = 1.5F,
-                                float deshade = 0.5F, float chroma = 0.6F) {
+                                float deshade = 0.5F, float chroma = 0.6F, float seam = 0.6F) {
   const auto device = model.uv_coords().device();
   const auto ras = ncg::recon::uv_rasterize(model.uv_coords(), model.uv_faces(), T);
   const auto face = ras.face.to(device);                              // [T^2]
@@ -1082,18 +1083,55 @@ torch::Tensor recover_uv_albedo(const ncg::body::SmplxModel& model,
     const auto lum = of.mean(1);                                  // [T^2]
     const auto mx = std::get<0>(of.max(1)).clamp_min(1e-3F);
     const auto sat = (mx - std::get<0>(of.min(1))) / mx;          // [T^2]
-    const auto spec = torch::sigmoid((lum - 0.78F) * 14.0F) * torch::sigmoid((0.22F - sat) * 14.0F);
-    w_l.push_back(tw * inb * (1.0F - 0.92F * spec));              // [T^2]
+    const auto spec = torch::sigmoid((lum - 0.72F) * 16.0F) * torch::sigmoid((0.24F - sat) * 16.0F);
+    w_l.push_back(tw * inb * (1.0F - 0.96F * spec));              // [T^2] harder specular reject
   }
+  // ============ STEP 1: PER-PHOTO RADIOMETRIC EQUALIZATION (before any fusion) =====================
+  // Each photo baked in its own exposure + white balance; AVERAGING them is the root cause of the
+  // mottled chroma (diag row 1) AND the faceted seams (row 2). Solve a per-photo 3-channel gain that
+  // minimizes cross-photo disagreement on SHARED texels (alternating: weighted ref → per-channel LSQ
+  // gain → gauge-normalize), so every photo lives in ONE albedo space. Gauge: per-channel mean gain=1
+  // (absolute tone is set later by white-balance) → no global drift.
+  auto O = torch::stack(obs_l, 0);                                  // [N,T^2,3]
+  const auto W = torch::stack(w_l, 0);                             // [N,T^2]
+  const int64_t Nph = O.size(0);
+  {
+    const auto Wt = W.unsqueeze(2);                                // [N,T^2,1]
+    const auto cnt2 = (((W > 0.2F).to(at::kFloat).sum(0)) >= 2.0F).to(at::kFloat).unsqueeze(1);  // shared
+    auto shared_var = [&](const torch::Tensor& Oe) {
+      const auto wm = (Wt * Oe).sum(0) / Wt.sum(0).clamp_min(1e-6F);
+      const auto v = (Wt * (Oe - wm.unsqueeze(0)).pow(2)).sum(0) / Wt.sum(0).clamp_min(1e-6F);
+      return ((v * cnt2).sum() / cnt2.sum().clamp_min(1.0F)).item<double>();
+    };
+    const double vb = shared_var(O);
+    auto eqg = torch::ones({Nph, 1, 3}, O.options());
+    for (int it = 0; it < 6; ++it) {
+      const auto ref = (Wt * (O * eqg)).sum(0) / Wt.sum(0).clamp_min(1e-6F);      // [T^2,3]
+      auto g = ((Wt * ref.unsqueeze(0) * O).sum(1) /
+                (Wt * O.pow(2)).sum(1).clamp_min(1e-6F)).clamp(0.3F, 3.0F);       // [N,3] LSQ scale
+      g = g / g.mean(0, true).clamp_min(1e-6F);                                   // gauge
+      eqg = g.view({Nph, 1, 3});
+    }
+    O = (O * eqg).clamp(0.0F, 2.0F);
+    const double va = shared_var(O);
+    NCG_LOG_INFO("equalize(GATE1): shared-texel var {:.6f} -> {:.6f} ({:.2f}x)", vb, va,
+                 vb / std::max(va, 1e-12));
+    for (int64_t i = 0; i < Nph; ++i) obs_l[static_cast<size_t>(i)] = O[i].contiguous();
+  }
+  // ============ STEP 2: robust per-texel MEDIAN merge (rejects the residual specular/occluded view a
+  // mean smears in). solve_inverse_render is kept ONLY for the per-view lights → photometric normals.
   ncg::recon::InverseRenderConfig ic;
   ic.iterations = 60;
   ic.robust = true;
-  const auto ir = ncg::recon::solve_inverse_render(torch::stack(obs_l, 0), torch::stack(nrm_l, 0),
-                                                   torch::stack(w_l, 0), ic);
-  auto albedo = torch::nan_to_num(ir.albedo).clamp(0.0F, 1.0F);     // [T^2,3]
-  const auto obs_mean = torch::stack(obs_l, 0).mean(0).mean(0).clamp_min(1e-3F);
-  const auto alb_mean = albedo.mean(0).clamp_min(1e-3F);
-  albedo = (albedo * (obs_mean / alb_mean).view({1, 3})).clamp(0.0F, 1.0F);
+  const auto ir = ncg::recon::solve_inverse_render(O, torch::stack(nrm_l, 0), W, ic);  // lights→normals
+  torch::Tensor albedo;
+  {
+    const auto good = (W > 0.2F).unsqueeze(2);                                    // [N,T^2,1]
+    const auto wmean = (W.unsqueeze(2) * O).sum(0) / W.unsqueeze(2).sum(0).clamp_min(1e-6F);
+    const auto Om = torch::where(good, O, torch::full_like(O, std::numeric_limits<float>::quiet_NaN()));
+    const auto med = std::get<0>(torch::nanmedian(Om, 0));                        // [T^2,3]
+    albedo = torch::where(torch::isnan(med), wmean, med).clamp(0.0F, 1.0F);
+  }
 
   // ---- algorithmic UV cleanup: confidence-weighted push-pull inpaint + edge-aware smoothing -----
   // Per-texel coverage Σ_f w is the confidence. Low-coverage texels — UV seams, rarely-seen cheek/
@@ -1148,41 +1186,31 @@ torch::Tensor recover_uv_albedo(const ncg::body::SmplxModel& model,
     albedo = (albedo * gain.view({T * T, 1})).clamp(0.0F, 1.0F);
   }
 
-  // ---- ROBUST PER-TEXEL CHROMA from a MEDIAN across views (kills WB-outlier colour patches) --------
-  // The green/magenta patches are LOW-freq colour outliers: a rarely-seen texel gets its colour from
-  // one or two bad-white-balance photos, and weighted-MEAN fusion can't reject them. Skin colour is
-  // smooth, so recover each texel's chroma as the MEDIAN of its per-view chromas (robust to a minority
-  // of outlier photos) — preserving REGIONAL skin tone (no graying) while rejecting the bad views.
-  // Keep the (detailed, deshaded) luminance; only the colour is replaced.
-  if (chroma > 0.0F) {
+  // ============ STEP 3: SEAM-AWARE multi-band blend (kill the faceting) ============================
+  // Per-texel independence leaves hard adjacent jumps at photo boundaries (diag row 2). Reconstruct as
+  // base(low-freq, heavily smoothed ACROSS seams) + detail(high-freq pores), so the mid-frequency STEP
+  // discontinuities vanish while fine skin texture survives. Normalized convolution stays inside the
+  // valid UV region (no background bleed).
+  if (seam > 0.0F) {
     namespace Fc = torch::nn::functional;
-    const auto O = torch::stack(obs_l, 0);                                  // [N,T^2,3] per-view RGB
-    const auto Wn = torch::stack(w_l, 0);                                   // [N,T^2] per-view weight
-    const auto Ol = O.mean(2, true).clamp_min(0.02F);                       // [N,T^2,1] per-view lum
-    auto Oc = O / Ol;                                                       // [N,T^2,3] per-view chroma
-    // Neutralize low-visibility views (which sample background/grazing) so they can't skew the median:
-    // replace their chroma with the per-texel weighted-mean chroma.
-    const auto wmean = (Wn.unsqueeze(2) * Oc).sum(0) /
-                       Wn.sum(0).clamp_min(1e-6F).unsqueeze(1);            // [T^2,3]
-    const auto good = (Wn > 0.2F).unsqueeze(2);                            // [N,T^2,1]
-    Oc = torch::where(good, Oc, wmean.unsqueeze(0).expand_as(Oc));
-    auto chs = std::get<0>(Oc.median(0));                                   // [T^2,3] robust chroma
-    // light spatial smooth of the chroma to remove residual speckle (colour is smooth anyway).
-    auto ck1 = torch::tensor({1.F, 4.F, 6.F, 4.F, 1.F}, albedo.options());
-    auto ck2 = torch::outer(ck1, ck1);
-    ck2 = ck2 / ck2.sum();
-    const auto ckc = ck2.view({1, 1, 5, 5}).expand({3, 1, 5, 5}).contiguous();
-    const auto ck = ck2.view({1, 1, 5, 5});
     const auto vmask = valid.view({1, 1, T, T});
-    auto cimg = chs.t().reshape({1, 3, T, T}).contiguous();
-    for (int it = 0; it < 6; ++it)
-      cimg = Fc::conv2d(cimg * vmask, ckc, Fc::Conv2dFuncOptions().padding(2).groups(3)) /
-                 Fc::conv2d(vmask, ck, Fc::Conv2dFuncOptions().padding(2).groups(1)).clamp_min(1e-6F) *
-                 vmask +
-             cimg * (1.0F - vmask);
-    chs = cimg.reshape({3, T * T}).t();
-    const auto lum = albedo.mean(1).clamp_min(0.02F).view({T * T, 1});      // [T^2,1] keep luminance
-    albedo = (lum * chs).clamp(0.0F, 1.0F);
+    auto bk1 = torch::tensor({1.F, 4.F, 6.F, 4.F, 1.F}, albedo.options());
+    auto bk2 = torch::outer(bk1, bk1);
+    bk2 = bk2 / bk2.sum();
+    const auto kc = bk2.view({1, 1, 5, 5});
+    const auto ka = kc.expand({3, 1, 5, 5}).contiguous();
+    auto nblur = [&](const torch::Tensor& x) {
+      return Fc::conv2d(x * vmask, ka, Fc::Conv2dFuncOptions().padding(2).groups(3)) /
+                 Fc::conv2d(vmask, kc, Fc::Conv2dFuncOptions().padding(2).groups(1)).clamp_min(1e-6F) *
+                 vmask + x * (1.0F - vmask);
+    };
+    auto a = albedo.t().reshape({1, 3, T, T}).contiguous();
+    const auto fine = a - nblur(a);                                   // high-freq pores (1 small blur)
+    auto base = a.clone();
+    const int nb = static_cast<int>(4 + 12 * seam);                  // heavy low-pass across seams
+    for (int it = 0; it < nb; ++it) base = nblur(base);
+    a = (base + fine).clamp(0.0F, 1.0F);
+    albedo = a.reshape({3, T * T}).t().contiguous();
   }
 
   // ---- DETAIL TRANSFER: real high-frequency skin detail from the single SHARPEST view per texel ---
