@@ -1036,7 +1036,7 @@ torch::Tensor recover_uv_albedo(const ncg::body::SmplxModel& model,
                                 const std::vector<torch::Tensor>& viss, int T,
                                 const torch::Tensor& rest_verts, torch::Tensor& mask_out,
                                 torch::Tensor& normal_out, torch::Tensor& pos_out,
-                                float detail_weight = 1.5F) {
+                                float detail_weight = 1.5F, float deshade = 0.5F) {
   const auto device = model.uv_coords().device();
   const auto ras = ncg::recon::uv_rasterize(model.uv_coords(), model.uv_faces(), T);
   const auto face = ras.face.to(device);                              // [T^2]
@@ -1120,6 +1120,31 @@ torch::Tensor recover_uv_albedo(const ncg::body::SmplxModel& model,
     }
     a = a * 0.65F + blur(a, ka, 3) * 0.35F;  // mild edge-aware smooth (de-speckle, keep pores)
     albedo = a.reshape({3, T * T}).t().contiguous().clamp(0.0F, 1.0F);
+  }
+
+  // ---- HOMOMORPHIC DESHADE: remove baked shading/AO blotches the in-the-wild delighting missed ----
+  // The Lambertian+SH delight can't model cast shadows / occlusion under harsh casual lighting, so
+  // residual LOW-FREQUENCY luminance (dark eye sockets, bright forehead) survives in the albedo.
+  // Texture-resolution rendering makes those blotches obvious. Divide out the low-frequency luminance
+  // (normalized convolution over the valid UV region) with a BOUNDED gain — flattens the shading while
+  // leaving pores/edges (high-freq) and skin colour (chroma) untouched.
+  if (deshade > 0.0F) {
+    namespace Fc = torch::nn::functional;
+    auto bk1 = torch::tensor({1.F, 4.F, 6.F, 4.F, 1.F}, albedo.options());
+    auto bk2 = torch::outer(bk1, bk1);
+    bk2 = bk2 / bk2.sum();
+    const auto bk = bk2.view({1, 1, 5, 5});
+    auto blur1 = [&](const torch::Tensor& x) {
+      return Fc::conv2d(x, bk, Fc::Conv2dFuncOptions().padding(2).groups(1));
+    };
+    const auto vmask = valid.view({1, 1, T, T});
+    auto lum = albedo.mean(1).view({1, 1, T, T});                       // [1,1,T,T]
+    auto lp = lum * vmask;
+    for (int it = 0; it < 24; ++it)                                     // big low-pass (normalized)
+      lp = blur1(lp) / blur1(vmask).clamp_min(1e-6F) * vmask + lp * (1.0F - vmask);
+    const auto tgt = (lum * vmask).sum() / vmask.sum().clamp_min(1e-6F);  // global mean luminance
+    auto gain = (tgt / lp.clamp_min(0.05F)).clamp(1.0F - deshade, 1.0F + deshade);  // bounded
+    albedo = (albedo * gain.view({T * T, 1})).clamp(0.0F, 1.0F);
   }
 
   // ---- DETAIL TRANSFER: real high-frequency skin detail from the single SHARPEST view per texel ---
@@ -2136,7 +2161,7 @@ int cmd_face(const ncg::app::Args& args) {
       torch::Tensor uvmask, uvnrm, uvpos;
       const auto uvtex =
           recover_uv_albedo(model, uv_img, uv_v2d, nrm_l, viss_t, T, verts_dev, uvmask, uvnrm, uvpos,
-                            args.get_float("detail", 1.5F));
+                            args.get_float("detail", 0.7F), args.get_float("deshade", 0.5F));
       // TEXTURE-RESOLUTION render: turn each valid UV texel into a 3D surface splat coloured by the
       // sharp per-texel albedo. Render detail = texture resolution (T²), not the ~10⁴ vertex count —
       // this is what actually makes the rendered face sharp (the splat portraits below were
