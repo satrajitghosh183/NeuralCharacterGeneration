@@ -1339,6 +1339,72 @@ torch::Tensor recover_uv_albedo(const ncg::body::SmplxModel& model,
 // projected-color mannequin to a real likeness. Renders fit-check + novel-view turntable frames.
 //   ncg_cli avatar --frames dir/ --weights nlf.torchscript --smplx model.safetensors \
 //                  [--max-frames 60 --res 288 --iters 3000 --out-prefix rock_avatar]
+// `mvtest` — SELF-CONTAINED data-wall-vs-fit-bug isolator. Render a known-clean avatar (gaussians on
+// the rest SMPL-X body, clean per-vertex albedo) from N known orbit cameras → PERFECT multi-view
+// input (exact poses, full 360° yaw, single subject, zero blur). Feed those back to fit_avatar
+// --densify (init == GT) and measure held-out-view reconstruction. CLEAN → the fit/densify is sound
+// and every prior corruption was DATA quality. CORRUPT on perfect input → the bug is in the fit.
+int cmd_mvtest(const ncg::app::Args& args) {
+  NCG_CHECK(ncg::cuda_available(), "mvtest requires a CUDA device");
+  const auto device = at::Device(at::kCUDA, 0);
+  auto rec = ncg::record::Recorder::create("runs", args.get("run", "mvtest"));
+  const auto prefix = (rec.dir() / "mv").string();
+  auto model = ncg::body::SmplxModel::load(args.require("smplx"), device);
+  const auto dopt = at::TensorOptions().device(device).dtype(at::kFloat);
+  ncg::body::SmplxParams rest;
+  rest.betas = torch::zeros({1, model.num_betas()}, dopt);
+  rest.pose_aa = torch::zeros({1, model.num_joints(), 3}, dopt);
+  rest.transl = torch::zeros({1, 3}, dopt);
+  const auto gt_verts = model.forward(rest).vertices.squeeze(0);  // [V,3] rest body
+  const int64_t V = gt_verts.size(0);
+  torch::Tensor albedo;
+  if (args.has("albedo")) albedo = ncg::io::load_npy(args.require("albedo")).to(device, at::kFloat);
+  if (!albedo.defined() || albedo.size(0) != V) {  // fallback: smooth spatial gradient (still tests geometry)
+    const auto mn = std::get<0>(gt_verts.min(0)), mx = std::get<0>(gt_verts.max(0));
+    albedo = ((gt_verts - mn) / (mx - mn).clamp_min(1e-4)).clamp(0.05, 0.95);
+  }
+  const auto pvs = ncg::recon::per_vertex_scale(gt_verts.to(at::kCPU), 0.75).to(device);
+  auto gt = ncg::recon::gaussians_on_body(gt_verts, args.get_float("scale", 0.008F), albedo, pvs);
+  const auto center = gt.positions.mean(0);
+  const int res = args.get_int("res", 400);
+  const int N = args.get_int("views", 36);
+  const float radius = args.get_float("radius", 2.4F), elev = 10.0F;
+  const auto cams = ncg::runtime::orbit_trajectory(center, radius, elev, N, 50.0F, res, res, device);
+  std::vector<ncg::fit::AvatarFrame> frames;
+  for (int i = 0; i < N; ++i) {
+    ncg::fit::AvatarFrame fr;
+    fr.pose_aa = torch::zeros({model.num_joints(), 3}, dopt);
+    fr.transl = torch::zeros({3}, dopt);
+    fr.camera = cams[i];
+    fr.target = ncg::runtime::render_soft_aniso(gt, cams[i]).image.detach();  // PERFECT GT view
+    frames.push_back(std::move(fr));
+  }
+  ncg::fit::AvatarFitConfig cfg;
+  cfg.iterations = args.get_int("iters", 1500);
+  cfg.densify = args.get_int("densify", 1) != 0;
+  cfg.lr_color = 0.0;  // init == GT albedo; test geometry/densify, not colour
+  cfg.max_dev = args.get_float("max-dev", 0.012F);
+  cfg.min_scale = args.get_float("min-scale", 0.0035F);
+  cfg.opacity_floor = args.get_float("opacity-floor", 0.6F);
+  cfg.densify_grad = args.get_float("densify-grad", 6e-5F);
+  cfg.per_view_exposure = false;  // perfect data — no exposure variance
+  cfg.robust = false;
+  const auto cov = torch::ones({V}, dopt);
+  auto fit = ncg::fit::fit_avatar(model, rest.betas.squeeze(0), frames, albedo, cfg, &rec, cov);
+  // Held-out view BETWEEN training azimuths — the real generalization test.
+  const auto hc = ncg::runtime::Camera::orbit(center, radius, 360.0F / N / 2.0F, elev, 50.0F, res, res, device);
+  const auto gh = ncg::runtime::render_soft_aniso(gt, hc);
+  const auto fh = ncg::runtime::render_soft_aniso(fit.canonical, hc);
+  const auto mask = (gh.alpha.detach() > 0.05F).to(at::kFloat);
+  const double psnr = ncg::record::psnr(fh.image.detach() * mask, gh.image.detach() * mask);
+  ncg::io::save_png(prefix + "_gt_held.png", gh.image.detach());
+  ncg::io::save_png(prefix + "_fit_held.png", fh.image.detach());
+  NCG_LOG_INFO("mvtest: PERFECT multi-view, held-out recon PSNR fit-vs-GT = {:.2f} dB "
+               "(N={} views, {} splats, densify={}) -> {}_fit_held.png", psnr, N,
+               fit.canonical.size(), cfg.densify, prefix);
+  return 0;
+}
+
 int cmd_avatar(const ncg::app::Args& args) {
   const auto device = ncg::cuda_available() ? at::Device(at::kCUDA, 0) : at::Device(at::kCPU);
   auto rec = ncg::record::Recorder::create("runs", args.get("run", "avatar"));
@@ -2830,6 +2896,7 @@ int main(int argc, char** argv) {
     if (cmd == "gate") return cmd_gate(args);
     if (cmd == "geom") return cmd_geom(args);
     if (cmd == "complete") return cmd_complete(args);
+    if (cmd == "mvtest") return cmd_mvtest(args);
     if (cmd == "face") return cmd_face(args);
     if (cmd == "nerf") return cmd_nerf(args);
     std::fprintf(stderr, "unknown command '%s'\n", cmd.c_str());
