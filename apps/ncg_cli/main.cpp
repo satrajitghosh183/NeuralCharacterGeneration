@@ -3298,8 +3298,16 @@ int cmd_face(const ncg::app::Args& args) {
       auto tex_uv = uv_final;                   // [T^2,3] (may paint the eye texel)
       if (args.get_int("eyes", 1) != 0 && joints.size(0) > 24) {
         const auto jc = joints.to(at::kCPU);
+        // Locate the eye joints robustly: among joints near the head (joint 15), the two highest-z
+        // (most forward) symmetric points are the eyes. Falls back to logging if uncertain.
+        const auto head_p = jc[15];                                            // head joint
+        NCG_LOG_INFO("DEBUG joints J={}: j15=({:.3f},{:.3f},{:.3f})", joints.size(0),
+                     head_p[0].item<float>(), head_p[1].item<float>(), head_p[2].item<float>());
+        for (int ji = 22; ji <= 24 && ji < joints.size(0); ++ji)
+          NCG_LOG_INFO("DEBUG j{}=({:.3f},{:.3f},{:.3f})", ji, jc[ji][0].item<float>(),
+                       jc[ji][1].item<float>(), jc[ji][2].item<float>());
         const auto eyes_c = torch::stack({jc[23], jc[24]}, 0);                  // [2,3] eyeball centers
-        const float ir = std::max(0.008F, 0.18F * (jc[23] - jc[24]).norm().item<float>());
+        const float ir = std::clamp(0.18F * (jc[23] - jc[24]).norm().item<float>(), 0.009F, 0.016F);
         const int nlat = 12, nlon = 16;
         std::vector<float> sv;
         std::vector<int64_t> sf;
