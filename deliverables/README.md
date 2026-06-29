@@ -9,6 +9,7 @@ commands below.
 |------|---------|-------|
 | `me_char_rvxl2_face.glb` | user | best face bake — RealVisXL_V4.0 + IP-Adapter-FaceID-portrait reprojected onto the UV (identity ArcFace ~0.56, photoreal skin), 55-joint SMPL-X rig |
 | `kj_char_rvxl_face.glb` | Kendall (research benchmark only, not deployable) | same RealVisXL FaceID bake path |
+| `me_eyes_hair_face.glb` | user | TASK 2 result — adds anatomically-placed **eyeballs** (skinned to head) and a dark **hair cap** (crown/back/sides, off the face) to the rig; all 55 bones **named**; analytic skin. All gates PASS (skeleton/dressable/opaque). The photoreal-skin combine (RealVisXL + eyes + hair in one asset) is the pending finish. |
 
 Each `.glb` is a 55-joint SMPL-X-rigged, UV-textured, opaque, dressable body
 (engine adds clothing at runtime). Verified game-ready by `tools/glb_verify.py`.
