@@ -1549,7 +1549,15 @@ int cmd_avatar(const ncg::app::Args& args) {
     cfg.log_every = 50;
     cfg.dump_every = args.get_int("dump-every", 500);
     cfg.densify = args.get_int("densify", 0) != 0;
-    auto result = ncg::fit::fit_avatar(model, betas0, frames, init_colors, cfg, &rec);
+    // Supervision-fix knobs (Part 2) for the multi-angle densify test: anti-floater clamp + min-scale
+    // (no speckle) + opacity floor (no dark holes) + optional colour freeze.
+    cfg.max_dev = args.get_float("max-dev", 0.012F);
+    cfg.min_scale = args.get_float("min-scale", 0.0035F);
+    cfg.opacity_floor = args.get_float("opacity-floor", 0.6F);
+    cfg.densify_grad = args.get_float("densify-grad", 6e-5F);
+    if (args.get_int("freeze-color", 0) != 0) cfg.lr_color = 0.0;  // keep the seeded clean albedo
+    const auto cov = torch::ones({init_colors.size(0)}, init_colors.options());  // video sees whole body
+    auto result = ncg::fit::fit_avatar(model, betas0, frames, init_colors, cfg, &rec, cov);
     canonical = result.canonical;
     binding = result.binding;
   }
