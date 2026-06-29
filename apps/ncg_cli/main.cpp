@@ -1556,6 +1556,29 @@ int cmd_mvbench(const ncg::app::Args& args) {
                  "(w_subject<0.5)", Ftot, Ns, Kc, Kb, sup);
   }
 
+  // M3 quality weight: per-frame sharpness (variance-of-Laplacian), normalized — the blurred frames
+  // score low and so (a) are sampled less and (b) drive a wider confidence-blur. This is the per-frame
+  // confidence M3 consumes; it is ORTHOGONAL to M1's who-channel (a sharp wrong-person frame still has
+  // high quality but low w_subject; a blurred subject frame the reverse).
+  std::vector<float> wqual(static_cast<size_t>(Ftot), 1.0F);
+  {
+    const auto lapk =
+        torch::tensor({0.F, 1.F, 0.F, 1.F, -4.F, 1.F, 0.F, 1.F, 0.F}, dopt).view({1, 1, 3, 3});
+    std::vector<float> sv(static_cast<size_t>(Ftot));
+    float lo = 1e30F, hi = -1e30F;
+    for (int64_t i = 0; i < Ftot; ++i) {
+      const auto g = frames[static_cast<size_t>(i)].target.mean(0, true).unsqueeze(0);  // [1,1,H,W]
+      const auto lp = torch::nn::functional::conv2d(
+          g, lapk, torch::nn::functional::Conv2dFuncOptions().padding(1));
+      sv[static_cast<size_t>(i)] = lp.var().item<float>();
+      lo = std::min(lo, sv[static_cast<size_t>(i)]);
+      hi = std::max(hi, sv[static_cast<size_t>(i)]);
+    }
+    for (int64_t i = 0; i < Ftot; ++i)
+      wqual[static_cast<size_t>(i)] =
+          (hi > lo) ? 0.2F + 0.8F * (sv[static_cast<size_t>(i)] - lo) / (hi - lo) : 1.0F;
+  }
+
   const auto cov = torch::ones({V}, dopt);
   const auto init_gray = torch::full({V, 3}, 0.5F, dopt);  // appearance must be LEARNED from frames
   const int iters = args.get_int("iters", 1200);
@@ -1566,10 +1589,11 @@ int cmd_mvbench(const ncg::app::Args& args) {
   ncg::io::save_png(prefix + "_gt_held.png", gh.image.detach());
 
   // One ablation condition: fit a subset under given defences, return held-out PSNR vs true subject.
-  auto run = [&](const std::vector<ncg::fit::AvatarFrame>& fr, bool attrib, bool robust, bool blur,
-                 const char* name) {
+  auto run = [&](const std::vector<ncg::fit::AvatarFrame>& fr, bool attrib, bool quality, bool robust,
+                 bool blur, const char* name) {
     std::vector<ncg::fit::AvatarFrame> f = fr;
-    for (size_t i = 0; i < f.size(); ++i) f[i].weight = attrib ? wsub[i] : 1.0F;
+    for (size_t i = 0; i < f.size(); ++i)
+      f[i].weight = (attrib ? wsub[i] : 1.0F) * (quality ? wqual[i] : 1.0F);
     ncg::fit::AvatarFitConfig cfg;
     cfg.iterations = iters;
     cfg.per_view_exposure = false;
@@ -1585,13 +1609,14 @@ int cmd_mvbench(const ncg::app::Args& args) {
   };
 
   // CEILING = clean subject frames only (no contamination); then the contaminated-set ablation.
+  //                     frames   attrib quality robust blur   name
   std::vector<ncg::fit::AvatarFrame> clean(frames.begin(), frames.begin() + Ns);
-  const double p_ceil = run(clean, false, false, false, "ceiling");
-  const double p_naive = run(frames, false, false, false, "naive");
-  const double p_rob = run(frames, false, true, false, "robust");
-  const double p_m1 = run(frames, true, false, false, "m1");
-  const double p_m3 = run(frames, false, false, true, "m3");
-  const double p_all = run(frames, true, true, true, "all");
+  const double p_ceil = run(clean, false, false, false, false, "ceiling");
+  const double p_naive = run(frames, false, false, false, false, "naive");
+  const double p_rob = run(frames, false, false, true, false, "robust");
+  const double p_m1 = run(frames, true, false, false, false, "m1");
+  const double p_m3 = run(frames, false, true, false, true, "m3");
+  const double p_all = run(frames, true, true, true, true, "all");
   NCG_LOG_INFO("mvbench SUMMARY (gap-to-ceiling {:.2f} dB): naive {:.2f} (-{:.2f}) | robust {:.2f} | "
                "M1 {:.2f} | M3 {:.2f} | ALL {:.2f} (recovers {:.0f}% of the gap) -> {}",
                p_ceil, p_naive, p_ceil - p_naive, p_rob, p_m1, p_m3, p_all,
