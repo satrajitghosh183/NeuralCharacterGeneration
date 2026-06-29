@@ -6,6 +6,25 @@ Grounded in two deep-research passes (see `research-findings.md` + memory). Supe
 
 ---
 
+## Progress log — 2026-06-29: local Mac build + M1 attribution
+
+- **Local Mac CPU build established** (`docs/mac_handoff.md`): host-only build+test of the CPU-clean
+  module subset against pip LibTorch — **58 tests, 100% pass** (3 by-design skips). The handoff path
+  for continuing development after the H100 lease ends. CUDA renderer (runtime/fit/nerf/apps) stays
+  H100-gated; extension notes in the handoff doc.
+- **Suite fully green on BOTH platforms.** Two H100-safe toolchain fixes: APPLE-only fmt-consteval
+  `PATCH_COMMAND`; `SKIP_REGULAR_EXPRESSION` in `NcgAddTest` so SKIP()-ed Catch2 cases record as
+  Skipped not Failed (cleared the lone `sd_guidance` red on the H100 too → **79 tests, 100% pass**).
+- **M1 (blocker #1 / robust factorization WHO-channel): `ncg_cli attribute`** — multi-modal anchor
+  attribution from one reference (ArcFace face + NLF-β body shape + appearance histogram), partial-cue
+  per-frame `w_subject`, auto-selects the best-face reference. GATE on the contaminated runway (88
+  frames): **51 kept (47 FACELESS, attributed via body+appearance — the unlock), 15 rejected as
+  contamination**. No per-subject training. Remaining for full M-method: visual attribution overlay +
+  ArcFace-cluster verification, then M2 (joint pose/appearance factorization), M3 (confidence-weighted
+  anisotropic-blur loss), M4 (unify + gap-to-42dB benchmark) — the multi-week research.
+
+---
+
 ## 1. The contribution (three legs)
 
 > **The technical core / paper method is `docs/method.md`** (the *discovery*: casual photos are a
