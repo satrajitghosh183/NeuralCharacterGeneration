@@ -3288,11 +3288,12 @@ int cmd_face(const ncg::app::Args& args) {
       // eye joint (23=left, 24=right), skinned to the head joint, coloured by a reserved brown texel,
       // so the rig has real 3D eyes. Best-effort: textured meshes can't be rendered server-side, verify
       // in a glТF viewer. --eyes 0 to disable.
-      auto g_verts = hair_cpu;                  // [V,3]
-      auto g_faces = faces;                     // [F,3]
-      auto g_norm = hnrm;                       // [V,3]
-      auto g_uv = model.uv_coords();            // [n_uv,2]
-      auto g_uvf = model.uv_faces();            // [F,3]
+      // All on CPU (the eyeball tensors are CPU; cat requires one device) + remember base dtypes.
+      auto g_verts = hair_cpu.to(at::kCPU);     // [V,3]
+      auto g_faces = faces.to(at::kCPU);        // [F,3]
+      auto g_norm = hnrm.to(at::kCPU);          // [V,3]
+      auto g_uv = model.uv_coords().to(at::kCPU);     // [n_uv,2]
+      auto g_uvf = model.uv_faces().to(at::kCPU);     // [F,3]
       auto g_lbs = model.lbs_weights().to(at::kCPU);  // [V,J]
       auto tex_uv = uv_final;                   // [T^2,3] (may paint the eye texel)
       if (args.get_int("eyes", 1) != 0 && joints.size(0) > 24) {
@@ -3337,13 +3338,13 @@ int cmd_face(const ncg::app::Args& args) {
         std::vector<torch::Tensor> Vs{g_verts}, Ns{g_norm}, UVs{g_uv}, Ls{g_lbs}, Fs{g_faces}, UVFs{g_uvf};
         int64_t vbase = g_verts.size(0), uvbase = g_uv.size(0);
         for (int e = 0; e < 2; ++e) {
-          Vs.push_back(sV * ir + eyes_c[e]);                                    // [N,3]
-          Ns.push_back(sV);                                                     // outward normals
-          UVs.push_back(eye_uv);                                                // all -> brown texel
+          Vs.push_back((sV * ir + eyes_c[e]).to(g_verts.scalar_type()));        // [N,3]
+          Ns.push_back(sV.to(g_norm.scalar_type()));                            // outward normals
+          UVs.push_back(eye_uv.to(g_uv.scalar_type()));                         // all -> brown texel
           auto lb = torch::zeros({N, Jn}); lb.select(1, 15).fill_(1.0F);        // skin to head joint
-          Ls.push_back(lb);
-          Fs.push_back(sF + vbase);
-          UVFs.push_back(sF + uvbase);
+          Ls.push_back(lb.to(g_lbs.scalar_type()));
+          Fs.push_back((sF + vbase).to(g_faces.scalar_type()));
+          UVFs.push_back((sF + uvbase).to(g_uvf.scalar_type()));
           vbase += N; uvbase += N;
         }
         g_verts = torch::cat(Vs, 0); g_norm = torch::cat(Ns, 0); g_uv = torch::cat(UVs, 0);
