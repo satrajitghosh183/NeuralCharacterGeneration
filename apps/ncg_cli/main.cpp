@@ -1617,7 +1617,7 @@ int cmd_mvbench(const ncg::app::Args& args) {
 
   // One ablation condition: fit a subset under given defences, return held-out PSNR vs true subject.
   auto run = [&](const std::vector<ncg::fit::AvatarFrame>& fr, bool attrib, bool quality, bool robust,
-                 bool blur, bool pose, const char* name) {
+                 bool blur, bool pose, bool frobust, const char* name) {
     std::vector<ncg::fit::AvatarFrame> f = fr;
     for (size_t i = 0; i < f.size(); ++i)
       f[i].weight = (attrib ? wsub[i] : 1.0F) * (quality ? wqual[i] : 1.0F);
@@ -1627,10 +1627,13 @@ int cmd_mvbench(const ncg::app::Args& args) {
     cfg.densify = false;
     cfg.robust = robust;
     cfg.conf_blur = blur;
-    cfg.refine_pose = pose;  // M2: per-frame camera bundle-adjustment (joint pose factorization)
-    cfg.pose_reg = args.get_float("pose-reg", 2.0F);  // moderate: clean cameras stay put, bad ones move
+    cfg.refine_pose = pose;  // joint camera bundle-adjustment baseline (shown unstable)
+    cfg.pose_reg = args.get_float("pose-reg", 2.0F);
     cfg.lr_pose = args.get_float("lr-pose", 3e-3F);
-    cfg.pose_refine_from = static_cast<int>(args.get_float("pose-warmup", 0.5F) * iters);  // warm-up
+    cfg.pose_refine_from = static_cast<int>(args.get_float("pose-warmup", 0.5F) * iters);
+    cfg.frame_robust = frobust;  // M2: frame-level residual gating (the stable pose channel)
+    cfg.frame_robust_from = static_cast<int>(args.get_float("frobust-warmup", 0.4F) * iters);
+    cfg.frame_robust_k = args.get_float("frobust-k", 2.0F);
     auto fit = ncg::fit::fit_avatar(model, rest.betas.squeeze(0), f, init_gray, cfg, nullptr, cov);
     const auto fh = ncg::runtime::render_soft_aniso(fit.canonical, hc);
     const double p = ncg::record::psnr(fh.image.detach() * hmask, gh.image.detach() * hmask);
@@ -1642,22 +1645,23 @@ int cmd_mvbench(const ncg::app::Args& args) {
   // CEILING = clean subject frames only (no contamination); then the contaminated-set ablation.
   //                     frames   attrib quality robust blur   name
   std::vector<ncg::fit::AvatarFrame> clean(frames.begin(), frames.begin() + Ns);
-  //                     frames   attr  qual  robust blur  pose   name
-  const double p_ceil = run(clean, false, false, false, false, false, "ceiling");
-  const double p_naive = run(frames, false, false, false, false, false, "naive");
-  const double p_rob = run(frames, false, false, true, false, false, "robust");  // prior C2 baseline
-  const double p_m1 = run(frames, true, false, false, false, false, "m1");
-  const double p_m3 = run(frames, false, true, false, true, false, "m3");
-  const double p_m2 = run(frames, false, false, false, false, true, "m2");  // joint camera BA (unstable)
-  // OURS = M1 (who) + M3 (quality+blur). NOT M2: naive joint camera bundle-adjustment destabilizes a
-  // from-scratch fit (clean cameras co-adapt into a degenerate over-fit; held-out collapses — shown by
-  // the M2 column), and NOT the prior per-pixel robust/C2 (over-rejects clean signal). Robust pose
-  // factorization needs frame-level residual gating, not free per-frame camera DOF — left to M2-future.
-  const double p_ours = run(frames, true, true, false, true, false, "ours");
+  //                      frames  attr  qual  robust blur  pose  frob   name
+  const double p_ceil = run(clean, false, false, false, false, false, false, "ceiling");
+  const double p_naive = run(frames, false, false, false, false, false, false, "naive");
+  const double p_rob = run(frames, false, false, true, false, false, false, "robust");   // prior C2
+  const double p_ba = run(frames, false, false, false, false, true, false, "jointBA");    // unstable
+  const double p_m1 = run(frames, true, false, false, false, false, false, "m1");          // who
+  const double p_m3 = run(frames, false, true, false, true, false, false, "m3");           // quality
+  const double p_m2 = run(frames, false, false, false, false, false, true, "m2");          // frame-robust pose
+  // OURS = M1 (who) + M3 (quality+blur) + M2 (frame-level residual gating). The prior per-pixel
+  // robust/C2 (over-rejects clean signal) and joint camera BA (free DOF → degenerate over-fit) both
+  // HURT — kept as baseline columns. M2-as-frame-gating is the stable pose channel: it only removes
+  // the influence of unreconcilable (pose-bad) views, never adds DOF.
+  const double p_ours = run(frames, true, true, false, true, false, true, "ours");
   NCG_LOG_INFO("mvbench SUMMARY (ceiling {:.2f} dB, contamination gap -{:.2f}): naive {:.2f} | "
-               "robust(C2) {:.2f} | jointBA {:.2f} | M1 {:.2f} | M3 {:.2f} | OURS(M1+M3) {:.2f} "
-               "(recovers {:.0f}% of the gap; robust & jointBA HURT) -> {}",
-               p_ceil, p_ceil - p_naive, p_naive, p_rob, p_m2, p_m1, p_m3, p_ours,
+               "robust/C2 {:.2f} | jointBA {:.2f} | M1 {:.2f} | M2 {:.2f} | M3 {:.2f} | "
+               "OURS(M1+M2+M3) {:.2f} (recovers {:.0f}% of the gap; robust & jointBA HURT) -> {}",
+               p_ceil, p_ceil - p_naive, p_naive, p_rob, p_ba, p_m1, p_m2, p_m3, p_ours,
                (p_naive < p_ceil) ? 100.0 * (p_ours - p_naive) / (p_ceil - p_naive) : 100.0, prefix);
   return 0;
 }

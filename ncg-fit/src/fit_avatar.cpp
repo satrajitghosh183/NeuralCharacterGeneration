@@ -250,6 +250,10 @@ AvatarFitResult fit_avatar(const body::SmplxModel& model, const Tensor& betas_in
     return im.squeeze(0);  // [3,H,W]
   };
 
+  // M2 frame-robust: per-frame photometric-residual EMA (−1 = not yet seen). Persistently-high frames
+  // (e.g. pose-misestimated views that can't reconcile with the consensus) get down-weighted.
+  std::vector<float> fresid(static_cast<size_t>(F), -1.0F);
+
   for (int it = 0; it < cfg.iterations; ++it) {
     const int64_t f = weighted ? torch::multinomial(fw, 1).item<int64_t>()
                                : torch::randint(0, F, {1}, at::kLong).item<int64_t>();
@@ -305,6 +309,28 @@ AvatarFitResult fit_avatar(const body::SmplxModel& model, const Tensor& betas_in
       l1 = torch::l1_loss(pred, tgt);
     }
     auto loss = (1.0 - cfg.lambda_dssim) * l1 + cfg.lambda_dssim * (1.0 - ssim(pred, tgt));
+    // M2: track this frame's photometric residual (EMA) and, after warm-up, down-weight frames whose
+    // residual is a persistent outlier vs the consensus median (Welsch) — they can't be reconciled
+    // (mis-estimated pose / unmodelable view) and would otherwise drag the shared canonical.
+    if (cfg.frame_robust) {
+      const auto d = (pred - tgt).abs();
+      const float rf = cfg.use_mask
+                           ? (d.sum() / (masks[f].sum() * 3.0 + 1e-6)).item<float>()
+                           : d.mean().item<float>();
+      auto& fr = fresid[static_cast<size_t>(f)];
+      fr = (fr < 0.0F) ? rf : 0.9F * fr + 0.1F * rf;
+      if (it >= cfg.frame_robust_from) {
+        std::vector<float> seen;
+        seen.reserve(static_cast<size_t>(F));
+        for (float v : fresid)
+          if (v >= 0.0F) seen.push_back(v);
+        std::nth_element(seen.begin(), seen.begin() + seen.size() / 2, seen.end());
+        const float med = seen[seen.size() / 2];
+        const float c = std::max(1e-4F, static_cast<float>(cfg.frame_robust_k) * med);
+        const float wrob = std::exp(-0.5F * (fr / c) * (fr / c));  // ∈(0,1], outlier frames → small
+        loss = loss * static_cast<double>(wrob);
+      }
+    }
     if (cfg.refine_pose) {  // keep the camera residual small (stay near the NLF estimate)
       loss = loss + cfg.pose_reg * (cam_drot[f].pow(2).sum() + cam_dt[f].pow(2).sum());
     }

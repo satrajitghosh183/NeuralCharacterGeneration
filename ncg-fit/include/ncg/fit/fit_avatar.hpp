@@ -40,6 +40,16 @@ struct AvatarFitConfig {
   bool robust = false;
   double robust_k = 3.0;            // Welsch scale = robust_k · median(residual), recomputed per step
 
+  // M2 (robust pose/observation factorization): FRAME-LEVEL robust weighting. Unlike per-pixel robust
+  // (which over-rejects clean pixels) or joint camera bundle-adjustment (which adds free per-frame DOF
+  // and co-adapts into a degenerate over-fit), this only DOWN-WEIGHTS whole frames whose photometric
+  // residual stays an outlier vs the consensus — exactly what a pose-misestimated (or otherwise
+  // unmodelable) view looks like. Stable by construction: it removes influence, never adds DOF. A
+  // warm-up lets appearance form first so the residual signal is meaningful. Off by default.
+  bool frame_robust = false;
+  int frame_robust_from = 0;        // warm-up: start frame-robust weighting at this iteration
+  double frame_robust_k = 2.0;      // Welsch scale = k · median(per-frame residual EMA)
+
   // M3: confidence-weighted anisotropic-blur loss. A low-confidence frame (motion blur, NLF pose
   // noise — i.e. a small frame weight) should NOT force its unreliable high-frequency detail into the
   // shared canonical. So both render and target are blurred by a Gaussian whose width grows as the
