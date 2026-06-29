@@ -1540,6 +1540,36 @@ int cmd_avatar(const ncg::app::Args& args) {
   auto nlf = ncg::body::Nlf::load(args.require("weights"), device, nc);
   const auto model = ncg::body::SmplxModel::load(args.require("smplx"), device);
 
+  // M1 attribution (the WHO channel) — optional, enabled when --arcface + --detector are given. Per
+  // frame we compute ArcFace face similarity (when a face is visible), NLF-β body-shape similarity,
+  // and an appearance-histogram similarity to the album's strongest-face frame, fuse them into a
+  // partial-cue w_subject, and FOLD it into the fit weight so contaminating frames (other people on
+  // a runway/red-carpet clip) contribute ~0 while faceless-but-matching frames still count. Reuses
+  // the per-frame NLF pass below — no extra inference. Disabled => behaviour unchanged.
+  const bool attrib = !args.get("arcface", "").empty() && !args.get("detector", "").empty();
+  std::optional<ncg::body::FaceDetector> a_det;
+  std::optional<ncg::body::ArcFace> a_arc;
+  if (attrib) {
+    a_det = ncg::body::FaceDetector::load(args.require("detector"), at::kCPU);
+    a_arc = ncg::body::ArcFace::load(args.require("arcface"), at::kCPU);
+    NCG_LOG_INFO("avatar: M1 attribution ON (ArcFace + NLF-β + appearance)");
+  }
+  auto color_hist = [](const torch::Tensor& img_cpu, const torch::Tensor& v2d) -> torch::Tensor {
+    const int64_t H = img_cpu.size(1), W = img_cpu.size(2);
+    const auto vc = v2d.to(at::kCPU);
+    const int x0 = std::clamp<int>((int)vc.select(1, 0).min().item<float>(), 0, (int)W - 2);
+    const int x1 = std::clamp<int>((int)vc.select(1, 0).max().item<float>(), x0 + 1, (int)W);
+    const int y0 = std::clamp<int>((int)vc.select(1, 1).min().item<float>(), 0, (int)H - 2);
+    const int y1 = std::clamp<int>((int)vc.select(1, 1).max().item<float>(), y0 + 1, (int)H);
+    const auto crop = img_cpu.slice(1, y0, y1).slice(2, x0, x1).clamp(0, 1);
+    std::vector<torch::Tensor> hs;
+    for (int c = 0; c < 3; ++c) hs.push_back(torch::histc(crop[c], 8, 0.0, 1.0));
+    auto h = torch::cat(hs);
+    return h / h.sum().clamp_min(1.0);  // [24]
+  };
+  std::vector<torch::Tensor> at_beta, at_arc, at_hist;  // per-kept-frame attribution cues (aligned)
+  std::vector<float> at_fsc;                            // per-kept-frame face-detection score
+
   const int res = args.get_int("res", 288);
   namespace F = torch::nn::functional;
   auto downscale = [&](const torch::Tensor& img) {
@@ -1568,7 +1598,8 @@ int cmd_avatar(const ncg::app::Args& args) {
   torch::Tensor betas0;
   torch::Tensor init_colors;
   for (size_t i = 0; i < paths.size(); ++i) {
-    const auto img_full = ncg::io::load_image(paths[i]).to(device);
+    const auto img_cpu = ncg::io::load_image(paths[i]);  // CPU copy for the (CPU) face nets
+    const auto img_full = img_cpu.to(device);
     auto [img, s] = downscale(img_full);
     ncg::body::NlfPrediction pred;
     try {
@@ -1631,6 +1662,17 @@ int cmd_avatar(const ncg::app::Args& args) {
       }
       yaws.push_back(yaw);
     }
+    // M1 — attribution cues for this kept frame (reuses the NLF pred; face nets run on the CPU image).
+    if (attrib) {
+      torch::Tensor a;
+      float fsc = 0.0F;
+      const auto faces = a_det->detect(img_cpu, 0.5F);
+      if (!faces.empty()) { a = a_arc->embed(img_cpu, faces[0]); fsc = faces[0].score; }
+      at_arc.push_back(a);  // undefined when no face — partial cue
+      at_fsc.push_back(fsc);
+      at_beta.push_back(pred.params.betas.reshape({-1}).to(at::kCPU));
+      at_hist.push_back(color_hist(img_cpu, pred.vertices2d));
+    }
     frames.push_back(std::move(fr));
 
     if (!init_colors.defined()) {  // seed appearance from the first good frame
@@ -1679,6 +1721,39 @@ int cmd_avatar(const ncg::app::Args& args) {
     for (int b = 0; b < 12; ++b) hs += std::to_string(hist[b]) + (b < 11 ? "," : "");
     NCG_LOG_INFO("extract: {} frames, mean weight {:.2f}, {} low-weight; yaw-coverage {}/12 bins "
                  "occupied [{}] (E7 GO/NO-GO)", F, wsum / F, dropped, occupied, hs);
+  }
+
+  // ===== M1 ATTRIBUTION FOLD: multiply the WHO channel into each frame's fit weight =====
+  // Reference = the strongest-face frame (clearest view of the album's dominant subject). Off-subject
+  // frames (different β + appearance, and a non-matching face when one is visible) get w_subject -> 0
+  // and so stop poisoning the shared canonical appearance. Applied AFTER E1/E5 so it composes.
+  if (attrib && at_fsc.size() == frames.size() && !frames.empty()) {
+    size_t ri = 0;
+    for (size_t i = 1; i < at_fsc.size(); ++i)
+      if (at_fsc[i] > at_fsc[ri]) ri = i;
+    const auto rb = at_beta[ri];
+    const auto ra = at_arc[ri];
+    const auto rh = at_hist[ri];
+    const float kappa = args.get_float("attrib-kappa", 10.0F), tau = args.get_float("attrib-tau", 0.45F);
+    const float bscale = args.get_float("attrib-beta-scale", 2.0F);
+    int suppressed = 0;
+    for (size_t i = 0; i < frames.size(); ++i) {
+      float num = 0, den = 0;
+      if (at_arc[i].defined() && ra.defined()) {
+        num += at_fsc[i] * at_arc[i].dot(ra).item<float>();
+        den += at_fsc[i];
+      }
+      const float sb = std::exp(-(at_beta[i] - rb).norm().item<float>() / bscale);
+      num += sb; den += 1.0F;
+      const float sa = torch::minimum(at_hist[i], rh).sum().item<float>();
+      num += sa; den += 1.0F;
+      const float ai = num / std::max(den, 1e-6F);
+      const float ws = 1.0F / (1.0F + std::exp(-kappa * (ai - tau)));
+      frames[i].weight *= ws;
+      if (ws < 0.5F) ++suppressed;
+    }
+    NCG_LOG_INFO("avatar(M1 fold): ref frame #{} (face {:.2f}); {} of {} frames suppressed as "
+                 "off-subject (w_subject<0.5)", ri, at_fsc[ri], suppressed, frames.size());
   }
   NCG_LOG_INFO("avatar: training on {} frames at {}px", frames.size(), res);
 
