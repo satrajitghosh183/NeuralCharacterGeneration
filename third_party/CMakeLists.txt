@@ -6,10 +6,22 @@ include(FetchContent)
 set(FETCHCONTENT_QUIET OFF)
 
 # --- spdlog (logging) ------------------------------------------------------
+# spdlog v1.15.0 bundles fmt 11.0.2, whose consteval compile-time format-string check miscompiles
+# on modern Apple clang ("call to consteval function ... is not a constant expression"; fixed in
+# fmt 11.1+). On Apple hosts, neuter FMT_CONSTEVAL so the check runs at runtime instead. Idempotent
+# (re-running finds nothing to replace) and APPLE-only, so the H100 (GCC) build is byte-for-byte
+# unchanged. This is what lets the CPU dev build compile locally.
+set(_spdlog_patch "")
+if(APPLE)
+  set(_spdlog_patch PATCH_COMMAND sed -i.bak
+      "s/#  define FMT_CONSTEVAL consteval/#  define FMT_CONSTEVAL/"
+      include/spdlog/fmt/bundled/base.h)
+endif()
 FetchContent_Declare(spdlog
   GIT_REPOSITORY https://github.com/gabime/spdlog.git
   GIT_TAG        v1.15.0
-  GIT_SHALLOW    TRUE)
+  GIT_SHALLOW    TRUE
+  ${_spdlog_patch})
 set(SPDLOG_BUILD_EXAMPLE OFF CACHE BOOL "" FORCE)
 set(SPDLOG_BUILD_TESTS   OFF CACHE BOOL "" FORCE)
 set(SPDLOG_INSTALL       OFF CACHE BOOL "" FORCE)

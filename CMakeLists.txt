@@ -72,6 +72,8 @@ endif()
 include(NcgWarnings)   # defines interface target ncg::warnings
 
 # --- Modules ---------------------------------------------------------------
+# (Apple clang's incompatibility with spdlog's bundled-fmt consteval check is handled by an
+# APPLE-only PATCH_COMMAND in third_party/CMakeLists.txt — see the note there.)
 add_subdirectory(third_party)
 add_subdirectory(ncg-core)
 add_subdirectory(ncg-io)
