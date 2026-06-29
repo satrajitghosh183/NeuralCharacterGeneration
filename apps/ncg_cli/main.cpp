@@ -1856,6 +1856,8 @@ int cmd_avatar(const ncg::app::Args& args) {
     cfg.per_view_exposure = args.get_int("exposure", 1) != 0;
     cfg.robust = args.get_int("robust", 1) != 0;  // C2 robust consistency on by default (mixed data)
     cfg.robust_k = args.get_float("robust_k", 3.0F);
+    cfg.conf_blur = args.get_int("conf-blur", 0) != 0;  // M3 confidence-weighted anisotropic-blur loss
+    cfg.conf_blur_max = args.get_float("conf-blur-max", 2.5F);
     cfg.log_every = 50;
     cfg.dump_every = args.get_int("dump-every", 500);
     cfg.densify = args.get_int("densify", 0) != 0;

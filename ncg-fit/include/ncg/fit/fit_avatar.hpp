@@ -40,6 +40,15 @@ struct AvatarFitConfig {
   bool robust = false;
   double robust_k = 3.0;            // Welsch scale = robust_k · median(residual), recomputed per step
 
+  // M3: confidence-weighted anisotropic-blur loss. A low-confidence frame (motion blur, NLF pose
+  // noise — i.e. a small frame weight) should NOT force its unreliable high-frequency detail into the
+  // shared canonical. So both render and target are blurred by a Gaussian whose width grows as the
+  // frame's confidence (its weight, normalized to the max) drops — anisotropic: wider horizontally,
+  // matching the horizontal-dominant motion blur of a walking/turning subject. Sharp, trusted frames
+  // are matched at full resolution; blurry ones still constrain silhouette + coarse colour. 0 = off.
+  bool conf_blur = false;
+  double conf_blur_max = 2.5;       // max horizontal blur sigma (pixels) at zero confidence
+
   // BUNDLE ADJUSTMENT: jointly refine each frame's CAMERA EXTRINSICS (small rotation+translation
   // residual, regularized toward the NLF estimate) so multi-view frames ALIGN instead of mushing.
   // The diagnosed fix for "views exist but per-frame poses disagree". Off by default (legacy).

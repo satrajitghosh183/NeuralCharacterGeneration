@@ -226,6 +226,26 @@ AvatarFitResult fit_avatar(const body::SmplxModel& model, const Tensor& betas_in
   auto fw = torch::ones({F}, opts);
   for (int64_t i = 0; i < F; ++i) fw[i] = std::max(1e-3F, frames[static_cast<size_t>(i)].weight);
   const bool weighted = (fw.max() - fw.min()).item<float>() > 1e-4F;
+  const float fwmax = fw.max().item<float>();  // M3: normalizer for per-frame confidence
+
+  // M3: separable anisotropic Gaussian blur of a [3,H,W] image (grouped conv, one Gaussian per axis).
+  auto gauss1d = [](double s, const at::TensorOptions& o) {
+    const int r = std::max(1, static_cast<int>(std::ceil(3.0 * s)));
+    const auto x = torch::arange(-r, r + 1, o);
+    const auto k = torch::exp(-0.5 * (x / s).pow(2));
+    return k / k.sum();  // [2r+1]
+  };
+  auto blur_aniso = [&](const Tensor& img, double sx, double sy) {
+    const auto o = img.options();
+    auto im = img.unsqueeze(0);  // [1,3,H,W]
+    const auto kx = gauss1d(sx, o);
+    const auto Kx = kx.view({1, 1, 1, -1}).expand({3, 1, 1, kx.size(0)}).contiguous();
+    im = torch::conv2d(im, Kx, {}, 1, {0, (kx.size(0) - 1) / 2}, 1, 3);  // along W
+    const auto ky = gauss1d(sy, o);
+    const auto Ky = ky.view({1, 1, -1, 1}).expand({3, 1, ky.size(0), 1}).contiguous();
+    im = torch::conv2d(im, Ky, {}, 1, {(ky.size(0) - 1) / 2, 0}, 1, 3);  // along H
+    return im.squeeze(0);  // [3,H,W]
+  };
 
   for (int it = 0; it < cfg.iterations; ++it) {
     const int64_t f = weighted ? torch::multinomial(fw, 1).item<int64_t>()
@@ -246,6 +266,18 @@ AvatarFitResult fit_avatar(const body::SmplxModel& model, const Tensor& betas_in
     if (cfg.use_mask) {
       pred = pred * masks[f];
       tgt = tgt * masks[f];
+    }
+    // M3: confidence-weighted anisotropic blur — match low-confidence frames only at low frequency, so
+    // their unreliable detail can't sharpen-then-muddy the canonical. Blur grows as the frame's weight
+    // (normalized) drops; wider horizontally (locomotion motion blur). Applied to BOTH pred and target.
+    if (cfg.conf_blur && fwmax > 0.0F) {
+      const float conf = fw[f].item<float>() / fwmax;             // [0,1]
+      const double sx = cfg.conf_blur_max * (1.0 - conf);
+      if (sx > 0.5) {  // skip negligible blur (keeps trusted frames at full resolution)
+        const double sy = std::max(0.5 * sx, 0.5);
+        pred = blur_aniso(pred, sx, sy);
+        tgt = blur_aniso(tgt, sx, sy);
+      }
     }
     Tensor l1;
     if (cfg.robust) {
