@@ -3231,7 +3231,24 @@ int cmd_face(const ncg::app::Args& args) {
           conf = torch::maximum(conf, w);
           NCG_LOG_INFO("face: reprojected refined view az={:+d}", az);
         }
-        NCG_LOG_INFO("face: baked external refined views -> UV texture (reproject-dir)");
+        // VERIFY render: the baked texture as a texel cloud (front + sides) so the bake can be
+        // checked by eye without a glTF viewer. Uses the reprojected colours directly.
+        ncg::recon::GaussianCloud bc;
+        bc.positions = rfp;
+        bc.colors = uv_final.index_select(0, pidx).clamp(0.0F, 1.0F);
+        bc.scales = torch::full({RP, 3}, args.get_float("texel-scale", 0.0010F), rfp.options());
+        bc.opacities = torch::ones({RP, 1}, rfp.options());
+        bc.rotations = torch::zeros({RP, 4}, rfp.options());
+        bc.rotations.select(1, 0).fill_(1.0F);
+        for (int raz : {-20, 0, 20}) {
+          const auto rcam = ncg::runtime::Camera::orbit(rhc, 0.42F, static_cast<float>(raz), 5.0F,
+                                                        28.0F, 512, 512, device);
+          char rn[40];
+          std::snprintf(rn, sizeof(rn), "_reproj_%+03d.png", raz);
+          ncg::io::save_png(prefix + rn, ncg::runtime::render_gaussians(bc, rcam).image);
+        }
+        NCG_LOG_INFO("face: baked external refined views -> UV texture (reproject-dir); "
+                     "verify renders -> {}_reproj_*.png", prefix);
       }
       ncg::io::save_png(prefix + "_albedo_uv.png",
                         uv_final.reshape({T, T, 3}).permute({2, 0, 1}).contiguous().detach());
