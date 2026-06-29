@@ -3351,6 +3351,29 @@ int cmd_face(const ncg::app::Args& args) {
         g_lbs = torch::cat(Ls, 0); g_faces = torch::cat(Fs, 0); g_uvf = torch::cat(UVFs, 0);
         ncg::io::save_png(prefix + "_albedo_uv.png",
                           tex_uv.reshape({T, T, 3}).permute({2, 0, 1}).contiguous().detach());
+        // VERIFY render (GATE A1): head as per-vertex-albedo splats + the eyeballs as brown splats,
+        // so the eyeball PLACEMENT (filling the sockets) is checkable by eye without a mesh renderer.
+        {
+          const int64_t Vc = g_verts.size(0);
+          const auto vcol = torch::cat(
+              {albedo.to(at::kCPU).clamp(0.0F, 1.0F),
+               torch::tensor({0.28F, 0.18F, 0.13F}).reshape({1, 3}).expand({2 * N, 3})}, 0);
+          ncg::recon::GaussianCloud ec;
+          ec.positions = g_verts.to(device);
+          ec.colors = vcol.to(device);
+          ec.scales = torch::full({Vc, 3}, 0.004F, ec.positions.options());
+          ec.opacities = torch::ones({Vc, 1}, ec.positions.options());
+          ec.rotations = torch::zeros({Vc, 4}, ec.positions.options());
+          ec.rotations.select(1, 0).fill_(1.0F);
+          const auto htgt = jc[15].to(device);
+          for (int eaz : {0, -25, 25}) {
+            const auto ecam = ncg::runtime::Camera::orbit(htgt, 0.42F, static_cast<float>(eaz), 5.0F,
+                                                          28.0F, 512, 512, device);
+            char en[36];
+            std::snprintf(en, sizeof(en), "_eyes_check_%+03d.png", eaz);
+            ncg::io::save_png(prefix + en, ncg::runtime::render_gaussians(ec, ecam).image);
+          }
+        }
         NCG_LOG_INFO("face: added 2 eyeballs ({} verts each, r={:.3f}m) skinned to head joint", N, ir);
       }
 
