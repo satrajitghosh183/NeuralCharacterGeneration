@@ -3296,7 +3296,7 @@ int cmd_face(const ncg::app::Args& args) {
       auto g_uvf = model.uv_faces().to(at::kCPU);     // [F,3]
       auto g_lbs = model.lbs_weights().to(at::kCPU);  // [V,J]
       auto tex_uv = uv_final;                   // [T^2,3] (may paint the eye texel)
-      if (args.get_int("eyes", 1) != 0 && joints.size(0) > 24) {
+      if (args.get_int("eyes", 0) != 0 && joints.size(0) > 24) {  // OFF by default: engine supplies eyes
         // Eye positions in the FACE-MESH frame (the joints are in a different frame). orbit az=0 looks
         // down -z at the +z-facing face, +y up, +x right -> nose tip = the max-z vertex; the eyes sit
         // above + behind + beside it by anatomical offsets. Robust + frame-correct.
@@ -3396,7 +3396,7 @@ int cmd_face(const ncg::app::Args& args) {
       // position<->uv, like the eyeballs, to dodge UV seams), offset outward by a hair thickness, and
       // paint it a tunable dark hair colour (the baked scalp texels are grey). Skin to the head joint so
       // it moves with the head. --hair 0 to disable; --hair-q / --hair-thick / --hair-r,g,b to tune.
-      if (args.get_int("hair", 1) != 0 && joints.size(0) > 15) {
+      if (args.get_int("hair", 0) != 0 && joints.size(0) > 15) {  // OFF by default: engine supplies hair
         const auto idv = id_verts.to(at::kCPU);                                       // [V,3]
         const auto vn = ncg::mesh::compute_vertex_normals(ncg::mesh::TriMesh{idv, faces.to(at::kCPU)})
                             .to(at::kCPU);
