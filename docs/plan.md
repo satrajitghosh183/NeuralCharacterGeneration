@@ -29,15 +29,31 @@ Grounded in two deep-research passes (see `research-findings.md` + memory). Supe
   frequency via a per-frame Gaussian (wider horizontally for locomotion blur) on both render+target,
   so unreliable detail can't muddy the shared canonical.
 - **M4 (the money figure): `ncg_cli mvbench`** — controlled robustness benchmark. From a known
-  synthetic avatar, render clean multi-view (the ceiling), inject CONTROLLED contamination (8 frames
-  of a different person: different shape + colour cast; 8 motion-blurred + camera-jittered frames),
-  fit under a per-channel ablation, measure held-out-view PSNR-vs-true-subject. **Result (H100, 40
-  frames, held-out view):** ceiling **44.80 dB**; naive (contaminated) **37.89** (−6.91 gap);
-  prior per-pixel robust/C2 **35.05** (HURTS — over-rejects clean signal under whole-frame
-  contamination); **M1 41.49**, **M3 42.31**, **OURS (M1+M3) 43.73 — recovers 85% of the gap**.
-  M1 suppresses exactly the 8 contaminant frames (0 false positives). Verified by eye (renders in the
-  run dir): `ours` is visibly crisper + truer-colour than `naive`. Fully synthetic ⇒ exact ground
-  truth, no dependence on scavenged real data. Remaining: M2 (joint pose/appearance factorization).
+  synthetic avatar, render clean multi-view (the ceiling), inject CONTROLLED contamination across all
+  three nuisance axes — **8 wrong-person** frames (different shape + colour cast), **8 motion-blurred
+  + jittered** frames, **6 pose-misestimated** frames (sharp, right person, wrong camera) — then fit
+  under a per-channel ablation and measure held-out-view PSNR-vs-true-subject. **Final result (H100,
+  46 frames, held-out view):**
+
+  | condition | PSNR | vs naive |
+  |---|---|---|
+  | ceiling (clean) | **45.99 dB** | — |
+  | naive (contaminated) | 39.54 | −6.45 gap |
+  | prior per-pixel robust / C2 | 34.34 | **−5.2 (HURTS)** |
+  | joint camera bundle-adjustment | 31.38 | **−8.2 (HURTS)** |
+  | M1 (who: attribution) | 41.17 | +1.6 |
+  | M3 (quality: conf-blur) | 42.49 | +3.0 |
+  | **OURS (M1+M3)** | **44.28** | **recovers 74% of the gap** |
+
+  M1 suppresses exactly the 8 wrong-person frames (0 false positives). Verified by eye (renders in the
+  run dir): `ours` is crisp + near-ceiling; `m2`/jointBA is visibly ghosted (cameras drift). Two
+  HONEST NEGATIVES: (1) the prior per-pixel robust/C2 over-rejects clean signal under structured
+  whole-frame contamination; (2) **naive joint pose bundle-adjustment is destabilizing** — freeing
+  per-frame camera DOF against a from-scratch canonical co-adapts into a degenerate over-fit that
+  collapses held-out (tried with a 50% appearance warm-up too; 29→31 dB, still ≪ naive). The working
+  contribution is M1 (who) + M3 (quality). **M2-FUTURE:** robust pose factorization needs *frame-level
+  residual gating* (reject misaligned views), NOT free camera DOF — the clear next implementation.
+  Fully synthetic ⇒ exact ground truth, no dependence on scavenged real data.
 
 ---
 
