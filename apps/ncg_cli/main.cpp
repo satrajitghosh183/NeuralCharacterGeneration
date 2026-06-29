@@ -3297,17 +3297,23 @@ int cmd_face(const ncg::app::Args& args) {
       auto g_lbs = model.lbs_weights().to(at::kCPU);  // [V,J]
       auto tex_uv = uv_final;                   // [T^2,3] (may paint the eye texel)
       if (args.get_int("eyes", 1) != 0 && joints.size(0) > 24) {
-        const auto jc = joints.to(at::kCPU);
-        // Locate the eye joints robustly: among joints near the head (joint 15), the two highest-z
-        // (most forward) symmetric points are the eyes. Falls back to logging if uncertain.
-        const auto head_p = jc[15];                                            // head joint
-        NCG_LOG_INFO("DEBUG joints J={}: j15=({:.3f},{:.3f},{:.3f})", joints.size(0),
-                     head_p[0].item<float>(), head_p[1].item<float>(), head_p[2].item<float>());
-        for (int ji = 22; ji <= 24 && ji < joints.size(0); ++ji)
-          NCG_LOG_INFO("DEBUG j{}=({:.3f},{:.3f},{:.3f})", ji, jc[ji][0].item<float>(),
-                       jc[ji][1].item<float>(), jc[ji][2].item<float>());
-        const auto eyes_c = torch::stack({jc[23], jc[24]}, 0);                  // [2,3] eyeball centers
-        const float ir = std::clamp(0.18F * (jc[23] - jc[24]).norm().item<float>(), 0.009F, 0.016F);
+        // Eye positions in the FACE-MESH frame (the joints are in a different frame). orbit az=0 looks
+        // down -z at the +z-facing face, +y up, +x right -> nose tip = the max-z vertex; the eyes sit
+        // above + behind + beside it by anatomical offsets. Robust + frame-correct.
+        const auto idv = id_verts.to(at::kCPU);
+        // Restrict the nose search to the head region (top ~25cm); in rest pose toes/fingers can rival
+        // the face for max-z, but within the head the most-forward vertex is unambiguously the nose tip.
+        const float ymax = idv.select(1, 1).max().item<float>();
+        const auto headv = idv.index({idv.select(1, 1) > (ymax - 0.25F)});
+        const auto nose = headv[headv.select(1, 2).argmax().item<int64_t>()];
+        const float nx = nose[0].item<float>(), ny = nose[1].item<float>(), nz = nose[2].item<float>();
+        const float eyx = args.get_float("eye-x", 0.032F), eyy = args.get_float("eye-up", 0.030F),
+                    eyz = args.get_float("eye-back", 0.018F);
+        const auto eyes_c = torch::stack({torch::tensor({nx - eyx, ny + eyy, nz - eyz}),
+                                          torch::tensor({nx + eyx, ny + eyy, nz - eyz})}, 0);  // [2,3]
+        const float ir = args.get_float("eye-r", 0.012F);
+        NCG_LOG_INFO("DEBUG nose=({:.3f},{:.3f},{:.3f}) eyeL=({:.3f},{:.3f},{:.3f}) r={:.3f}", nx, ny,
+                     nz, nx - eyx, ny + eyy, nz - eyz, ir);
         const int nlat = 12, nlon = 16;
         std::vector<float> sv;
         std::vector<int64_t> sf;
@@ -3373,7 +3379,7 @@ int cmd_face(const ncg::app::Args& args) {
           ec.opacities = torch::ones({Vc, 1}, ec.positions.options());
           ec.rotations = torch::zeros({Vc, 4}, ec.positions.options());
           ec.rotations.select(1, 0).fill_(1.0F);
-          const auto htgt = jc[15].to(device);
+          const auto htgt = eyes_c.mean(0).to(device);  // frame on the eyes (id_verts frame)
           for (int eaz : {0, -25, 25}) {
             const auto ecam = ncg::runtime::Camera::orbit(htgt, 0.42F, static_cast<float>(eaz), 5.0F,
                                                           28.0F, 512, 512, device);
