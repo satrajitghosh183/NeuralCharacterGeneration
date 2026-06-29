@@ -1444,6 +1444,160 @@ int cmd_attribute(const ncg::app::Args& args) {
   return 0;
 }
 
+// `mvbench` — M4 CONTROLLED robustness benchmark (the paper's money figure). From a known synthetic
+// avatar we render a clean multi-view set (the CEILING), then inject CONTROLLED contamination — frames
+// of a DIFFERENT person (different shape + inverted appearance) and motion-blurred + camera-jittered
+// frames — and fit under an ablation of the defences: naive / +robust(C2) / +M1 attribution / +M3
+// confidence-blur / +ALL. Every condition's held-out-view PSNR-vs-true-subject is measured, so the
+// table reads as "how much of the gap to the clean ceiling each channel recovers". Fully synthetic =
+// ground truth is exact and the result is verifiable, with no dependence on scavenged real data.
+int cmd_mvbench(const ncg::app::Args& args) {
+  NCG_CHECK(ncg::cuda_available(), "mvbench requires a CUDA device");
+  const auto device = at::Device(at::kCUDA, 0);
+  auto rec = ncg::record::Recorder::create("runs", args.get("run", "mvbench"));
+  const auto prefix = (rec.dir() / "mvb").string();
+  auto model = ncg::body::SmplxModel::load(args.require("smplx"), device);
+  const auto dopt = at::TensorOptions().device(device).dtype(at::kFloat);
+  const int res = args.get_int("res", 256);
+  const int Ns = args.get_int("subject-views", 24);   // clean subject views
+  const int Kc = args.get_int("contam-views", 8);      // wrong-person contaminant frames
+  const int Kb = args.get_int("blur-views", 8);        // motion-blurred + jittered subject frames
+  const float scale = args.get_float("scale", 0.008F);
+  const float radius = args.get_float("radius", 2.4F), elev = 10.0F, fov = 50.0F;
+
+  // ---- ground-truth SUBJECT (neutral shape, smooth-gradient albedo) ----
+  ncg::body::SmplxParams rest;
+  rest.betas = torch::zeros({1, model.num_betas()}, dopt);
+  rest.pose_aa = torch::zeros({1, model.num_joints(), 3}, dopt);
+  rest.transl = torch::zeros({1, 3}, dopt);
+  const auto v_subj = model.forward(rest).vertices.squeeze(0);  // [V,3]
+  const int64_t V = v_subj.size(0);
+  const auto mn = std::get<0>(v_subj.min(0)), mx = std::get<0>(v_subj.max(0));
+  const auto A_subj = ((v_subj - mn) / (mx - mn).clamp_min(1e-4)).clamp(0.05, 0.95);  // [V,3]
+  const auto gt_subj = ncg::recon::gaussians_on_body(
+      v_subj, scale, A_subj, ncg::recon::per_vertex_scale(v_subj.to(at::kCPU), 0.75).to(device));
+  const auto center = gt_subj.positions.mean(0);
+  const auto cams = ncg::runtime::orbit_trajectory(center, radius, elev, Ns, fov, res, res, device);
+
+  // ---- CONTAMINANT: a different person — different shape (betas) + inverted appearance ----
+  ncg::body::SmplxParams r2 = rest;
+  r2.betas = torch::full({1, model.num_betas()}, 1.5F, dopt);  // clearly different body
+  const auto v_cont = model.forward(r2).vertices.squeeze(0);
+  const auto A_cont = (1.0 - A_subj).clamp(0.05, 0.95);  // inverted look => separable by appearance
+  const auto gt_cont = ncg::recon::gaussians_on_body(
+      v_cont, scale, A_cont, ncg::recon::per_vertex_scale(v_cont.to(at::kCPU), 0.75).to(device));
+  const auto center_c = gt_cont.positions.mean(0);
+
+  // Separable Gaussian blur of a [3,H,W] image (for the motion-blur frames).
+  auto gblur = [&](const torch::Tensor& img, double s) {
+    const auto o = img.options();
+    const int r = std::max(1, static_cast<int>(std::ceil(3.0 * s)));
+    const auto x = torch::arange(-r, r + 1, o);
+    auto k = torch::exp(-0.5 * (x / s).pow(2));
+    k = k / k.sum();
+    auto im = img.unsqueeze(0);
+    im = torch::conv2d(im, k.view({1, 1, 1, -1}).expand({3, 1, 1, k.size(0)}).contiguous(), {}, 1,
+                       {0, r}, 1, 3);
+    im = torch::conv2d(im, k.view({1, 1, -1, 1}).expand({3, 1, k.size(0), 1}).contiguous(), {}, 1,
+                       {r, 0}, 1, 3);
+    return im.squeeze(0);
+  };
+  // Foreground colour histogram (8 bins/channel over alpha>0 pixels) — the M1 appearance cue.
+  auto fg_hist = [&](const torch::Tensor& img, const torch::Tensor& alpha) {
+    const auto m = (alpha.reshape({-1}) > 0.05F);
+    std::vector<torch::Tensor> hs;
+    for (int c = 0; c < 3; ++c)
+      hs.push_back(torch::histc(img[c].reshape({-1}).masked_select(m), 8, 0.0, 1.0));
+    auto h = torch::cat(hs);
+    return h / h.sum().clamp_min(1.0);
+  };
+
+  // ---- assemble the contaminated training set (+ provenance + M1 attribution weight) ----
+  std::vector<ncg::fit::AvatarFrame> frames;  // full set
+  std::vector<int> kind;                       // 0 clean, 1 contaminant, 2 blurred
+  std::vector<torch::Tensor> hists;            // per-frame appearance descriptor
+  auto add = [&](const ncg::runtime::Camera& cam, const ncg::recon::GaussianCloud& cloud, int knd,
+                 bool blur) {
+    auto out = ncg::runtime::render_soft_aniso(cloud, cam);
+    auto tgt = out.image.detach();
+    if (blur) tgt = gblur(tgt, args.get_float("blur-sigma", 2.5F)).detach();
+    ncg::fit::AvatarFrame fr;
+    fr.pose_aa = torch::zeros({model.num_joints(), 3}, dopt);
+    fr.transl = torch::zeros({3}, dopt);
+    fr.camera = cam;
+    fr.target = tgt;
+    hists.push_back(fg_hist(tgt, out.alpha.detach()));
+    frames.push_back(std::move(fr));
+    kind.push_back(knd);
+  };
+  for (int i = 0; i < Ns; ++i) add(cams[i], gt_subj, 0, false);                       // clean subject
+  const auto ccams = ncg::runtime::orbit_trajectory(center_c, radius, elev, Kc, fov, res, res, device);
+  for (int i = 0; i < Kc; ++i) add(ccams[i], gt_cont, 1, false);                       // wrong person
+  for (int i = 0; i < Kb; ++i) {                                                       // blurred + jittered
+    auto cam = cams[(i * 3) % Ns];
+    cam.t = cam.t + torch::randn_like(cam.t) * args.get_float("jitter", 0.04F);        // camera misalignment
+    add(cam, gt_subj, 2, true);
+  }
+  const int64_t Ftot = static_cast<int64_t>(frames.size());
+
+  // M1 attribution weight: appearance-histogram similarity to the reference (clean frame 0).
+  const float kappa = args.get_float("attrib-kappa", 12.0F), tau = args.get_float("attrib-tau", 0.55F);
+  std::vector<float> wsub(static_cast<size_t>(Ftot), 1.0F);
+  {
+    const auto ref = hists[0];
+    int sup = 0;
+    for (int64_t i = 0; i < Ftot; ++i) {
+      const float sim = torch::minimum(hists[static_cast<size_t>(i)], ref).sum().item<float>();
+      wsub[static_cast<size_t>(i)] = 1.0F / (1.0F + std::exp(-kappa * (sim - tau)));
+      if (wsub[static_cast<size_t>(i)] < 0.5F) ++sup;
+    }
+    NCG_LOG_INFO("mvbench: {} frames ({} clean + {} contaminant + {} blurred); M1 suppresses {} "
+                 "(w_subject<0.5)", Ftot, Ns, Kc, Kb, sup);
+  }
+
+  const auto cov = torch::ones({V}, dopt);
+  const auto init_gray = torch::full({V, 3}, 0.5F, dopt);  // appearance must be LEARNED from frames
+  const int iters = args.get_int("iters", 1200);
+  // Held-out clean-subject view BETWEEN training azimuths — the generalization metric.
+  const auto hc = ncg::runtime::Camera::orbit(center, radius, 360.0F / Ns / 2.0F, elev, fov, res, res, device);
+  const auto gh = ncg::runtime::render_soft_aniso(gt_subj, hc);
+  const auto hmask = (gh.alpha.detach() > 0.05F).to(at::kFloat);
+  ncg::io::save_png(prefix + "_gt_held.png", gh.image.detach());
+
+  // One ablation condition: fit a subset under given defences, return held-out PSNR vs true subject.
+  auto run = [&](const std::vector<ncg::fit::AvatarFrame>& fr, bool attrib, bool robust, bool blur,
+                 const char* name) {
+    std::vector<ncg::fit::AvatarFrame> f = fr;
+    for (size_t i = 0; i < f.size(); ++i) f[i].weight = attrib ? wsub[i] : 1.0F;
+    ncg::fit::AvatarFitConfig cfg;
+    cfg.iterations = iters;
+    cfg.per_view_exposure = false;
+    cfg.densify = false;
+    cfg.robust = robust;
+    cfg.conf_blur = blur;
+    auto fit = ncg::fit::fit_avatar(model, rest.betas.squeeze(0), f, init_gray, cfg, nullptr, cov);
+    const auto fh = ncg::runtime::render_soft_aniso(fit.canonical, hc);
+    const double p = ncg::record::psnr(fh.image.detach() * hmask, gh.image.detach() * hmask);
+    ncg::io::save_png(prefix + "_" + name + "_held.png", fh.image.detach());
+    NCG_LOG_INFO("mvbench[{:>10}]: held-out PSNR = {:.2f} dB", name, p);
+    return p;
+  };
+
+  // CEILING = clean subject frames only (no contamination); then the contaminated-set ablation.
+  std::vector<ncg::fit::AvatarFrame> clean(frames.begin(), frames.begin() + Ns);
+  const double p_ceil = run(clean, false, false, false, "ceiling");
+  const double p_naive = run(frames, false, false, false, "naive");
+  const double p_rob = run(frames, false, true, false, "robust");
+  const double p_m1 = run(frames, true, false, false, "m1");
+  const double p_m3 = run(frames, false, false, true, "m3");
+  const double p_all = run(frames, true, true, true, "all");
+  NCG_LOG_INFO("mvbench SUMMARY (gap-to-ceiling {:.2f} dB): naive {:.2f} (-{:.2f}) | robust {:.2f} | "
+               "M1 {:.2f} | M3 {:.2f} | ALL {:.2f} (recovers {:.0f}% of the gap) -> {}",
+               p_ceil, p_naive, p_ceil - p_naive, p_rob, p_m1, p_m3, p_all,
+               (p_naive < p_ceil) ? 100.0 * (p_all - p_naive) / (p_ceil - p_naive) : 100.0, prefix);
+  return 0;
+}
+
 // `mvtest` — SELF-CONTAINED data-wall-vs-fit-bug isolator. Render a known-clean avatar (gaussians on
 // the rest SMPL-X body, clean per-vertex albedo) from N known orbit cameras → PERFECT multi-view
 // input (exact poses, full 360° yaw, single subject, zero blur). Feed those back to fit_avatar
@@ -3079,6 +3233,7 @@ int main(int argc, char** argv) {
     if (cmd == "geom") return cmd_geom(args);
     if (cmd == "complete") return cmd_complete(args);
     if (cmd == "mvtest") return cmd_mvtest(args);
+    if (cmd == "mvbench") return cmd_mvbench(args);
     if (cmd == "attribute") return cmd_attribute(args);
     if (cmd == "face") return cmd_face(args);
     if (cmd == "nerf") return cmd_nerf(args);
