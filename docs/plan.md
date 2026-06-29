@@ -19,9 +19,25 @@ Grounded in two deep-research passes (see `research-findings.md` + memory). Supe
   attribution from one reference (ArcFace face + NLF-β body shape + appearance histogram), partial-cue
   per-frame `w_subject`, auto-selects the best-face reference. GATE on the contaminated runway (88
   frames): **51 kept (47 FACELESS, attributed via body+appearance — the unlock), 15 rejected as
-  contamination**. No per-subject training. Remaining for full M-method: visual attribution overlay +
-  ArcFace-cluster verification, then M2 (joint pose/appearance factorization), M3 (confidence-weighted
-  anisotropic-blur loss), M4 (unify + gap-to-42dB benchmark) — the multi-week research.
+  contamination**. No per-subject training. Wired into the avatar fit (`avatar --arcface --detector`):
+  per-frame `w_subject` folds into the fit weight. HONEST NEGATIVE: on the real Kendall paparazzi
+  clips this barely fires (1/46 suppressed) and the bake is mud — the data is unusable (subject is a
+  tiny, faceless, motion-blurred figure in cluttered watermarked long-shots). The data wall, now
+  visually proven; no method rescues it. The contribution must be shown on CONTROLLED data instead.
+- **M3 (quality channel): confidence-weighted anisotropic-blur loss** (`fit_avatar --conf-blur`) —
+  low-confidence frames (small weight ⇒ motion blur / pose noise) are matched only at low spatial
+  frequency via a per-frame Gaussian (wider horizontally for locomotion blur) on both render+target,
+  so unreliable detail can't muddy the shared canonical.
+- **M4 (the money figure): `ncg_cli mvbench`** — controlled robustness benchmark. From a known
+  synthetic avatar, render clean multi-view (the ceiling), inject CONTROLLED contamination (8 frames
+  of a different person: different shape + colour cast; 8 motion-blurred + camera-jittered frames),
+  fit under a per-channel ablation, measure held-out-view PSNR-vs-true-subject. **Result (H100, 40
+  frames, held-out view):** ceiling **44.80 dB**; naive (contaminated) **37.89** (−6.91 gap);
+  prior per-pixel robust/C2 **35.05** (HURTS — over-rejects clean signal under whole-frame
+  contamination); **M1 41.49**, **M3 42.31**, **OURS (M1+M3) 43.73 — recovers 85% of the gap**.
+  M1 suppresses exactly the 8 contaminant frames (0 false positives). Verified by eye (renders in the
+  run dir): `ours` is visibly crisper + truer-colour than `naive`. Fully synthetic ⇒ exact ground
+  truth, no dependence on scavenged real data. Remaining: M2 (joint pose/appearance factorization).
 
 ---
 
