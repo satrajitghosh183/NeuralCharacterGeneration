@@ -38,3 +38,17 @@ as scattered bone shapes. The mesh itself is clean (1 mesh, 11313 verts).
 TODO to restore rigging: fix the joint node translations in `write_glb_textured`
 (`ncg-mesh/src/mesh_io.cpp`) — rest-pose joints collapse; verify the exported skeleton in
 Blender, not just bind-pose renders.
+
+## RESOLVED — armature fixed locally (working rig)
+The skeleton bug is fixed. Root cause: the joints handed to `write_glb_textured` were
+collapsed (most joints near origin), so the exported armature was garbage (Blender drew
+it as scattered spheres). SMPL-X was unavailable (deleted), so the fix recovers each
+joint from the glb's **own skin weights** — joint = weighted centroid of the vertices
+shared between it and its parent (the articulation point) — then rewrites the node
+translations + inverse-bind matrices. **Mesh/texture/weights are untouched** (bind pose
+identical; FK == inverse-bind). Tool: `tools/fix_glb_rig.py <in.glb> <out.glb>`.
+
+`me_char_rvxl2_face.glb` / `kj_char_rvxl_face.glb` now carry a correct, animatable
+55-joint skeleton (verified: pelvis→hip→knee→ankle, spine→neck→head, shoulder→elbow→wrist,
+finger chains — see `me_skeleton_FIXED.png`). The `*_static.glb` files remain as a no-rig
+fallback.
