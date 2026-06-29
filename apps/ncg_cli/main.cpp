@@ -1339,6 +1339,87 @@ torch::Tensor recover_uv_albedo(const ncg::body::SmplxModel& model,
 // projected-color mannequin to a real likeness. Renders fit-check + novel-view turntable frames.
 //   ncg_cli avatar --frames dir/ --weights nlf.torchscript --smplx model.safetensors \
 //                  [--max-frames 60 --res 288 --iters 3000 --out-prefix rock_avatar]
+// `attribute` — BLOCKER #1 / M1: multi-modal anchor attribution. From ONE reference image build a
+// signature {ArcFace face, NLF-β body shape, appearance colour histogram} at inference (no per-subject
+// training), then score EVERY frame's subject with whichever cues are visible (partial-cue). The body
+// + appearance cues attribute PROFILE/BACK/faceless frames (where ArcFace can't) to the subject, while
+// other people are rejected — the contamination + faceless-frame fix the runway needed. Emits per-frame
+// w_subject. (Temporal track-stitching is the next increment; per-frame multi-cue lands first.)
+int cmd_attribute(const ncg::app::Args& args) {
+  namespace fs = std::filesystem;
+  const auto ndev = ncg::cuda_available() ? at::Device(at::kCUDA, 0) : at::Device(at::kCPU);
+  auto nlf = ncg::body::Nlf::load(args.require("nlf"), ndev, {});
+  auto det = ncg::body::FaceDetector::load(args.require("detector"), at::kCPU);  // traced CPU weights
+  auto arc = ncg::body::ArcFace::load(args.require("arcface"), at::kCPU);
+
+  // Appearance descriptor: normalized 8-bin/channel RGB histogram over the subject's projected bbox.
+  auto color_hist = [](const torch::Tensor& img_cpu, const torch::Tensor& v2d) -> torch::Tensor {
+    const int64_t H = img_cpu.size(1), W = img_cpu.size(2);
+    const auto vc = v2d.to(at::kCPU);
+    const int x0 = std::clamp<int>((int)vc.select(1, 0).min().item<float>(), 0, (int)W - 2);
+    const int x1 = std::clamp<int>((int)vc.select(1, 0).max().item<float>(), x0 + 1, (int)W);
+    const int y0 = std::clamp<int>((int)vc.select(1, 1).min().item<float>(), 0, (int)H - 2);
+    const int y1 = std::clamp<int>((int)vc.select(1, 1).max().item<float>(), y0 + 1, (int)H);
+    const auto crop = img_cpu.slice(1, y0, y1).slice(2, x0, x1).clamp(0, 1);  // [3,h,w]
+    std::vector<torch::Tensor> hs;
+    for (int c = 0; c < 3; ++c) hs.push_back(torch::histc(crop[c], 8, 0.0, 1.0));
+    auto h = torch::cat(hs);
+    return h / h.sum().clamp_min(1.0);  // [24]
+  };
+  auto sig = [&](const std::string& path, torch::Tensor& beta, torch::Tensor& a512,
+                 torch::Tensor& hist, float& fscore) {
+    const auto img = ncg::io::load_image(path, 3);  // [3,H,W] cpu [0,1]
+    const auto pred = nlf.detect(img.to(ndev));
+    beta = pred.params.betas.reshape({-1}).to(at::kCPU);
+    hist = color_hist(img, pred.vertices2d);
+    const auto faces = det.detect(img, 0.5F);
+    fscore = 0.0F;
+    a512 = torch::Tensor{};
+    if (!faces.empty()) { a512 = arc.embed(img, faces[0]); fscore = faces[0].score; }
+  };
+
+  // ---- reference signature ----
+  torch::Tensor rb, ra, rh; float rf;
+  sig(args.require("ref"), rb, ra, rh, rf);
+  NCG_LOG_INFO("attribute: reference signature built (face cue {}, |β|={:.2f})",
+               ra.defined() ? "present" : "absent", rb.norm().item<float>());
+
+  std::vector<std::string> paths;
+  for (const auto& e : fs::directory_iterator(args.require("frames"))) {
+    const auto x = e.path().extension().string();
+    if (x == ".jpg" || x == ".jpeg" || x == ".png" || x == ".JPG") paths.push_back(e.path().string());
+  }
+  std::sort(paths.begin(), paths.end());
+
+  const float kappa = args.get_float("kappa", 10.0F), tau = args.get_float("tau", 0.45F);
+  const float bscale = args.get_float("beta-scale", 2.0F);
+  int kept = 0, faceless_kept = 0, rejected = 0;
+  std::vector<float> ws;
+  for (const auto& p : paths) {
+    torch::Tensor b, a, h; float fsc;
+    try { sig(p, b, a, h, fsc); } catch (const std::exception&) { ws.push_back(0); continue; }
+    // partial-cue score: face (if visible) + body-shape + appearance.
+    float num = 0, den = 0;
+    bool has_face = a.defined() && ra.defined();
+    if (has_face) { num += fsc * (a.dot(ra).item<float>()); den += fsc; }  // ArcFace cosine (L2-normed)
+    const float sb = std::exp(-(b - rb).norm().item<float>() / bscale);    // body-shape similarity
+    num += 1.0F * sb; den += 1.0F;
+    const float sa = torch::minimum(h, rh).sum().item<float>();            // histogram intersection
+    num += 1.0F * sa; den += 1.0F;
+    const float ai = num / std::max(den, 1e-6F);
+    const float w = 1.0F / (1.0F + std::exp(-kappa * (ai - tau)));
+    ws.push_back(w);
+    if (w > 0.5F) { ++kept; if (!has_face) ++faceless_kept; } else ++rejected;
+  }
+  // E7-style summary + GATE numbers.
+  ncg::io::save_npy(args.get("out", "w_subject.npy"),
+                    torch::tensor(ws, at::TensorOptions().dtype(at::kFloat)).contiguous());
+  NCG_LOG_INFO("attribute(GATE M1): {} frames -> {} subject ({} of them FACELESS, kept via body+app), "
+               "{} rejected (contamination). w_subject -> {}", paths.size(), kept, faceless_kept,
+               rejected, args.get("out", "w_subject.npy"));
+  return 0;
+}
+
 // `mvtest` — SELF-CONTAINED data-wall-vs-fit-bug isolator. Render a known-clean avatar (gaussians on
 // the rest SMPL-X body, clean per-vertex albedo) from N known orbit cameras → PERFECT multi-view
 // input (exact poses, full 360° yaw, single subject, zero blur). Feed those back to fit_avatar
@@ -2897,6 +2978,7 @@ int main(int argc, char** argv) {
     if (cmd == "geom") return cmd_geom(args);
     if (cmd == "complete") return cmd_complete(args);
     if (cmd == "mvtest") return cmd_mvtest(args);
+    if (cmd == "attribute") return cmd_attribute(args);
     if (cmd == "face") return cmd_face(args);
     if (cmd == "nerf") return cmd_nerf(args);
     std::fprintf(stderr, "unknown command '%s'\n", cmd.c_str());
