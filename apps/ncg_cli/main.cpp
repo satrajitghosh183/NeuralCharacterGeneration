@@ -1956,6 +1956,7 @@ int cmd_geom(const ncg::app::Args& args) {
             fc.densify = true;
             fc.position_reg = args.get_float("dev-reg", 20.0F);   // soft anti-floater
             fc.max_dev = args.get_float("max-dev", 0.012F);       // HARD cap: splats stay ≤1.2cm off-mesh
+            fc.min_scale = args.get_float("min-scale", 0.0035F);  // splats overlap into a surface (no speckle)
             fc.densify_grad = args.get_float("densify-grad", 2.5e-5F);  // lower → denser face
             fc.densify_until = args.get_int("densify-iters", 1800) - 300;
             fc.per_view_exposure = true;

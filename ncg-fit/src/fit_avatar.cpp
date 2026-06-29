@@ -130,7 +130,7 @@ AvatarFitResult fit_avatar(const body::SmplxModel& model, const Tensor& betas_in
   // Bound scales to a human-scale range: collapse (→0) makes the projected covariance singular and
   // explodes the conic-inverse gradient; runaway growth lets one Gaussian dominate the normalized
   // splat. Both drive the fit to NaN, so clamp the rendered scale (gradient still flows in-range).
-  const double smin = 1e-3;
+  const double smin = cfg.min_scale;  // raise (e.g. 3mm) so densified splats overlap into a surface
   const double smax = 0.05;
   auto canonical = [&]() {
     recon::GaussianCloud g;

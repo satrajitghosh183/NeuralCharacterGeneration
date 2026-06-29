@@ -46,6 +46,7 @@ struct AvatarFitConfig {
   // densified splats add surface detail without flying off into floaters. 0 = off (legacy).
   double position_reg = 0.0;
   double max_dev = 0.0;  // HARD cap on a splat's distance from its bound vertex rest pos (m); 0=off
+  double min_scale = 1e-3;  // floor on rendered splat std-dev (m); raise so dense splats overlap
   int densify_from = 500;
   int densify_until = 2500;
   int densify_every = 200;
