@@ -253,6 +253,19 @@ AvatarFitResult fit_avatar(const body::SmplxModel& model, const Tensor& betas_in
     }
     optimizer->step();
 
+    // HARD anti-floater clamp: a free splat may not leave a thin band around its bound vertex's rest
+    // position. With few casual views, soft regularization alone lets splats proliferate as floaters
+    // (which wreck the render + identity); this GUARANTEES they stay on the surface so densification
+    // only adds detail. cfg.max_dev <= 0 disables (legacy 1:1 path).
+    if (cfg.max_dev > 0.0 && lr_pos > 0) {
+      torch::NoGradGuard ng;
+      const auto anchor = rest_verts.index_select(0, binding);            // [N,3]
+      const auto off = positions.detach() - anchor;
+      const auto d = off.norm(2, 1, true).clamp_min(1e-9);
+      const auto clamped = anchor + off * (d.clamp_max(cfg.max_dev) / d);
+      positions.detach().copy_(clamped);
+    }
+
     // ---- adaptive density control (clone/split high-gradient Gaussians; children inherit binding) ----
     const bool in_densify = cfg.densify && it >= cfg.densify_from && it < cfg.densify_until;
     if (in_densify && it % cfg.densify_every == 0 && accum_count > 0 &&

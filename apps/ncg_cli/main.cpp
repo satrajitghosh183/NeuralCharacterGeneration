@@ -1954,8 +1954,9 @@ int cmd_geom(const ncg::app::Args& args) {
             fc.lr_color = 0.0;            // FREEZE colour — preserve the clean albedo
             fc.lr_position = 2e-4;        // small position freedom (densify needs a position gradient)
             fc.densify = true;
-            fc.position_reg = args.get_float("dev-reg", 120.0F);  // anti-floater: stay near the mesh
-            fc.densify_grad = args.get_float("densify-grad", 3e-5F);  // lower → denser face
+            fc.position_reg = args.get_float("dev-reg", 20.0F);   // soft anti-floater
+            fc.max_dev = args.get_float("max-dev", 0.012F);       // HARD cap: splats stay ≤1.2cm off-mesh
+            fc.densify_grad = args.get_float("densify-grad", 2.5e-5F);  // lower → denser face
             fc.densify_until = args.get_int("densify-iters", 1800) - 300;
             fc.per_view_exposure = true;
             fc.robust = true;

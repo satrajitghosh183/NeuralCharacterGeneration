@@ -45,6 +45,7 @@ struct AvatarFitConfig {
   // Deviation regularizer λ_dev: pull each (free) splat toward its bound vertex's REST position so
   // densified splats add surface detail without flying off into floaters. 0 = off (legacy).
   double position_reg = 0.0;
+  double max_dev = 0.0;  // HARD cap on a splat's distance from its bound vertex rest pos (m); 0=off
   int densify_from = 500;
   int densify_until = 2500;
   int densify_every = 200;
