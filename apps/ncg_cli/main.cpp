@@ -3391,6 +3391,71 @@ int cmd_face(const ncg::app::Args& args) {
         NCG_LOG_INFO("face: added 2 eyeballs ({} verts each, r={:.3f}m) skinned to head joint", N, ir);
       }
 
+      // ---- HAIR CAP GEOMETRY (--hair): an additive scalp shell that reads as hair, not a bald dome.
+      // Take the scalp sub-mesh (head verts above the hairline), duplicate it per-face-corner (1:1
+      // position<->uv, like the eyeballs, to dodge UV seams), offset outward by a hair thickness, and
+      // texture it with the head's OWN UV (so the hair colour comes from the photos). Skin to the head
+      // joint so it moves with the head. --hair 0 to disable; --hair-q / --hair-thick to tune.
+      if (args.get_int("hair", 1) != 0 && joints.size(0) > 15) {
+        const auto idv = id_verts.to(at::kCPU);                                       // [V,3]
+        const auto vn = ncg::mesh::compute_vertex_normals(ncg::mesh::TriMesh{idv, faces.to(at::kCPU)});
+        const float hq = args.get_float("hair-q", 0.86F);
+        const float hairline = torch::quantile(idv.select(1, 1), hq).item<float>();
+        const float crown = torch::quantile(idv.select(1, 1), 0.93F).item<float>();
+        const auto y = idv.select(1, 1), nz = vn.select(1, 2);
+        // scalp = above the hairline, minus the clearly-frontal face (forward normal below the crown).
+        const auto scalp = (y > hairline) & ~((nz > 0.45F) & (y < crown));            // [V] bool
+        const auto fc = faces.to(at::kCPU), uvf = model.uv_faces().to(at::kCPU);      // [F,3] each
+        const auto fmask = scalp.index({fc.select(1, 0)}) & scalp.index({fc.select(1, 1)}) &
+                           scalp.index({fc.select(1, 2)});                            // [F] bool
+        const auto selF = fc.index({fmask}), selUVF = uvf.index({fmask});             // [Fh,3]
+        const int64_t Fh = selF.size(0);
+        if (Fh > 0) {
+          const float hthick = args.get_float("hair-thick", 0.018F);                 // ~1.8 cm shell
+          const auto cV = selF.reshape({-1}), cUV = selUVF.reshape({-1});            // [3Fh] corner ids
+          const auto capPos = (idv.index({cV}) + vn.index({cV}) * hthick);           // [3Fh,3] displaced
+          const auto capNrm = vn.index({cV});                                        // [3Fh,3]
+          const auto capUVc = model.uv_coords().to(at::kCPU).index({cUV});           // [3Fh,2]
+          const int64_t M = capPos.size(0), Jn = g_lbs.size(1);
+          auto capLbs = torch::zeros({M, Jn}); capLbs.select(1, 15).fill_(1.0F);     // skin to head
+          const auto capF = torch::arange(M, torch::kLong).reshape({Fh, 3});         // local faces
+          const int64_t vbase = g_verts.size(0), uvbase = g_uv.size(0);
+          g_verts = torch::cat({g_verts, capPos.to(g_verts.scalar_type())}, 0);
+          g_norm = torch::cat({g_norm, capNrm.to(g_norm.scalar_type())}, 0);
+          g_uv = torch::cat({g_uv, capUVc.to(g_uv.scalar_type())}, 0);
+          g_lbs = torch::cat({g_lbs, capLbs.to(g_lbs.scalar_type())}, 0);
+          g_faces = torch::cat({g_faces, (capF + vbase).to(g_faces.scalar_type())}, 0);
+          g_uvf = torch::cat({g_uvf, (capF + uvbase).to(g_uvf.scalar_type())}, 0);
+          // VERIFY render (GATE B): head (albedo splats) + hair cap (its photo-sampled colour) so the
+          // hair coverage/shape is checkable by eye. Sample the cap colour from the baked texture.
+          const auto pu = (capUVc.select(1, 0) * static_cast<float>(T)).clamp(0, T - 1).to(at::kLong);
+          const auto pv = ((1.0F - capUVc.select(1, 1)) * static_cast<float>(T)).clamp(0, T - 1).to(at::kLong);
+          const auto capCol = tex_uv.index({pv * static_cast<int64_t>(T) + pu}).clamp(0.0F, 1.0F);
+          const auto vpos = torch::cat({idv, capPos}, 0);
+          const auto vcol = torch::cat({albedo.to(at::kCPU).clamp(0.0F, 1.0F), capCol}, 0);
+          ncg::recon::GaussianCloud hc;
+          hc.positions = vpos.to(device);
+          hc.colors = vcol.to(device);
+          hc.scales = torch::full({vpos.size(0), 3}, 0.006F, hc.positions.options());
+          hc.opacities = torch::ones({vpos.size(0), 1}, hc.positions.options());
+          hc.rotations = torch::zeros({vpos.size(0), 4}, hc.positions.options());
+          hc.rotations.select(1, 0).fill_(1.0F);
+          const auto htgt = torch::tensor({0.0F, crown - 0.06F, 0.04F}).to(device);  // frame the head
+          for (int haz : {0, 180, 90}) {
+            const auto hcam = ncg::runtime::Camera::orbit(htgt, 0.55F, static_cast<float>(haz), 8.0F,
+                                                          28.0F, 512, 512, device);
+            char hn[36];
+            std::snprintf(hn, sizeof(hn), "_hair_check_%+04d.png", haz);
+            ncg::io::save_png(prefix + hn, ncg::runtime::render_gaussians(hc, hcam).image);
+          }
+          NCG_LOG_INFO("face: added hair cap ({} tris, {} verts, thick={:.3f}m) skinned to head joint",
+                       Fh, M, hthick);
+        } else {
+          NCG_LOG_WARN("face: hair cap empty (no scalp faces above hairline q={:.2f}) — try lower --hair-q",
+                       hq);
+        }
+      }
+
       ncg::mesh::write_glb_textured(g_verts, g_faces, g_norm, g_uv, g_uvf,
                                     joints, model.parents(), g_lbs,
                                     prefix + "_albedo_uv.png", prefix + "_face.glb",
