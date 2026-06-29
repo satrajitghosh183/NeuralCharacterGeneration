@@ -26,7 +26,7 @@ import os
 
 import numpy as np
 import torch
-from PIL import Image
+from PIL import Image, ImageFilter
 
 
 def log(*a):
@@ -46,12 +46,7 @@ def build_pipe(model, controlnet_id, ip_weight, dtype, device, diff_diffusion=Fa
                            DPMSolverMultistepScheduler,
                            StableDiffusionControlNetImg2ImgPipeline)
     kw = dict(torch_dtype=dtype, safety_checker=None, requires_safety_checker=False)
-    if diff_diffusion:
-        # Differential Diffusion community pipeline = per-pixel strength via a map. Same weights.
-        from diffusers import DiffusionPipeline
-        pipe = DiffusionPipeline.from_pretrained(
-            model, custom_pipeline="stable_diffusion_diff_img2img", **kw)
-    elif controlnet_id:
+    if controlnet_id:
         cn = ControlNetModel.from_pretrained(controlnet_id, torch_dtype=dtype)
         pipe = StableDiffusionControlNetImg2ImgPipeline.from_pretrained(model, controlnet=cn, **kw)
     else:
@@ -92,7 +87,9 @@ def main():
                     "natural detailed skin, sharp, studio portrait, 85mm")
     ap.add_argument("--neg", default="cartoon, cgi, 3d render, plastic, waxy, smooth, blurry, "
                     "deformed, extra limbs, watermark, text")
-    ap.add_argument("--strength", type=float, default=0.45)
+    ap.add_argument("--strength", type=float, default=0.45, help="HIGH (completion) strength for low-conf regions / scalar strength")
+    ap.add_argument("--gate-lo", type=float, default=0.25, help="LOW (refine) strength for confident regions")
+    ap.add_argument("--declean", type=int, default=0, help="median-filter size to remove base texel-splat crack seams before refine (0=off)")
     ap.add_argument("--ip-scale", type=float, default=0.6)
     ap.add_argument("--control-scale", type=float, default=0.8)
     ap.add_argument("--steps", type=int, default=30)
@@ -106,36 +103,49 @@ def main():
     log(f"device={device} dtype={dtype} model={args.model} controlnet={args.controlnet or 'none'} "
         f"ip={args.ip_weight}")
 
-    use_diff = bool(args.gate_map)
-    pipe = build_pipe(args.model, args.controlnet, args.ip_weight, dtype, device, diff_diffusion=use_diff)
+    pipe = build_pipe(args.model, args.controlnet, args.ip_weight, dtype, device)
     if args.ip_weight:
         pipe.set_ip_adapter_scale(args.ip_scale)
-    gen = torch.Generator(device=device).manual_seed(args.seed)
 
     base = load_image(args.base, args.size)
-    call = dict(prompt=args.prompt, negative_prompt=args.neg, image=base,
-                num_inference_steps=args.steps, guidance_scale=args.guidance, generator=gen)
-    if args.ip_weight:
-        call["ip_adapter_image"] = load_image(args.ref, args.size)
+    if args.declean and args.declean >= 3:
+        # The recovered albedo carries thin bright UV-seam cracks; a median filter removes them
+        # (they're sub-structure spikes) without blurring real features, so refinement isn't seeded
+        # with crack lines it then preserves. (A smoother C++ albedo render would obviate this.)
+        base = base.filter(ImageFilter.MedianFilter(args.declean | 1))
+        log(f"de-cracked base with median filter size {args.declean | 1}")
+    ref_img = load_image(args.ref, args.size) if args.ip_weight else None
+    ctrl_img = (load_image(args.control, args.size) if args.control else base) if args.controlnet else None
 
-    if use_diff:
-        gate = Image.open(args.gate_map).convert("L").resize((args.size, args.size), Image.LANCZOS)
-        # Differential Diffusion: map in [0,1]; higher => more change (lower confidence). Pass as the
-        # per-pixel change map; the global strength caps the maximum.
-        call["map"] = gate
-        call["strength"] = args.strength
-        log(f"differential diffusion: per-pixel gate map (max strength {args.strength})")
+    def one_pass(strength, seed):
+        gen = torch.Generator(device=device).manual_seed(seed)
+        c = dict(prompt=args.prompt, negative_prompt=args.neg, image=base, strength=float(strength),
+                 num_inference_steps=args.steps, guidance_scale=args.guidance, generator=gen)
+        if ref_img is not None:
+            c["ip_adapter_image"] = ref_img
+        if ctrl_img is not None:
+            c["control_image"] = ctrl_img
+            c["controlnet_conditioning_scale"] = args.control_scale
+        return pipe(**c).images[0]
+
+    if args.gate_map:
+        # CONFIDENCE-GATED refinement: refine confident regions at LOW strength (identity held) and
+        # complete low-confidence regions at HIGH strength (invent), blended by the feathered
+        # confidence = 1 - gate. Per-region strength that composes with IP-Adapter; the feather keeps
+        # the refined<->completed boundary seamless.
+        change = Image.open(args.gate_map).convert("L").resize((args.size, args.size), Image.LANCZOS)
+        change = change.filter(ImageFilter.GaussianBlur(6))
+        conf = 1.0 - np.asarray(change).astype(np.float32) / 255.0  # [H,W], 1=confident
+        conf = conf[..., None]
+        log(f"gated blend: lo(refine)={args.gate_lo} hi(complete)={args.strength} "
+            f"mean_conf={float(conf.mean()):.3f}")
+        lo = np.asarray(one_pass(args.gate_lo, args.seed)).astype(np.float32)
+        hi = np.asarray(one_pass(args.strength, args.seed)).astype(np.float32)
+        out = Image.fromarray(np.clip(conf * lo + (1.0 - conf) * hi, 0, 255).astype(np.uint8))
     else:
-        call["strength"] = args.strength
+        log(f"scalar refine: strength={args.strength} ip_scale={args.ip_scale}")
+        out = one_pass(args.strength, args.seed)
 
-    if args.controlnet and not use_diff:
-        ctrl = load_image(args.control, args.size) if args.control else base
-        call["control_image"] = ctrl
-        call["controlnet_conditioning_scale"] = args.control_scale
-
-    log(f"running: strength={args.strength} ip_scale={args.ip_scale} steps={args.steps} "
-        f"guidance={args.guidance}")
-    out = pipe(**call).images[0]
     os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)
     out.save(args.out)
     log(f"wrote {args.out}")
