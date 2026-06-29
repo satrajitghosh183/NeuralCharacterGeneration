@@ -3398,7 +3398,8 @@ int cmd_face(const ncg::app::Args& args) {
       // joint so it moves with the head. --hair 0 to disable; --hair-q / --hair-thick to tune.
       if (args.get_int("hair", 1) != 0 && joints.size(0) > 15) {
         const auto idv = id_verts.to(at::kCPU);                                       // [V,3]
-        const auto vn = ncg::mesh::compute_vertex_normals(ncg::mesh::TriMesh{idv, faces.to(at::kCPU)});
+        const auto vn = ncg::mesh::compute_vertex_normals(ncg::mesh::TriMesh{idv, faces.to(at::kCPU)})
+                            .to(at::kCPU);
         const float hq = args.get_float("hair-q", 0.86F);
         const float hairline = torch::quantile(idv.select(1, 1), hq).item<float>();
         const float crown = torch::quantile(idv.select(1, 1), 0.93F).item<float>();
@@ -3420,19 +3421,21 @@ int cmd_face(const ncg::app::Args& args) {
           auto capLbs = torch::zeros({M, Jn}); capLbs.select(1, 15).fill_(1.0F);     // skin to head
           const auto capF = torch::arange(M, torch::kLong).reshape({Fh, 3});         // local faces
           const int64_t vbase = g_verts.size(0), uvbase = g_uv.size(0);
-          g_verts = torch::cat({g_verts, capPos.to(g_verts.scalar_type())}, 0);
-          g_norm = torch::cat({g_norm, capNrm.to(g_norm.scalar_type())}, 0);
-          g_uv = torch::cat({g_uv, capUVc.to(g_uv.scalar_type())}, 0);
-          g_lbs = torch::cat({g_lbs, capLbs.to(g_lbs.scalar_type())}, 0);
-          g_faces = torch::cat({g_faces, (capF + vbase).to(g_faces.scalar_type())}, 0);
-          g_uvf = torch::cat({g_uvf, (capF + uvbase).to(g_uvf.scalar_type())}, 0);
+          const auto cpu = at::kCPU;
+          g_verts = torch::cat({g_verts.to(cpu), capPos.to(cpu, g_verts.scalar_type())}, 0);
+          g_norm = torch::cat({g_norm.to(cpu), capNrm.to(cpu, g_norm.scalar_type())}, 0);
+          g_uv = torch::cat({g_uv.to(cpu), capUVc.to(cpu, g_uv.scalar_type())}, 0);
+          g_lbs = torch::cat({g_lbs.to(cpu), capLbs.to(cpu, g_lbs.scalar_type())}, 0);
+          g_faces = torch::cat({g_faces.to(cpu), (capF + vbase).to(cpu, g_faces.scalar_type())}, 0);
+          g_uvf = torch::cat({g_uvf.to(cpu), (capF + uvbase).to(cpu, g_uvf.scalar_type())}, 0);
           // VERIFY render (GATE B): head (albedo splats) + hair cap (its photo-sampled colour) so the
           // hair coverage/shape is checkable by eye. Sample the cap colour from the baked texture.
+          const auto texcpu = tex_uv.to(at::kCPU);
           const auto pu = (capUVc.select(1, 0) * static_cast<float>(T)).clamp(0, T - 1).to(at::kLong);
           const auto pv = ((1.0F - capUVc.select(1, 1)) * static_cast<float>(T)).clamp(0, T - 1).to(at::kLong);
-          const auto capCol = tex_uv.index({pv * static_cast<int64_t>(T) + pu}).clamp(0.0F, 1.0F);
-          const auto vpos = torch::cat({idv, capPos}, 0);
-          const auto vcol = torch::cat({albedo.to(at::kCPU).clamp(0.0F, 1.0F), capCol}, 0);
+          const auto capCol = texcpu.index({pv * static_cast<int64_t>(T) + pu}).clamp(0.0F, 1.0F);
+          const auto vpos = torch::cat({idv.to(at::kCPU), capPos.to(at::kCPU)}, 0);
+          const auto vcol = torch::cat({albedo.to(at::kCPU).clamp(0.0F, 1.0F), capCol.to(at::kCPU)}, 0);
           ncg::recon::GaussianCloud hc;
           hc.positions = vpos.to(device);
           hc.colors = vcol.to(device);
