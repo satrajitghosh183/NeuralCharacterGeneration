@@ -23,6 +23,24 @@ void append_bytes(std::vector<char>& b, const void* p, size_t n) {
   const char* c = static_cast<const char*>(p);
   b.insert(b.end(), c, c + n);
 }
+
+// Canonical 55-joint SMPL-X skeleton names (body 0-21, jaw/eyes 22-24, then L/R hands 25-54).
+// Named bones make the rig import cleanly into Unity/Unreal (retargeting needs joint names).
+const char* smplx_joint_name(int64_t j, int64_t J) {
+  static const char* const kNames[55] = {
+      "pelvis",        "left_hip",      "right_hip",     "spine1",        "left_knee",
+      "right_knee",    "spine2",        "left_ankle",    "right_ankle",   "spine3",
+      "left_foot",     "right_foot",    "neck",          "left_collar",   "right_collar",
+      "head",          "left_shoulder", "right_shoulder", "left_elbow",   "right_elbow",
+      "left_wrist",    "right_wrist",   "jaw",           "left_eye",      "right_eye",
+      "left_index1",   "left_index2",   "left_index3",   "left_middle1",  "left_middle2",
+      "left_middle3",  "left_pinky1",   "left_pinky2",   "left_pinky3",   "left_ring1",
+      "left_ring2",    "left_ring3",    "left_thumb1",   "left_thumb2",   "left_thumb3",
+      "right_index1",  "right_index2",  "right_index3",  "right_middle1", "right_middle2",
+      "right_middle3", "right_pinky1",  "right_pinky2",  "right_pinky3",  "right_ring1",
+      "right_ring2",   "right_ring3",   "right_thumb1",  "right_thumb2",  "right_thumb3"};
+  return (J == 55 && j >= 0 && j < 55) ? kNames[j] : nullptr;  // nullptr -> caller emits joint_<j>
+}
 }  // namespace
 
 void write_glb(const Tensor& vertices, const Tensor& faces, const Tensor& normals_in,
@@ -258,6 +276,8 @@ void write_glb_skinned(const Tensor& vertices, const Tensor& faces, const Tensor
     const float ly = jp[j * 3 + 1] - (par < 0 ? 0.0F : jp[par * 3 + 1]);
     const float lz = jp[j * 3 + 2] - (par < 0 ? 0.0F : jp[par * 3 + 2]);
     js << "{\"translation\":[" << lx << "," << ly << "," << lz << "]";
+    if (const char* nm = smplx_joint_name(j, J)) js << ",\"name\":\"" << nm << "\"";
+    else js << ",\"name\":\"joint_" << j << "\"";
     if (!children[static_cast<size_t>(j)].empty()) {
       js << ",\"children\":[";
       for (size_t k = 0; k < children[static_cast<size_t>(j)].size(); ++k)
@@ -484,6 +504,8 @@ void write_glb_textured(const Tensor& vertices, const Tensor& faces_in, const Te
     const float ly = jp[j * 3 + 1] - (par < 0 ? 0.0F : jp[par * 3 + 1]);
     const float lz = jp[j * 3 + 2] - (par < 0 ? 0.0F : jp[par * 3 + 2]);
     js << "{\"translation\":[" << lx << "," << ly << "," << lz << "]";
+    if (const char* nm = smplx_joint_name(j, J)) js << ",\"name\":\"" << nm << "\"";
+    else js << ",\"name\":\"joint_" << j << "\"";
     if (!children[static_cast<size_t>(j)].empty()) {
       js << ",\"children\":[";
       for (size_t k = 0; k < children[static_cast<size_t>(j)].size(); ++k)
@@ -492,7 +514,7 @@ void write_glb_textured(const Tensor& vertices, const Tensor& faces_in, const Te
     }
     js << "},";
   }
-  js << "{\"mesh\":0,\"skin\":0}],";
+  js << "{\"mesh\":0,\"skin\":0,\"name\":\"body\"}],";
 
   int bv = 0;
   std::ostringstream bvs;
@@ -698,6 +720,8 @@ void write_glb_animated(const Tensor& vertices, const Tensor& faces, const Tenso
     js << "{\"translation\":[" << jp[j * 3 + 0] - (par < 0 ? 0.0F : jp[par * 3 + 0]) << ","
        << jp[j * 3 + 1] - (par < 0 ? 0.0F : jp[par * 3 + 1]) << ","
        << jp[j * 3 + 2] - (par < 0 ? 0.0F : jp[par * 3 + 2]) << "]";
+    if (const char* nm = smplx_joint_name(j, J)) js << ",\"name\":\"" << nm << "\"";
+    else js << ",\"name\":\"joint_" << j << "\"";
     if (!children[static_cast<size_t>(j)].empty()) {
       js << ",\"children\":[";
       for (size_t k = 0; k < children[static_cast<size_t>(j)].size(); ++k)
