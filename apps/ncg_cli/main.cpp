@@ -3400,13 +3400,13 @@ int cmd_face(const ncg::app::Args& args) {
         const auto idv = id_verts.to(at::kCPU);                                       // [V,3]
         const auto vn = ncg::mesh::compute_vertex_normals(ncg::mesh::TriMesh{idv, faces.to(at::kCPU)})
                             .to(at::kCPU);
-        const float hq = args.get_float("hair-q", 0.90F);
+        const float hq = args.get_float("hair-q", 0.85F);
         const float hairline = torch::quantile(idv.select(1, 1), hq).item<float>();
         const float crown = torch::quantile(idv.select(1, 1), 0.93F).item<float>();
         const auto y = idv.select(1, 1), nz = vn.select(1, 2);
         // scalp = above the hairline AND not forward-facing (a forward normal = forehead/face skin,
         // where hair must not cover). Keeps the crown/back/sides; the hair recedes off the face.
-        const auto scalp = (y > hairline) & (nz < args.get_float("hair-front", 0.30F));  // [V] bool
+        const auto scalp = (y > hairline) & (nz < args.get_float("hair-front", 0.42F));  // [V] bool
         const auto fc = faces.to(at::kCPU), uvf = model.uv_faces().to(at::kCPU);      // [F,3] each
         const auto fmask = scalp.index({fc.select(1, 0)}) & scalp.index({fc.select(1, 1)}) &
                            scalp.index({fc.select(1, 2)});                            // [F] bool
