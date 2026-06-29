@@ -1956,16 +1956,18 @@ int cmd_geom(const ncg::app::Args& args) {
             fc.densify = true;
             fc.position_reg = args.get_float("dev-reg", 20.0F);   // soft anti-floater
             fc.max_dev = args.get_float("max-dev", 0.012F);       // HARD cap: splats stay ≤1.2cm off-mesh
-            fc.min_scale = args.get_float("min-scale", 0.0035F);  // splats overlap into a surface (no speckle)
-            fc.densify_grad = args.get_float("densify-grad", 2.5e-5F);  // lower → denser face
+            fc.min_scale = args.get_float("min-scale", 0.0035F);  // splats overlap into a surface
+            fc.opacity_floor = args.get_float("opacity-floor", 0.6F);  // FIX2: no dark holes in covered regions
+            fc.densify_grad = args.get_float("densify-grad", 6e-5F);   // FIX3: gentle, residual-driven (don't chase count)
             fc.densify_until = args.get_int("densify-iters", 1800) - 300;
-            fc.per_view_exposure = true;
+            fc.per_view_exposure = true;  // FIX1: per-frame exposure/WB equalization in the fit
             fc.robust = true;
             fc.max_gaussians = args.get_int("max-splats", 90000);
             fc.init_scale = args.get_float("scale", 0.008F);
             const auto bb = body_betas.slice(0, 0, std::min<int64_t>(body_betas.size(0),
                                                                      smodel.num_betas())).to(ndev);
-            auto fit = ncg::fit::fit_avatar(smodel, bb, aframes, vcol.to(ndev), fc);
+            const auto cov = app_obs.defined() ? app_obs.to(ndev) : torch::Tensor{};  // FIX2 coverage
+            auto fit = ncg::fit::fit_avatar(smodel, bb, aframes, vcol.to(ndev), fc, nullptr, cov);
             auto fcloud = fit.canonical;
             fcloud.to_(at::kCPU);
             const int64_t Nf = fcloud.size();

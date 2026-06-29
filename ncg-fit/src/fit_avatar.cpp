@@ -81,7 +81,8 @@ recon::GaussianCloud deform_avatar(const recon::GaussianCloud& canonical, const 
 
 AvatarFitResult fit_avatar(const body::SmplxModel& model, const Tensor& betas_in,
                            const std::vector<AvatarFrame>& frames, const Tensor& init_colors,
-                           const AvatarFitConfig& cfg, record::Recorder* rec) {
+                           const AvatarFitConfig& cfg, record::Recorder* rec,
+                           const Tensor& coverage) {
   NCG_CHECK(!frames.empty(), "fit_avatar: no frames");
   const auto device = model.device();
   const auto opts = at::TensorOptions().dtype(at::kFloat).device(device);
@@ -264,6 +265,16 @@ AvatarFitResult fit_avatar(const body::SmplxModel& model, const Tensor& betas_in
       const auto d = off.norm(2, 1, true).clamp_min(1e-9);
       const auto clamped = anchor + off * (d.clamp_max(cfg.max_dev) / d);
       positions.detach().copy_(clamped);
+    }
+    // FIX2 — opacity floor in COVERED regions: a splat bound to a well-photographed vertex may not
+    // go transparent (that is what punched the dark holes where photos disagreed). Unobserved splats
+    // are free to fade. Clamp opacity_logits up to the floor where coverage is high.
+    if (cfg.opacity_floor > 0.0 && coverage.defined() && coverage.numel() > 0) {
+      torch::NoGradGuard ng;
+      const auto cov = coverage.to(opts).index_select(0, binding).view({-1, 1});  // [N,1]
+      const auto floor_logit = inv_sigmoid(torch::full_like(opacity_logits, cfg.opacity_floor));
+      const auto need = (cov > 0.5F) & (opacity_logits.detach() < floor_logit);
+      opacity_logits.detach().copy_(torch::where(need, floor_logit, opacity_logits.detach()));
     }
 
     // ---- adaptive density control (clone/split high-gradient Gaussians; children inherit binding) ----

@@ -47,6 +47,7 @@ struct AvatarFitConfig {
   double position_reg = 0.0;
   double max_dev = 0.0;  // HARD cap on a splat's distance from its bound vertex rest pos (m); 0=off
   double min_scale = 1e-3;  // floor on rendered splat std-dev (m); raise so dense splats overlap
+  double opacity_floor = 0.0;  // FIX2: splats bound to well-COVERED verts may not vanish (no dark holes)
   int densify_from = 500;
   int densify_until = 2500;
   int densify_every = 200;
@@ -85,6 +86,7 @@ struct AvatarFitResult {
 /// (rest-pose) cloud + its vertex binding; animate it with deform_avatar or the runtime.
 AvatarFitResult fit_avatar(const body::SmplxModel& model, const Tensor& betas,
                            const std::vector<AvatarFrame>& frames, const Tensor& init_colors,
-                           const AvatarFitConfig& cfg, record::Recorder* recorder = nullptr);
+                           const AvatarFitConfig& cfg, record::Recorder* recorder = nullptr,
+                           const Tensor& coverage = {});  // [V] per-vertex photo coverage (FIX2 floor)
 
 }  // namespace ncg::fit
