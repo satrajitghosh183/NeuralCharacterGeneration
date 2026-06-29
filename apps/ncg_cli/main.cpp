@@ -1648,14 +1648,16 @@ int cmd_mvbench(const ncg::app::Args& args) {
   const double p_rob = run(frames, false, false, true, false, false, "robust");  // prior C2 baseline
   const double p_m1 = run(frames, true, false, false, false, false, "m1");
   const double p_m3 = run(frames, false, true, false, true, false, "m3");
-  const double p_m2 = run(frames, false, false, false, false, true, "m2");
-  // OURS = M1 (who) + M3 (quality+blur) + M2 (pose factorization), WITHOUT the prior per-pixel robust
-  // consistency — which on structured whole-frame contamination over-rejects clean signal (shown).
-  const double p_ours = run(frames, true, true, false, true, true, "ours");
+  const double p_m2 = run(frames, false, false, false, false, true, "m2");  // joint camera BA (unstable)
+  // OURS = M1 (who) + M3 (quality+blur). NOT M2: naive joint camera bundle-adjustment destabilizes a
+  // from-scratch fit (clean cameras co-adapt into a degenerate over-fit; held-out collapses — shown by
+  // the M2 column), and NOT the prior per-pixel robust/C2 (over-rejects clean signal). Robust pose
+  // factorization needs frame-level residual gating, not free per-frame camera DOF — left to M2-future.
+  const double p_ours = run(frames, true, true, false, true, false, "ours");
   NCG_LOG_INFO("mvbench SUMMARY (ceiling {:.2f} dB, contamination gap -{:.2f}): naive {:.2f} | "
-               "robust(C2 baseline) {:.2f} | M1 {:.2f} | M2 {:.2f} | M3 {:.2f} | OURS(M1+M2+M3) {:.2f} "
-               "(recovers {:.0f}% of the gap) -> {}",
-               p_ceil, p_ceil - p_naive, p_naive, p_rob, p_m1, p_m2, p_m3, p_ours,
+               "robust(C2) {:.2f} | jointBA {:.2f} | M1 {:.2f} | M3 {:.2f} | OURS(M1+M3) {:.2f} "
+               "(recovers {:.0f}% of the gap; robust & jointBA HURT) -> {}",
+               p_ceil, p_ceil - p_naive, p_naive, p_rob, p_m2, p_m1, p_m3, p_ours,
                (p_naive < p_ceil) ? 100.0 * (p_ours - p_naive) / (p_ceil - p_naive) : 100.0, prefix);
   return 0;
 }
