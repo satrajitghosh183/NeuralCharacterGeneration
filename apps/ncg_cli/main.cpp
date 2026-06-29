@@ -3282,8 +3282,79 @@ int cmd_face(const ncg::app::Args& args) {
       const auto joints = model.forward(zp).joints.squeeze(0);                   // [J,3]
       const auto hair_cpu = verts_hair.to(at::kCPU);
       const auto hnrm = ncg::mesh::compute_vertex_normals(ncg::mesh::TriMesh{hair_cpu, faces});
-      ncg::mesh::write_glb_textured(hair_cpu, faces, hnrm, model.uv_coords(), model.uv_faces(),
-                                    joints, model.parents(), model.lbs_weights(),
+
+      // ---- EYEBALL GEOMETRY (--eyes): SMPL-X has no eyeballs, so refined eyes have nowhere to land
+      // (dark sockets / smudges, proven unfixable by texture strength). Add a sphere at each SMPL-X
+      // eye joint (23=left, 24=right), skinned to the head joint, coloured by a reserved brown texel,
+      // so the rig has real 3D eyes. Best-effort: textured meshes can't be rendered server-side, verify
+      // in a glТF viewer. --eyes 0 to disable.
+      auto g_verts = hair_cpu;                  // [V,3]
+      auto g_faces = faces;                     // [F,3]
+      auto g_norm = hnrm;                       // [V,3]
+      auto g_uv = model.uv_coords();            // [n_uv,2]
+      auto g_uvf = model.uv_faces();            // [F,3]
+      auto g_lbs = model.lbs_weights().to(at::kCPU);  // [V,J]
+      auto tex_uv = uv_final;                   // [T^2,3] (may paint the eye texel)
+      if (args.get_int("eyes", 1) != 0 && joints.size(0) > 24) {
+        const auto jc = joints.to(at::kCPU);
+        const auto eyes_c = torch::stack({jc[23], jc[24]}, 0);                  // [2,3] eyeball centers
+        const float ir = std::max(0.008F, 0.18F * (jc[23] - jc[24]).norm().item<float>());
+        const int nlat = 12, nlon = 16;
+        std::vector<float> sv;
+        std::vector<int64_t> sf;
+        for (int i = 0; i <= nlat; ++i) {
+          const float th = static_cast<float>(M_PI) * i / nlat;
+          for (int j = 0; j <= nlon; ++j) {
+            const float ph = 2.0F * static_cast<float>(M_PI) * j / nlon;
+            sv.push_back(std::sin(th) * std::cos(ph));
+            sv.push_back(std::cos(th));
+            sv.push_back(std::sin(th) * std::sin(ph));
+          }
+        }
+        const int Wp = nlon + 1;
+        for (int i = 0; i < nlat; ++i)
+          for (int j = 0; j < nlon; ++j) {
+            const int a = i * Wp + j, b = a + 1, c = a + Wp, d = c + 1;
+            sf.push_back(a); sf.push_back(c); sf.push_back(b);
+            sf.push_back(b); sf.push_back(c); sf.push_back(d);
+          }
+        const auto sV = torch::from_blob(sv.data(), {static_cast<int64_t>(sv.size()) / 3, 3},
+                                         torch::kFloat).clone();
+        const auto sF = torch::from_blob(sf.data(), {static_cast<int64_t>(sf.size()) / 3, 3},
+                                         torch::kLong).clone();
+        const int64_t N = sV.size(0), Jn = g_lbs.size(1);
+        // brown eye texel at UV (0.01,0.01) -> pixel (row=(1-v)*T, col=u*T) per the texture convention.
+        auto tx = tex_uv.reshape({T, T, 3}).clone();
+        const int pr = static_cast<int>(0.99F * T), pc = static_cast<int>(0.01F * T);
+        for (int di = -2; di <= 2; ++di)
+          for (int dj = -2; dj <= 2; ++dj) {
+            const int rr = std::clamp(pr + di, 0, static_cast<int>(T) - 1);
+            const int cc = std::clamp(pc + dj, 0, static_cast<int>(T) - 1);
+            tx[rr][cc][0] = 0.32F; tx[rr][cc][1] = 0.22F; tx[rr][cc][2] = 0.17F;
+          }
+        tex_uv = tx.reshape({T * T, 3});
+        const auto eye_uv = torch::tensor({0.01F, 0.01F}).reshape({1, 2}).expand({N, 2}).contiguous();
+        std::vector<torch::Tensor> Vs{g_verts}, Ns{g_norm}, UVs{g_uv}, Ls{g_lbs}, Fs{g_faces}, UVFs{g_uvf};
+        int64_t vbase = g_verts.size(0), uvbase = g_uv.size(0);
+        for (int e = 0; e < 2; ++e) {
+          Vs.push_back(sV * ir + eyes_c[e]);                                    // [N,3]
+          Ns.push_back(sV);                                                     // outward normals
+          UVs.push_back(eye_uv);                                                // all -> brown texel
+          auto lb = torch::zeros({N, Jn}); lb.select(1, 15).fill_(1.0F);        // skin to head joint
+          Ls.push_back(lb);
+          Fs.push_back(sF + vbase);
+          UVFs.push_back(sF + uvbase);
+          vbase += N; uvbase += N;
+        }
+        g_verts = torch::cat(Vs, 0); g_norm = torch::cat(Ns, 0); g_uv = torch::cat(UVs, 0);
+        g_lbs = torch::cat(Ls, 0); g_faces = torch::cat(Fs, 0); g_uvf = torch::cat(UVFs, 0);
+        ncg::io::save_png(prefix + "_albedo_uv.png",
+                          tex_uv.reshape({T, T, 3}).permute({2, 0, 1}).contiguous().detach());
+        NCG_LOG_INFO("face: added 2 eyeballs ({} verts each, r={:.3f}m) skinned to head joint", N, ir);
+      }
+
+      ncg::mesh::write_glb_textured(g_verts, g_faces, g_norm, g_uv, g_uvf,
+                                    joints, model.parents(), g_lbs,
                                     prefix + "_albedo_uv.png", prefix + "_face.glb",
                                     prefix + "_normal_uv.png");
       NCG_LOG_INFO("face: wrote rigged + textured engine asset -> {}_face.glb", prefix);
