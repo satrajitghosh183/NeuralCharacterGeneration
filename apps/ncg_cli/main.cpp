@@ -1393,6 +1393,7 @@ int cmd_avatar(const ncg::app::Args& args) {
   std::vector<torch::Tensor> id_betas;              // per-frame SMPL-X shape (robust personalization)
 
   std::vector<ncg::fit::AvatarFrame> frames;
+  std::vector<float> sharp_raw, yaws;  // E1 sharpness + E7 viewing-azimuth per kept frame
   torch::Tensor betas0;
   torch::Tensor init_colors;
   for (size_t i = 0; i < paths.size(); ++i) {
@@ -1435,6 +1436,30 @@ int cmd_avatar(const ncg::app::Args& args) {
     const int h = static_cast<int>(img.size(1));
     fr.camera = ncg::runtime::solve_pinhole_camera(pred.vertices3d.to(device),
                                                    pred.vertices2d.to(device) * s, w, h);
+    // E1 — per-frame sharpness (variance of Laplacian on the downscaled subject image).
+    {
+      const auto gray = img.mean(0, true).unsqueeze(0);  // [1,1,H,W]
+      const auto lapk = torch::tensor({0.F, 1.F, 0.F, 1.F, -4.F, 1.F, 0.F, 1.F, 0.F}, img.options())
+                            .view({1, 1, 3, 3});
+      const auto lap = torch::nn::functional::conv2d(
+          gray, lapk, torch::nn::functional::Conv2dFuncOptions().padding(1));
+      sharp_raw.push_back(lap.var().item<float>());
+    }
+    // E7 — viewing azimuth from the global orientation (Rodrigues on the forward axis).
+    {
+      const auto aa = pred.params.pose_aa.squeeze(0).select(0, 0).to(at::kCPU);  // [3] global orient
+      const float ang = aa.norm().item<float>();
+      float yaw = 0.0F;
+      if (ang > 1e-6F) {
+        const float ax0 = aa[0].item<float>() / ang, ax1 = aa[1].item<float>() / ang,
+                    ax2 = aa[2].item<float>() / ang;
+        const float c = std::cos(ang), sn = std::sin(ang);
+        const float fx = ax1 * sn + ax0 * ax2 * (1 - c);   // (R·[0,0,1]).x
+        const float fz = c + ax2 * ax2 * (1 - c);          // (R·[0,0,1]).z
+        yaw = std::atan2(fx, fz);
+      }
+      yaws.push_back(yaw);
+    }
     frames.push_back(std::move(fr));
 
     if (!init_colors.defined()) {  // seed appearance from the first good frame
@@ -1445,6 +1470,45 @@ int cmd_avatar(const ncg::app::Args& args) {
     }
   }
   NCG_CHECK(frames.size() >= 2, "avatar: need >=2 usable frames");
+
+  // ===== EXTRACTION WEIGHTING (E5 pose-consistency + E1 sharpness) + E7 coverage histogram =====
+  // Combine per-frame confidence into a sampling weight: sharp, pose-consistent frames contribute
+  // more; blurry / pose-jump frames contribute LESS (not dropped). Emit the yaw-coverage histogram.
+  if (args.get_int("extract-weight", 1) != 0 && frames.size() == sharp_raw.size()) {
+    const int64_t F = static_cast<int64_t>(frames.size());
+    // E1: normalize sharpness to [0,1] (relative within this source).
+    float smin = 1e30F, smax = -1e30F;
+    for (float s : sharp_raw) { smin = std::min(smin, s); smax = std::max(smax, s); }
+    // E5: pose-consistency — deviation of each frame's full pose from the per-source MEDIAN pose.
+    std::vector<torch::Tensor> poses;
+    for (const auto& fr : frames) poses.push_back(fr.pose_aa.reshape({-1}).to(at::kCPU));
+    const auto P = torch::stack(poses, 0);                          // [F, J*3]
+    const auto medp = std::get<0>(P.median(0));                    // [J*3]
+    const auto dev = (P - medp.unsqueeze(0)).norm(2, 1);           // [F] pose deviation
+    const float dscale = std::max(1e-3F, dev.median().item<float>());
+    int dropped = 0;
+    float wsum = 0;
+    for (int64_t i = 0; i < F; ++i) {
+      const float sn = (smax > smin) ? (sharp_raw[i] - smin) / (smax - smin) : 1.0F;  // E1
+      const float pc = std::exp(-0.5F * std::pow(dev[i].item<float>() / dscale, 2.0F));  // E5
+      float wgt = (0.3F + 0.7F * sn) * pc;  // keep a floor on sharpness so no frame is fully zeroed
+      if (wgt < 0.05F) { ++dropped; }       // effectively-dropped (rare true-garbage) — logged, not gated
+      frames[static_cast<size_t>(i)].weight = wgt;
+      wsum += wgt;
+    }
+    // E7: yaw-coverage histogram (12 bins over [-180,180]) — the GO/NO-GO multi-view artifact.
+    int hist[12] = {0};
+    for (float y : yaws) {
+      int b = static_cast<int>((y + static_cast<float>(M_PI)) / (2 * static_cast<float>(M_PI)) * 12);
+      hist[std::clamp(b, 0, 11)]++;
+    }
+    int occupied = 0;
+    for (int b = 0; b < 12; ++b) if (hist[b] > 0) ++occupied;
+    std::string hs;
+    for (int b = 0; b < 12; ++b) hs += std::to_string(hist[b]) + (b < 11 ? "," : "");
+    NCG_LOG_INFO("extract: {} frames, mean weight {:.2f}, {} low-weight; yaw-coverage {}/12 bins "
+                 "occupied [{}] (E7 GO/NO-GO)", F, wsum / F, dropped, occupied, hs);
+  }
   NCG_LOG_INFO("avatar: training on {} frames at {}px", frames.size(), res);
 
   ncg::recon::GaussianCloud canonical;

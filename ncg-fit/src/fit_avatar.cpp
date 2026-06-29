@@ -193,8 +193,16 @@ AvatarFitResult fit_avatar(const body::SmplxModel& model, const Tensor& betas_in
   auto grad_accum = torch::zeros({positions.size(0)}, opts);
   int accum_count = 0;
 
+  // E1/E5 extraction weighting: sample frames PROPORTIONAL to their confidence (sharpness ×
+  // pose-consistency × coverage), so low-confidence frames (blur, jumpy pose, redundant view)
+  // contribute less WITHOUT being discarded. Uniform if all weights are equal/unset.
+  auto fw = torch::ones({F}, opts);
+  for (int64_t i = 0; i < F; ++i) fw[i] = std::max(1e-3F, frames[static_cast<size_t>(i)].weight);
+  const bool weighted = (fw.max() - fw.min()).item<float>() > 1e-4F;
+
   for (int it = 0; it < cfg.iterations; ++it) {
-    const int64_t f = torch::randint(0, F, {1}, at::kLong).item<int64_t>();
+    const int64_t f = weighted ? torch::multinomial(fw, 1).item<int64_t>()
+                               : torch::randint(0, F, {1}, at::kLong).item<int64_t>();
     optimizer->zero_grad();
     const auto posed = deform_avatar(canonical(), transforms[f], binding);
     auto pred = runtime::render_soft_aniso(posed, frames[f].camera).image;

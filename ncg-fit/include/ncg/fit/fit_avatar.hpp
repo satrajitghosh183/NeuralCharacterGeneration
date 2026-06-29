@@ -18,6 +18,7 @@ struct AvatarFrame {
   runtime::Camera camera;
   Tensor target;            // [3,H,W] in [0,1]
   Tensor transl;            // [3] world translation (optional; empty -> zeros)
+  float weight = 1.0F;       // E1/E5 extraction confidence: scales this frame's loss (sharpness × pose-consistency × coverage)
 };
 
 struct AvatarFitConfig {
