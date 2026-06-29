@@ -1550,8 +1550,8 @@ int cmd_avatar(const ncg::app::Args& args) {
   std::optional<ncg::body::FaceDetector> a_det;
   std::optional<ncg::body::ArcFace> a_arc;
   if (attrib) {
-    a_det = ncg::body::FaceDetector::load(args.require("detector"), at::kCPU);
-    a_arc = ncg::body::ArcFace::load(args.require("arcface"), at::kCPU);
+    a_det.emplace(ncg::body::FaceDetector::load(args.require("detector"), at::kCPU));
+    a_arc.emplace(ncg::body::ArcFace::load(args.require("arcface"), at::kCPU));
     NCG_LOG_INFO("avatar: M1 attribution ON (ArcFace + NLF-β + appearance)");
   }
   auto color_hist = [](const torch::Tensor& img_cpu, const torch::Tensor& v2d) -> torch::Tensor {
