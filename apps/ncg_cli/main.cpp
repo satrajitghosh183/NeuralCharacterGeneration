@@ -3191,8 +3191,17 @@ int cmd_face(const ncg::app::Args& args) {
       if (args.has("reproject-dir")) {
         namespace Fn = torch::nn::functional;
         const std::string rd = args.require("reproject-dir");
-        auto conf = torch::zeros({P}, fp.options());
-        const auto pidx = m.nonzero().squeeze(1);
+        // Recompute the texel surface points/normals/head-centroid here (the inner-block copies are
+        // out of scope) from the broader-scope UV solve outputs.
+        const auto rm = (uvmask.reshape({T * T}) > 0.5F);
+        const auto rfp = uvpos.index({rm});                          // [P,3]
+        const auto rfn = uvgn.index({rm});                           // [P,3]
+        const int64_t RP = rfp.size(0);
+        const auto rhthr = torch::quantile(id_verts.select(1, 1), 0.88).item<float>();
+        const auto rhmask = (id_verts.select(1, 1).to(device) > rhthr).unsqueeze(1);
+        const auto rhc = verts_dev.masked_select(rhmask).reshape({-1, 3}).mean(0);
+        auto conf = torch::zeros({RP}, rfp.options());
+        const auto pidx = rm.nonzero().squeeze(1);
         for (int k = 0; k < 5; ++k) {
           const int az = -40 + 20 * k;
           char nm[40];
@@ -3201,22 +3210,22 @@ int cmd_face(const ncg::app::Args& args) {
           if (!std::filesystem::exists(path)) { NCG_LOG_WARN("reproject: missing {}", path); continue; }
           const auto img = ncg::io::load_image(path, 3).to(device);  // [3,H,W] in [0,1]
           const int sz = static_cast<int>(img.size(2));
-          const auto cam = ncg::runtime::Camera::orbit(hc, 0.42F, static_cast<float>(az), 5.0F, 28.0F,
+          const auto cam = ncg::runtime::Camera::orbit(rhc, 0.42F, static_cast<float>(az), 5.0F, 28.0F,
                                                        sz, sz, device);
           torch::Tensor uvp, depth;
-          cam.project(fp, uvp, depth);
-          const auto ncam = torch::matmul(fn, cam.R.t());
-          const auto front = torch::relu(-ncam.select(1, 2)) * (depth > 0).to(fp.dtype());
+          cam.project(rfp, uvp, depth);
+          const auto ncam = torch::matmul(rfn, cam.R.t());
+          const auto front = torch::relu(-ncam.select(1, 2)) * (depth > 0).to(rfp.dtype());
           const auto gx = uvp.select(1, 0) / (sz - 1) * 2 - 1;
           const auto gy = uvp.select(1, 1) / (sz - 1) * 2 - 1;
-          const auto grid = torch::stack({gx, gy}, 1).view({1, P, 1, 2});
+          const auto grid = torch::stack({gx, gy}, 1).view({1, RP, 1, 2});
           const auto samp = Fn::grid_sample(img.unsqueeze(0), grid,
               Fn::GridSampleFuncOptions().mode(torch::kBilinear).padding_mode(torch::kZeros)
-                  .align_corners(true)).view({3, P}).t();            // [P,3]
+                  .align_corners(true)).view({3, RP}).t();           // [P,3]
           const auto inb = ((uvp.select(1, 0) >= 0) & (uvp.select(1, 0) <= sz - 1) &
-                            (uvp.select(1, 1) >= 0) & (uvp.select(1, 1) <= sz - 1)).to(fp.dtype());
+                            (uvp.select(1, 1) >= 0) & (uvp.select(1, 1) <= sz - 1)).to(rfp.dtype());
           const auto w = front * inb;
-          const auto better = (w > conf).to(fp.dtype()).unsqueeze(1);
+          const auto better = (w > conf).to(rfp.dtype()).unsqueeze(1);
           const auto old = uv_final.index_select(0, pidx);
           uv_final.index_copy_(0, pidx, samp * better + old * (1.0F - better));
           conf = torch::maximum(conf, w);
