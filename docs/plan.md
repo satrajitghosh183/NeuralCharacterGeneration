@@ -37,23 +37,28 @@ Grounded in two deep-research passes (see `research-findings.md` + memory). Supe
 
   | condition | PSNR | vs naive |
   |---|---|---|
-  | ceiling (clean) | **45.99 dB** | — |
-  | naive (contaminated) | 39.54 | −6.45 gap |
-  | prior per-pixel robust / C2 | 34.34 | **−5.2 (HURTS)** |
-  | joint camera bundle-adjustment | 31.38 | **−8.2 (HURTS)** |
-  | M1 (who: attribution) | 41.17 | +1.6 |
-  | M3 (quality: conf-blur) | 42.49 | +3.0 |
-  | **OURS (M1+M3)** | **44.28** | **recovers 74% of the gap** |
+  | ceiling (clean) | **45.77 dB** | — |
+  | naive (contaminated) | 39.48 | −6.28 gap |
+  | prior per-pixel robust / C2 | 34.35 | **−5.1 (HURTS)** |
+  | joint camera bundle-adjustment | 30.99 | **−8.5 (HURTS)** |
+  | M1 (who: attribution) | 42.09 | +2.6 |
+  | M2 (pose: frame-level residual gating) | 40.98 | +1.5 |
+  | M3 (quality: conf-blur) | 42.52 | +3.0 |
+  | **OURS (M1+M2+M3)** | **43.77** | **recovers 68% of the gap** |
 
-  M1 suppresses exactly the 8 wrong-person frames (0 false positives). Verified by eye (renders in the
-  run dir): `ours` is crisp + near-ceiling; `m2`/jointBA is visibly ghosted (cameras drift). Two
-  HONEST NEGATIVES: (1) the prior per-pixel robust/C2 over-rejects clean signal under structured
-  whole-frame contamination; (2) **naive joint pose bundle-adjustment is destabilizing** — freeing
-  per-frame camera DOF against a from-scratch canonical co-adapts into a degenerate over-fit that
-  collapses held-out (tried with a 50% appearance warm-up too; 29→31 dB, still ≪ naive). The working
-  contribution is M1 (who) + M3 (quality). **M2-FUTURE:** robust pose factorization needs *frame-level
-  residual gating* (reject misaligned views), NOT free camera DOF — the clear next implementation.
-  Fully synthetic ⇒ exact ground truth, no dependence on scavenged real data.
+  M1 suppresses exactly the 8 wrong-person frames (0 false positives). All three channels are
+  individually positive and verified by eye (renders in the run dir): `m1`/`m2`/`m3`/`ours` are crisp
+  + near-ceiling. Two HONEST NEGATIVES — the prior defences both HURT: (1) per-pixel robust/C2
+  over-rejects clean signal under structured whole-frame contamination; (2) **joint camera
+  bundle-adjustment is destabilizing** — freeing per-frame camera DOF against a from-scratch canonical
+  co-adapts into a degenerate over-fit that collapses held-out (30–31 dB, visibly ghosted, even with a
+  50% appearance warm-up). **M2's working form is FRAME-LEVEL residual gating** (`--frame-robust`):
+  down-weight whole views whose photometric residual stays an outlier vs the consensus (exactly what a
+  pose-misestimated view looks like) — stable because it removes influence, never adds DOF (40.98 dB
+  vs jointBA's 31). Combined OURS (M1+M2+M3) recovers ~68–74% across runs (≈M1+M3 within the ~0.5–1 dB
+  run-to-run fit noise; M2's marginal lift is small once who+quality are handled, but it no longer
+  destabilizes). Fully synthetic ⇒ exact ground truth, no dependence on scavenged real data. The full
+  3-channel robust factorization (M1 who · M2 pose · M3 quality) is implemented, ablated, and green.
 
 ---
 
