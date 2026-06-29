@@ -3183,7 +3183,49 @@ int cmd_face(const ncg::app::Args& args) {
           NCG_LOG_INFO("face: img2img-baked photoreal face -> {}_face_baked_*.png", prefix);
         }
       }
-      ncg::io::save_png(prefix + "_albedo_uv.png", uvtex.permute({2, 0, 1}).contiguous().detach());
+      // EXTERNAL REPROJECTION: bake user-provided refined views (off-the-shelf IP-Adapter-FaceID
+      // renders of the lit portraits, named refine_<+/-NN>.png at the 5 lit camera angles) back onto
+      // the UV texture, keeping each texel's MOST-FRONTAL view. A stronger off-the-shelf refiner
+      // replaces the analytic skin while the recovered geometry/rig stay untouched (appearance-only).
+      auto uv_final = uvtex.reshape({T * T, 3}).clone();  // [T^2,3]
+      if (args.has("reproject-dir")) {
+        namespace Fn = torch::nn::functional;
+        const std::string rd = args.require("reproject-dir");
+        auto conf = torch::zeros({P}, fp.options());
+        const auto pidx = m.nonzero().squeeze(1);
+        for (int k = 0; k < 5; ++k) {
+          const int az = -40 + 20 * k;
+          char nm[40];
+          std::snprintf(nm, sizeof(nm), "/refine_%+03d.png", az);
+          const std::string path = rd + nm;
+          if (!std::filesystem::exists(path)) { NCG_LOG_WARN("reproject: missing {}", path); continue; }
+          const auto img = ncg::io::load_image(path, 3).to(device);  // [3,H,W] in [0,1]
+          const int sz = static_cast<int>(img.size(2));
+          const auto cam = ncg::runtime::Camera::orbit(hc, 0.42F, static_cast<float>(az), 5.0F, 28.0F,
+                                                       sz, sz, device);
+          torch::Tensor uvp, depth;
+          cam.project(fp, uvp, depth);
+          const auto ncam = torch::matmul(fn, cam.R.t());
+          const auto front = torch::relu(-ncam.select(1, 2)) * (depth > 0).to(fp.dtype());
+          const auto gx = uvp.select(1, 0) / (sz - 1) * 2 - 1;
+          const auto gy = uvp.select(1, 1) / (sz - 1) * 2 - 1;
+          const auto grid = torch::stack({gx, gy}, 1).view({1, P, 1, 2});
+          const auto samp = Fn::grid_sample(img.unsqueeze(0), grid,
+              Fn::GridSampleFuncOptions().mode(torch::kBilinear).padding_mode(torch::kZeros)
+                  .align_corners(true)).view({3, P}).t();            // [P,3]
+          const auto inb = ((uvp.select(1, 0) >= 0) & (uvp.select(1, 0) <= sz - 1) &
+                            (uvp.select(1, 1) >= 0) & (uvp.select(1, 1) <= sz - 1)).to(fp.dtype());
+          const auto w = front * inb;
+          const auto better = (w > conf).to(fp.dtype()).unsqueeze(1);
+          const auto old = uv_final.index_select(0, pidx);
+          uv_final.index_copy_(0, pidx, samp * better + old * (1.0F - better));
+          conf = torch::maximum(conf, w);
+          NCG_LOG_INFO("face: reprojected refined view az={:+d}", az);
+        }
+        NCG_LOG_INFO("face: baked external refined views -> UV texture (reproject-dir)");
+      }
+      ncg::io::save_png(prefix + "_albedo_uv.png",
+                        uv_final.reshape({T, T, 3}).permute({2, 0, 1}).contiguous().detach());
       ncg::io::save_png(prefix + "_normal_uv.png", uvnrm.permute({2, 0, 1}).contiguous().detach());
       ncg::io::save_npy(prefix + "_uvcoords.npy", model.uv_coords().to(at::kCPU).contiguous());
       ncg::io::save_npy(prefix + "_uvfaces.npy", model.uv_faces().to(at::kInt).contiguous());
