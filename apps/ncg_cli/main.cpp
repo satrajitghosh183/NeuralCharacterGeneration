@@ -1544,6 +1544,28 @@ int cmd_mvbench(const ncg::app::Args& args) {
     cam.t = cam.t + torch::randn_like(cam.t) * args.get_float("jitter", 0.04F);        // camera misalignment
     add(cam, gt_subj, 2, true);
   }
+  // POSE-MISESTIMATED subject frames (M2's target): a sharp, correct-person frame whose CAMERA POSE is
+  // wrong (rendered from the true camera, but the fit is GIVEN a mis-estimated one — the analogue of
+  // NLF pose noise). M1 (same person → high w_subject) and M3 (sharp → high quality) leave these
+  // untouched; only M2's joint pose factorization (per-frame camera bundle-adjustment) recovers them.
+  const int Kp = args.get_int("pose-views", 6);
+  for (int i = 0; i < Kp; ++i) {
+    const float az = 360.0F * (static_cast<float>(i) + 0.5F) / static_cast<float>(Kp);
+    const auto truecam = ncg::runtime::Camera::orbit(center, radius, az, elev, fov, res, res, device);
+    const float daz = ((i % 2) ? 1.0F : -1.0F) * args.get_float("pose-jitter-deg", 8.0F);
+    const auto badcam =
+        ncg::runtime::Camera::orbit(center, radius, az + daz, elev + 0.3F * daz, fov, res, res, device);
+    const auto out = ncg::runtime::render_soft_aniso(gt_subj, truecam);  // TRUE-pose target
+    const auto tgt = out.image.detach();
+    ncg::fit::AvatarFrame fr;
+    fr.pose_aa = torch::zeros({model.num_joints(), 3}, dopt);
+    fr.transl = torch::zeros({3}, dopt);
+    fr.camera = badcam;  // fit STARTS from the wrong camera; M2 must recover it
+    fr.target = tgt;
+    hists.push_back(fg_hist(tgt, out.alpha.detach()));
+    frames.push_back(std::move(fr));
+    kind.push_back(3);
+  }
   const int64_t Ftot = static_cast<int64_t>(frames.size());
 
   // M1 attribution weight: appearance-histogram similarity to the reference (clean frame 0).
@@ -1557,8 +1579,8 @@ int cmd_mvbench(const ncg::app::Args& args) {
       wsub[static_cast<size_t>(i)] = 1.0F / (1.0F + std::exp(-kappa * (sim - tau)));
       if (wsub[static_cast<size_t>(i)] < 0.5F) ++sup;
     }
-    NCG_LOG_INFO("mvbench: {} frames ({} clean + {} contaminant + {} blurred); M1 suppresses {} "
-                 "(w_subject<0.5)", Ftot, Ns, Kc, Kb, sup);
+    NCG_LOG_INFO("mvbench: {} frames ({} clean + {} contaminant + {} blurred + {} pose-bad); M1 "
+                 "suppresses {} (w_subject<0.5)", Ftot, Ns, Kc, Kb, Kp, sup);
   }
 
   // M3 quality weight: per-frame sharpness (variance-of-Laplacian), normalized — the blurred frames
@@ -1595,7 +1617,7 @@ int cmd_mvbench(const ncg::app::Args& args) {
 
   // One ablation condition: fit a subset under given defences, return held-out PSNR vs true subject.
   auto run = [&](const std::vector<ncg::fit::AvatarFrame>& fr, bool attrib, bool quality, bool robust,
-                 bool blur, const char* name) {
+                 bool blur, bool pose, const char* name) {
     std::vector<ncg::fit::AvatarFrame> f = fr;
     for (size_t i = 0; i < f.size(); ++i)
       f[i].weight = (attrib ? wsub[i] : 1.0F) * (quality ? wqual[i] : 1.0F);
@@ -1605,6 +1627,9 @@ int cmd_mvbench(const ncg::app::Args& args) {
     cfg.densify = false;
     cfg.robust = robust;
     cfg.conf_blur = blur;
+    cfg.refine_pose = pose;  // M2: per-frame camera bundle-adjustment (joint pose factorization)
+    cfg.pose_reg = args.get_float("pose-reg", 0.5F);  // low: no NLF prior to anchor to in synthetic
+    cfg.lr_pose = args.get_float("lr-pose", 5e-3F);
     auto fit = ncg::fit::fit_avatar(model, rest.betas.squeeze(0), f, init_gray, cfg, nullptr, cov);
     const auto fh = ncg::runtime::render_soft_aniso(fit.canonical, hc);
     const double p = ncg::record::psnr(fh.image.detach() * hmask, gh.image.detach() * hmask);
@@ -1616,18 +1641,20 @@ int cmd_mvbench(const ncg::app::Args& args) {
   // CEILING = clean subject frames only (no contamination); then the contaminated-set ablation.
   //                     frames   attrib quality robust blur   name
   std::vector<ncg::fit::AvatarFrame> clean(frames.begin(), frames.begin() + Ns);
-  const double p_ceil = run(clean, false, false, false, false, "ceiling");
-  const double p_naive = run(frames, false, false, false, false, "naive");
-  const double p_rob = run(frames, false, false, true, false, "robust");  // prior C2 baseline
-  const double p_m1 = run(frames, true, false, false, false, "m1");
-  const double p_m3 = run(frames, false, true, false, true, "m3");
-  // OURS = M1 (who) + M3 (quality+blur), WITHOUT the prior per-pixel robust consistency — which on
-  // structured whole-frame contamination over-rejects clean signal and underperforms naive (shown).
-  const double p_ours = run(frames, true, true, false, true, "ours");
+  //                     frames   attr  qual  robust blur  pose   name
+  const double p_ceil = run(clean, false, false, false, false, false, "ceiling");
+  const double p_naive = run(frames, false, false, false, false, false, "naive");
+  const double p_rob = run(frames, false, false, true, false, false, "robust");  // prior C2 baseline
+  const double p_m1 = run(frames, true, false, false, false, false, "m1");
+  const double p_m3 = run(frames, false, true, false, true, false, "m3");
+  const double p_m2 = run(frames, false, false, false, false, true, "m2");
+  // OURS = M1 (who) + M3 (quality+blur) + M2 (pose factorization), WITHOUT the prior per-pixel robust
+  // consistency — which on structured whole-frame contamination over-rejects clean signal (shown).
+  const double p_ours = run(frames, true, true, false, true, true, "ours");
   NCG_LOG_INFO("mvbench SUMMARY (ceiling {:.2f} dB, contamination gap -{:.2f}): naive {:.2f} | "
-               "robust(C2 baseline) {:.2f} | M1 {:.2f} | M3 {:.2f} | OURS(M1+M3) {:.2f} "
+               "robust(C2 baseline) {:.2f} | M1 {:.2f} | M2 {:.2f} | M3 {:.2f} | OURS(M1+M2+M3) {:.2f} "
                "(recovers {:.0f}% of the gap) -> {}",
-               p_ceil, p_ceil - p_naive, p_naive, p_rob, p_m1, p_m3, p_ours,
+               p_ceil, p_ceil - p_naive, p_naive, p_rob, p_m1, p_m2, p_m3, p_ours,
                (p_naive < p_ceil) ? 100.0 * (p_ours - p_naive) / (p_ceil - p_naive) : 100.0, prefix);
   return 0;
 }
