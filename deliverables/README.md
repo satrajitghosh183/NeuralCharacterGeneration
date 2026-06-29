@@ -25,3 +25,16 @@ ncg_cli face --frames data/me_clean_album \
   --out-prefix me_char --run me_char            # --eyes/--hair now default OFF
 ```
 Full command sequence (incl. the RealVisXL skin bake) is in `RUNBOOK.md`.
+
+## UPDATE — armature bug found; clean static meshes shipped
+The "spheres" in Blender were the **broken armature**, not geometry: `write_glb_textured`
+exports a malformed skeleton (leg/limb joints collapse to the origin), which Blender draws
+as scattered bone shapes. The mesh itself is clean (1 mesh, 11313 verts).
+
+**Ship these (no armature → no spheres):**
+- `me_char_static.glb`, `kj_char_static.glb` — photoreal textured mesh, skeleton stripped.
+  Re-rig in-engine (Mixamo auto-rig, or attach a correct SMPL-X armature).
+
+TODO to restore rigging: fix the joint node translations in `write_glb_textured`
+(`ncg-mesh/src/mesh_io.cpp`) — rest-pose joints collapse; verify the exported skeleton in
+Blender, not just bind-pose renders.
