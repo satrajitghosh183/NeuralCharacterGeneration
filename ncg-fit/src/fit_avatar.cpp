@@ -236,14 +236,17 @@ AvatarFitResult fit_avatar(const body::SmplxModel& model, const Tensor& betas_in
     return k / k.sum();  // [2r+1]
   };
   auto blur_aniso = [&](const Tensor& img, double sx, double sy) {
+    namespace Fn = torch::nn::functional;
     const auto o = img.options();
     auto im = img.unsqueeze(0);  // [1,3,H,W]
     const auto kx = gauss1d(sx, o);
     const auto Kx = kx.view({1, 1, 1, -1}).expand({3, 1, 1, kx.size(0)}).contiguous();
-    im = torch::conv2d(im, Kx, {}, 1, {0, (kx.size(0) - 1) / 2}, 1, 3);  // along W
+    const int rx = static_cast<int>((kx.size(0) - 1) / 2);
+    im = Fn::conv2d(im, Kx, Fn::Conv2dFuncOptions().padding({0, rx}).groups(3));  // along W
     const auto ky = gauss1d(sy, o);
     const auto Ky = ky.view({1, 1, -1, 1}).expand({3, 1, ky.size(0), 1}).contiguous();
-    im = torch::conv2d(im, Ky, {}, 1, {(ky.size(0) - 1) / 2, 0}, 1, 3);  // along H
+    const int ry = static_cast<int>((ky.size(0) - 1) / 2);
+    im = Fn::conv2d(im, Ky, Fn::Conv2dFuncOptions().padding({ry, 0}).groups(3));  // along H
     return im.squeeze(0);  // [3,H,W]
   };
 

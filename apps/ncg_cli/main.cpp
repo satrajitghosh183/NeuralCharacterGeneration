@@ -1490,16 +1490,17 @@ int cmd_mvbench(const ncg::app::Args& args) {
 
   // Separable Gaussian blur of a [3,H,W] image (for the motion-blur frames).
   auto gblur = [&](const torch::Tensor& img, double s) {
+    namespace Fn = torch::nn::functional;
     const auto o = img.options();
     const int r = std::max(1, static_cast<int>(std::ceil(3.0 * s)));
     const auto x = torch::arange(-r, r + 1, o);
     auto k = torch::exp(-0.5 * (x / s).pow(2));
     k = k / k.sum();
     auto im = img.unsqueeze(0);
-    im = torch::conv2d(im, k.view({1, 1, 1, -1}).expand({3, 1, 1, k.size(0)}).contiguous(), {}, 1,
-                       {0, r}, 1, 3);
-    im = torch::conv2d(im, k.view({1, 1, -1, 1}).expand({3, 1, k.size(0), 1}).contiguous(), {}, 1,
-                       {r, 0}, 1, 3);
+    im = Fn::conv2d(im, k.view({1, 1, 1, -1}).expand({3, 1, 1, k.size(0)}).contiguous(),
+                    Fn::Conv2dFuncOptions().padding({0, r}).groups(3));
+    im = Fn::conv2d(im, k.view({1, 1, -1, 1}).expand({3, 1, k.size(0), 1}).contiguous(),
+                    Fn::Conv2dFuncOptions().padding({r, 0}).groups(3));
     return im.squeeze(0);
   };
   // Foreground colour histogram (8 bins/channel over alpha>0 pixels) — the M1 appearance cue.
