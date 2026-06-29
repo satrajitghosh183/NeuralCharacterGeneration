@@ -1613,6 +1613,9 @@ int cmd_avatar(const ncg::app::Args& args) {
     cfg.log_every = 50;
     cfg.dump_every = args.get_int("dump-every", 500);
     cfg.densify = args.get_int("densify", 0) != 0;
+    cfg.refine_pose = args.get_int("refine-pose", 0) != 0;  // bundle-adjust per-frame cameras (video)
+    cfg.lr_pose = args.get_float("lr-pose", 2e-3F);
+    cfg.pose_reg = args.get_float("pose-reg", 50.0F);
     // Supervision-fix knobs (Part 2) for the multi-angle densify test: anti-floater clamp + min-scale
     // (no speckle) + opacity floor (no dark holes) + optional colour freeze.
     cfg.max_dev = args.get_float("max-dev", 0.012F);

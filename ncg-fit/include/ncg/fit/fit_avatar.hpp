@@ -40,6 +40,13 @@ struct AvatarFitConfig {
   bool robust = false;
   double robust_k = 3.0;            // Welsch scale = robust_k · median(residual), recomputed per step
 
+  // BUNDLE ADJUSTMENT: jointly refine each frame's CAMERA EXTRINSICS (small rotation+translation
+  // residual, regularized toward the NLF estimate) so multi-view frames ALIGN instead of mushing.
+  // The diagnosed fix for "views exist but per-frame poses disagree". Off by default (legacy).
+  bool refine_pose = false;
+  double lr_pose = 2e-3;            // LR for the per-frame camera residuals
+  double pose_reg = 50.0;           // keep residuals small (stay near NLF) — anti-drift
+
   // Adaptive density control (off by default). Densified Gaussians inherit their parent's vertex
   // binding, so they still skin. Requires lr_position > 0 to produce a position-gradient signal.
   bool densify = false;

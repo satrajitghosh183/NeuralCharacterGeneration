@@ -17,6 +17,19 @@ Tensor inv_sigmoid(const Tensor& p) {
   return torch::log(c / (1.0 - c));
 }
 
+// Axis-angle [3] -> rotation matrix [3,3] (Rodrigues, differentiable). For bundle-adjustment of the
+// per-frame camera (small residual rotations).
+Tensor rodrigues(const Tensor& w) {
+  const auto th = w.norm().clamp_min(1e-8);
+  const auto k = w / th;
+  const auto opts = w.options();
+  auto K = torch::zeros({3, 3}, opts);
+  K[0][1] = -k[2]; K[0][2] = k[1];
+  K[1][0] = k[2];  K[1][2] = -k[0];
+  K[2][0] = -k[1]; K[2][1] = k[0];
+  return torch::eye(3, opts) + torch::sin(th) * K + (1 - torch::cos(th)) * torch::matmul(K, K);
+}
+
 // Proper-rotation matrices [N,3,3] -> unit quaternions (w,x,y,z) [N,4], branchless (Shepperd).
 Tensor rotmat_to_quat(const Tensor& R) {
   const auto r00 = R.index({torch::indexing::Slice(), 0, 0});
@@ -127,6 +140,15 @@ AvatarFitResult fit_avatar(const body::SmplxModel& model, const Tensor& betas_in
   auto binding = torch::arange(V, at::TensorOptions().dtype(at::kLong).device(device));  // [N]→vert
   auto gain = torch::ones({F, 3}, opts).set_requires_grad(cfg.per_view_exposure);
   auto bias = torch::zeros({F, 3}, opts).set_requires_grad(cfg.per_view_exposure);
+  // Bundle-adjustment leaves: per-frame camera extrinsic residuals (axis-angle rotation + translation),
+  // init 0, regularized toward the NLF camera. Cache the NLF R/t to compose against.
+  auto cam_drot = torch::zeros({F, 3}, opts).set_requires_grad(cfg.refine_pose);
+  auto cam_dt = torch::zeros({F, 3}, opts).set_requires_grad(cfg.refine_pose);
+  std::vector<Tensor> camR0, camt0;
+  for (int64_t f = 0; f < F; ++f) {
+    camR0.push_back(frames[static_cast<size_t>(f)].camera.R.to(opts));
+    camt0.push_back(frames[static_cast<size_t>(f)].camera.t.to(opts).reshape({3}));
+  }
 
   // Bound scales to a human-scale range: collapse (→0) makes the projected covariance singular and
   // explodes the conic-inverse gradient; runaway growth lets one Gaussian dominate the normalized
@@ -163,12 +185,17 @@ AvatarFitResult fit_avatar(const body::SmplxModel& model, const Tensor& betas_in
       groups.push_back(grp({gain}, 1e-3));
       groups.push_back(grp({bias}, 1e-3));
     }
+    if (cfg.refine_pose) {
+      groups.push_back(grp({cam_drot}, cfg.lr_pose));
+      groups.push_back(grp({cam_dt}, cfg.lr_pose));
+    }
     clip_leaves = {log_scales, quats, color_logits, opacity_logits};
     if (lr_pos > 0) clip_leaves.push_back(positions);
     if (cfg.per_view_exposure) {
       clip_leaves.push_back(gain);
       clip_leaves.push_back(bias);
     }
+    if (cfg.refine_pose) { clip_leaves.push_back(cam_drot); clip_leaves.push_back(cam_dt); }
     return std::make_unique<Adam>(groups, AdamOptions(cfg.lr_color));
   };
   auto optimizer = make_opt();
@@ -205,7 +232,13 @@ AvatarFitResult fit_avatar(const body::SmplxModel& model, const Tensor& betas_in
                                : torch::randint(0, F, {1}, at::kLong).item<int64_t>();
     optimizer->zero_grad();
     const auto posed = deform_avatar(canonical(), transforms[f], binding);
-    auto pred = runtime::render_soft_aniso(posed, frames[f].camera).image;
+    // Bundle-adjustment: render through the REFINED camera (NLF extrinsics ∘ optimizable residual).
+    runtime::Camera cam = frames[f].camera;
+    if (cfg.refine_pose) {
+      cam.R = torch::matmul(rodrigues(cam_drot[f]), camR0[f]);  // R' = ΔR · R0
+      cam.t = camt0[f] + cam_dt[f];                             // t' = t0 + Δt
+    }
+    auto pred = runtime::render_soft_aniso(posed, cam).image;
     if (cfg.per_view_exposure) {
       pred = (pred * gain[f].view({3, 1, 1}) + bias[f].view({3, 1, 1})).clamp(0.0, 1.0);
     }
@@ -236,6 +269,9 @@ AvatarFitResult fit_avatar(const body::SmplxModel& model, const Tensor& betas_in
       l1 = torch::l1_loss(pred, tgt);
     }
     auto loss = (1.0 - cfg.lambda_dssim) * l1 + cfg.lambda_dssim * (1.0 - ssim(pred, tgt));
+    if (cfg.refine_pose) {  // keep the camera residual small (stay near the NLF estimate)
+      loss = loss + cfg.pose_reg * (cam_drot[f].pow(2).sum() + cam_dt[f].pow(2).sum());
+    }
     // Deviation regularizer (anti-floater): pull each splat toward its bound vertex's rest position.
     if (cfg.position_reg > 0.0 && lr_pos > 0) {
       const auto anchor = rest_verts.index_select(0, binding);  // [N,3] bound-vertex rest position
