@@ -9,6 +9,7 @@ commands below.
 |------|---------|-------|
 | `me_char_rvxl2_face.glb` | user | best face bake — RealVisXL_V4.0 + IP-Adapter-FaceID-portrait reprojected onto the UV (identity ArcFace ~0.56, photoreal skin), 55-joint SMPL-X rig |
 | `kj_char_rvxl_face.glb` | Kendall (research benchmark only, not deployable) | same RealVisXL FaceID bake path |
+| `kj_ultimate_face.glb` | Kendall (research benchmark only) | KJ full combine — RealVisXL skin + eyes + hair + 55 named bones; all gates PASS |
 | `me_eyes_hair_face.glb` | user | TASK 2 result — adds anatomically-placed **eyeballs** (skinned to head) and a dark **hair cap** (crown/back/sides, off the face) to the rig; all 55 bones **named**; analytic skin. All gates PASS. |
 | **`me_ultimate_face.glb`** | user | **the full combine** — RealVisXL_V4.0 + IP-Adapter-FaceID-portrait_sdxl photoreal skin reprojected onto the UV **+ eyeballs + hair cap + 55 named bones**. All gates PASS (skeleton 55/55, dressable, opaque). The deployable hero asset. |
 
