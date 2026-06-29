@@ -1378,18 +1378,42 @@ int cmd_attribute(const ncg::app::Args& args) {
     if (!faces.empty()) { a512 = arc.embed(img, faces[0]); fscore = faces[0].score; }
   };
 
-  // ---- reference signature ----
-  torch::Tensor rb, ra, rh; float rf;
-  sig(args.require("ref"), rb, ra, rh, rf);
-  NCG_LOG_INFO("attribute: reference signature built (face cue {}, |β|={:.2f})",
-               ra.defined() ? "present" : "absent", rb.norm().item<float>());
-
+  // Gather frames first — needed so the reference can be auto-selected from them if necessary.
   std::vector<std::string> paths;
   for (const auto& e : fs::directory_iterator(args.require("frames"))) {
     const auto x = e.path().extension().string();
     if (x == ".jpg" || x == ".jpeg" || x == ".png" || x == ".JPG") paths.push_back(e.path().string());
   }
   std::sort(paths.begin(), paths.end());
+  NCG_CHECK(!paths.empty(), "attribute: no image frames found in --frames dir");
+
+  // ---- reference signature ----
+  // Use --ref when it yields a valid NLF detection; otherwise (no --ref, or a --ref with no
+  // detectable person, e.g. a frame where the subject is occluded) auto-pick the frame with the
+  // strongest face detection — the most frontal/clear view of the subject — so a bad reference can
+  // never abort the run. NLF throws when it finds no person; we treat that as "skip this candidate".
+  torch::Tensor rb, ra, rh; float rf = 0.0F;
+  std::string ref_used;
+  const std::string ref_arg = args.get("ref", "");
+  if (!ref_arg.empty()) {
+    try { sig(ref_arg, rb, ra, rh, rf); ref_used = ref_arg; }
+    catch (const std::exception& e) {
+      NCG_LOG_WARN("attribute: --ref '{}' has no detectable person ({}); auto-selecting a reference",
+                   ref_arg, e.what());
+    }
+  }
+  if (!rb.defined()) {  // scan frames for the clearest face to anchor the signature
+    float best = -1.0F;
+    for (const auto& p : paths) {
+      torch::Tensor b, a, h; float fsc;
+      try { sig(p, b, a, h, fsc); } catch (const std::exception&) { continue; }
+      if (fsc > best) { best = fsc; rb = b; ra = a; rh = h; rf = fsc; ref_used = p; }
+      if (best > 0.9F) break;  // a strong frontal face is a good enough anchor; stop scanning
+    }
+    NCG_CHECK(rb.defined(), "attribute: no frame yielded a valid detection to use as a reference");
+  }
+  NCG_LOG_INFO("attribute: reference = {} (face cue {}, score {:.2f}, |β|={:.2f})", ref_used,
+               ra.defined() ? "present" : "absent", rf, rb.norm().item<float>());
 
   const float kappa = args.get_float("kappa", 10.0F), tau = args.get_float("tau", 0.45F);
   const float bscale = args.get_float("beta-scale", 2.0F);
