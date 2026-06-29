@@ -257,7 +257,8 @@ AvatarFitResult fit_avatar(const body::SmplxModel& model, const Tensor& betas_in
     const auto posed = deform_avatar(canonical(), transforms[f], binding);
     // Bundle-adjustment: render through the REFINED camera (NLF extrinsics ∘ optimizable residual).
     runtime::Camera cam = frames[f].camera;
-    if (cfg.refine_pose) {
+    const bool pose_active = cfg.refine_pose && it >= cfg.pose_refine_from;  // warm-up gate
+    if (pose_active) {
       cam.R = torch::matmul(rodrigues(cam_drot[f]), camR0[f]);  // R' = ΔR · R0
       cam.t = camt0[f] + cam_dt[f];                             // t' = t0 + Δt
     }

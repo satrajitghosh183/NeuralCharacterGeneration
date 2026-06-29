@@ -1628,8 +1628,9 @@ int cmd_mvbench(const ncg::app::Args& args) {
     cfg.robust = robust;
     cfg.conf_blur = blur;
     cfg.refine_pose = pose;  // M2: per-frame camera bundle-adjustment (joint pose factorization)
-    cfg.pose_reg = args.get_float("pose-reg", 0.5F);  // low: no NLF prior to anchor to in synthetic
-    cfg.lr_pose = args.get_float("lr-pose", 5e-3F);
+    cfg.pose_reg = args.get_float("pose-reg", 2.0F);  // moderate: clean cameras stay put, bad ones move
+    cfg.lr_pose = args.get_float("lr-pose", 3e-3F);
+    cfg.pose_refine_from = static_cast<int>(args.get_float("pose-warmup", 0.5F) * iters);  // warm-up
     auto fit = ncg::fit::fit_avatar(model, rest.betas.squeeze(0), f, init_gray, cfg, nullptr, cov);
     const auto fh = ncg::runtime::render_soft_aniso(fit.canonical, hc);
     const double p = ncg::record::psnr(fh.image.detach() * hmask, gh.image.detach() * hmask);

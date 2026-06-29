@@ -55,6 +55,11 @@ struct AvatarFitConfig {
   bool refine_pose = false;
   double lr_pose = 2e-3;            // LR for the per-frame camera residuals
   double pose_reg = 50.0;           // keep residuals small (stay near NLF) — anti-drift
+  // WARM-UP: hold cameras fixed for the first `pose_refine_from` iterations so appearance/geometry
+  // stabilizes before any camera moves. Refining from iter 0 (against a from-scratch canonical) lets
+  // even already-correct cameras drift on garbage early gradients into a degenerate co-adapted
+  // solution that overfits training views and collapses held-out quality. 0 = refine from the start.
+  int pose_refine_from = 0;
 
   // Adaptive density control (off by default). Densified Gaussians inherit their parent's vertex
   // binding, so they still skin. Requires lr_position > 0 to produce a position-gradient signal.
