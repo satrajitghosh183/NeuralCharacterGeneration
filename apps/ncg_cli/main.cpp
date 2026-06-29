@@ -1483,7 +1483,12 @@ int cmd_mvbench(const ncg::app::Args& args) {
   ncg::body::SmplxParams r2 = rest;
   r2.betas = torch::full({1, model.num_betas()}, 1.5F, dopt);  // clearly different body
   const auto v_cont = model.forward(r2).vertices.squeeze(0);
-  const auto A_cont = (1.0 - A_subj).clamp(0.05, 0.95);  // inverted look => separable by appearance
+  // A different person's colouring: a strong colour CAST (darker R/G, bluer) gives a DISTINCT colour
+  // histogram. Spatial inversion (1-A) would NOT — a histogram is permutation-invariant to layout, so
+  // it'd leave the distribution unchanged and the M1 appearance cue blind. The cast shifts the actual
+  // per-channel distribution, which is what attribution keys on.
+  const auto cast = torch::tensor({0.45F, 0.6F, 1.25F}, dopt).view({1, 3});
+  const auto A_cont = (A_subj * cast + 0.04).clamp(0.05, 0.95);
   const auto gt_cont = ncg::recon::gaussians_on_body(
       v_cont, scale, A_cont, ncg::recon::per_vertex_scale(v_cont.to(at::kCPU), 0.75).to(device));
   const auto center_c = gt_cont.positions.mean(0);
