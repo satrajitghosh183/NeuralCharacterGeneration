@@ -29,7 +29,10 @@ def to_np(x) -> np.ndarray:
     # SMPL-X stores some arrays as scipy sparse / chumpy; coerce to dense float32.
     if hasattr(x, "todense"):
         x = np.asarray(x.todense())
-    return np.asarray(x, dtype=np.float32)
+    # MUST be C-contiguous: the npz J_regressor is a strided/transposed view, and safetensors
+    # serializes the raw buffer — saving it non-contiguous silently corrupts it (e.g. J_regressor
+    # rows lose most non-zeros), which collapses the exported skeleton to the origin. Force a copy.
+    return np.ascontiguousarray(x, dtype=np.float32)
 
 
 def main() -> int:
