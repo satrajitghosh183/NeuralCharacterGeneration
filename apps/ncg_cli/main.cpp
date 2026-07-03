@@ -45,6 +45,7 @@
 #include <cstdio>
 #include <exception>
 #include <filesystem>
+#include <optional>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -1038,7 +1039,12 @@ torch::Tensor recover_uv_albedo(const ncg::body::SmplxModel& model,
                                 const torch::Tensor& rest_verts, torch::Tensor& mask_out,
                                 torch::Tensor& normal_out, torch::Tensor& pos_out,
                                 torch::Tensor& gnrm_out, float detail_weight = 1.5F,
-                                float deshade = 0.5F, float chroma = 0.6F, float seam = 0.6F) {
+                                float deshade = 0.5F, float chroma = 0.6F, float seam = 0.6F,
+                                torch::Tensor* obs_out = nullptr) {
+  // obs_out (optional): per-texel OBSERVABILITY o(x) in [0,1] — the evidence field of the
+  // paper's Theorem-3 completion. o(x) = a soft count of well-weighted views per texel
+  // (frontality x visibility x in-bounds x specular-reject), squashed so 1 good view ~ 0.5
+  // and 3+ good views ~ 1. The completion gate g(1-o) must be exactly zero where o > tau.
   const auto device = model.uv_coords().device();
   const auto ras = ncg::recon::uv_rasterize(model.uv_coords(), model.uv_faces(), T);
   const auto face = ras.face.to(device);                              // [T^2]
@@ -1095,6 +1101,12 @@ torch::Tensor recover_uv_albedo(const ncg::body::SmplxModel& model,
   auto O = torch::stack(obs_l, 0);                                  // [N,T^2,3]
   const auto W = torch::stack(w_l, 0);                             // [N,T^2]
   const int64_t Nph = O.size(0);
+  if (obs_out != nullptr) {
+    // o(x): soft count of well-weighted views per texel, squashed to [0,1]. One good view
+    // (w>0.35) -> ~0.5, three or more -> ~1. Multiplied by `valid` so gutter texels are 0.
+    const auto soft_count = torch::sigmoid((W - 0.35F) * 10.0F).sum(0);          // [T^2]
+    *obs_out = ((1.0F - torch::exp(-soft_count * 0.7F)) * valid).reshape({T, T});
+  }
   {
     const auto Wt = W.unsqueeze(2);                                // [N,T^2,1]
     const auto cnt2 = (((W > 0.2F).to(at::kFloat).sum(0)) >= 2.0F).to(at::kFloat).unsqueeze(1);  // shared
@@ -1133,7 +1145,10 @@ torch::Tensor recover_uv_albedo(const ncg::body::SmplxModel& model,
     const auto good = (W > 0.2F).unsqueeze(2);                                    // [N,T^2,1]
     const auto wmean = (W.unsqueeze(2) * O).sum(0) / W.unsqueeze(2).sum(0).clamp_min(1e-6F);
     const auto Om = torch::where(good, O, torch::full_like(O, std::numeric_limits<float>::quiet_NaN()));
-    const auto med = std::get<0>(torch::nanmedian(Om, 0));                        // [T^2,3]
+    // nanmedian is not implemented on MPS — round-trip through CPU there (small: [N,T^2,3]).
+    const auto med = Om.device().is_mps()
+                         ? std::get<0>(torch::nanmedian(Om.to(at::kCPU), 0)).to(Om.device())
+                         : std::get<0>(torch::nanmedian(Om, 0));                  // [T^2,3]
     albedo = torch::where(torch::isnan(med), wmean, med).clamp(0.0F, 1.0F);
     // GATE1 metric: residual of each view vs the consensus MEDIAN on shared skin texels (how much the
     // merge had to reject) — raw mean-residual vs median-residual.
@@ -2760,7 +2775,7 @@ int cmd_complete(const ncg::app::Args& args) {
 // per photo; we recover the one identity that explains the whole album. (docs/method.md Theorem 2.)
 // ============================================================================================
 int cmd_face(const ncg::app::Args& args) {
-  const auto device = ncg::cuda_available() ? at::Device(at::kCUDA, 0) : at::Device(at::kCPU);
+  const auto device = ncg::compute_device();  // CUDA > MPS > CPU (NCG_DEVICE overrides)
   auto rec = ncg::record::Recorder::create("runs", args.get("run", "face"));
   namespace fs = std::filesystem;
 
@@ -2810,11 +2825,38 @@ int cmd_face(const ncg::app::Args& args) {
     for (int i = 0; i < max_frames; ++i) paths.push_back(all[static_cast<size_t>(i * step)]);
   }
 
+  // NLF is the slowest stage (a 500MB ViT; minutes/photo on CPU). Cache its per-photo outputs
+  // (vertices2d/vertices3d — all cmd_face consumes) as npy keyed by photo basename, so NLF runs
+  // once per album EVER; the model itself is loaded lazily only when a cache miss occurs.
+  // --nlf-cache "" disables. Default: <frames>/.nlf_cache.
+  const std::string nlf_cache =
+      args.get("nlf-cache", (fs::path(args.require("frames")) / ".nlf_cache").string());
+  if (!nlf_cache.empty()) fs::create_directories(nlf_cache);
   ncg::body::NlfConfig nc;
   nc.detection = args.get_int("detection", 0);
-  auto nlf = ncg::body::Nlf::load(args.require("weights"), device, nc);
+  std::optional<ncg::body::Nlf> nlf;  // lazy: cached reruns never pay the model load
+  auto nlf_predict = [&](const torch::Tensor& img, const std::string& photo_path) {
+    ncg::body::NlfPrediction pred;
+    const auto stem = fs::path(photo_path).stem().string();
+    const auto f2d = fs::path(nlf_cache) / (stem + ".v2d.npy");
+    const auto f3d = fs::path(nlf_cache) / (stem + ".v3d.npy");
+    if (!nlf_cache.empty() && fs::exists(f2d) && fs::exists(f3d)) {
+      pred.vertices2d = ncg::io::load_npy(f2d.string()).to(at::kFloat);
+      pred.vertices3d = ncg::io::load_npy(f3d.string()).to(at::kFloat);
+      return pred;
+    }
+    if (!nlf) nlf.emplace(ncg::body::Nlf::load(args.require("weights"), device, nc));
+    pred = nlf->detect(img);
+    if (!nlf_cache.empty() && pred.vertices2d.defined() && pred.vertices2d.size(0) > 0) {
+      ncg::io::save_npy(f2d.string(), pred.vertices2d.to(at::kCPU).to(at::kFloat).contiguous());
+      ncg::io::save_npy(f3d.string(), pred.vertices3d.to(at::kCPU).to(at::kFloat).contiguous());
+    }
+    return pred;
+  };
 
-  const bool texture = args.get_int("texture", 1) != 0 && ncg::cuda_available();
+  // Texture solve runs on any torch device now (CUDA/MPS/CPU) — the renderers and the UV
+  // solve are pure LibTorch. CPU is slow but valid; --texture 0 still disables explicitly.
+  const bool texture = args.get_int("texture", 1) != 0;
   // SmplxModel gives the UV layout for the high-res per-texel solve (recover_uv_albedo).
   const auto model = texture ? ncg::body::SmplxModel::load(args.require("smplx"), device)
                              : ncg::body::SmplxModel::load(args.require("smplx"), at::kCPU);
@@ -2844,7 +2886,7 @@ int cmd_face(const ncg::app::Args& args) {
     }
     ncg::body::NlfPrediction pred;
     try {
-      pred = nlf.detect(img);
+      pred = nlf_predict(img, p);
     } catch (const std::exception& e) {
       NCG_LOG_WARN("face: NLF failed on {} ({}), skipping", p, e.what());
       continue;
@@ -2949,10 +2991,17 @@ int cmd_face(const ncg::app::Args& args) {
       for (int64_t i = 0; i < Nt; ++i)
         viss_t.push_back(vis_l[static_cast<size_t>(i)] * R.weight[i].to(device).clamp_min(0.05));
       torch::Tensor uvmask, uvnrm, uvpos, uvgn;
+      torch::Tensor uvobs;  // o(x) — per-texel observability, the Theorem-3 gate input
       const auto uvtex =
           recover_uv_albedo(model, uv_img, uv_v2d, nrm_l, viss_t, T, verts_dev, uvmask, uvnrm, uvpos,
                             uvgn, args.get_float("detail", 0.7F), args.get_float("deshade", 0.5F),
-                            args.get_float("chroma", 0.6F));
+                            args.get_float("chroma", 0.6F), 0.6F, &uvobs);
+      // Persist the observability field: the completion stage gates generation by g(1-o(x)),
+      // and the dump is GATE B's eye-check (face bright, unseen body dark).
+      ncg::io::save_npy(prefix + "_obs_uv.npy", uvobs.to(at::kCPU).contiguous());
+      ncg::io::save_png(prefix + "_obs_uv.png",
+                        uvobs.unsqueeze(0).expand({3, T, T}).to(at::kCPU).contiguous());
+      torch::Tensor uv_completed;  // set by --complete-body; downstream glb uses it over uvtex
       // TEXTURE-RESOLUTION render: turn each valid UV texel into a 3D surface splat coloured by the
       // sharp per-texel albedo. Render detail = texture resolution (T²), not the ~10⁴ vertex count —
       // this is what actually makes the rendered face sharp (the splat portraits below were
@@ -3182,12 +3231,217 @@ int cmd_face(const ncg::app::Args& args) {
                             uvcur.reshape({T, T, 3}).permute({2, 0, 1}).contiguous());
           NCG_LOG_INFO("face: img2img-baked photoreal face -> {}_face_baked_*.png", prefix);
         }
+
+        // ==== THEOREM-3 COMPLETION (--complete-body): observability-gated intrinsic completion ====
+        // p(X|{O_i}) ∝ p({O_i}|X,{g_i})·p(X). Texels with photo evidence (o(x) ≥ obs_hi) are held
+        // EXACTLY (completion gate ≡ 0 on Ω_obs — identity is structural, not tuned); texels the
+        // album never saw (o≈0) are completed by the diffusion prior in ALBEDO space (flat renders,
+        // no lighting), so the result stays relightable and animate∘relight commutes on completed
+        // regions too. Cross-view fusion = the monotone most-frontal rule (conf non-decreasing ⇒
+        // the view loop converges). Every texel gets provenance: evidence vs completed.
+        if (args.get_int("complete-body", 0) != 0 && args.has("sd-dir")) {
+          namespace Fn = torch::nn::functional;
+          const std::string sdd = args.require("sd-dir");
+          ncg::diffuse::SdGuidanceConfig gc;
+          gc.guidance = args.get_float("complete-guidance", 7.5F);
+          const bool ctrl = args.get_int("complete-control", 1) != 0;
+          auto guide = ncg::diffuse::SdGuidance::load(
+              sdd + (ctrl ? "/control_unet.ts" : "/sd_unet.ts"), sdd + "/sd_vae.ts",
+              sdd + "/sd_cond.safetensors", device, gc);
+          const ncg::diffuse::DdpmSchedule sch({}, device);
+          const int steps = args.get_int("complete-steps", 30);
+          const int br = args.get_int("complete-res", 512);
+          const float s_lo = args.get_float("complete-lo", 0.30F);  // refine (some evidence nearby)
+          const float s_hi = args.get_float("complete-hi", 0.85F);  // generate (no evidence)
+          const int64_t stride = args.get_int("complete-stride", 2);  // splat subsample (render only)
+          const int64_t rchunk = args.get_int("complete-chunk", 1024);
+
+          ncg::diffuse::CompletionConfig cc;
+          cc.obs_lo = args.get_float("obs-lo", 0.15F);
+          cc.obs_hi = args.get_float("obs-hi", 0.35F);
+          const auto o_tex = uvobs.reshape({T * T}).index({m}).to(fp.options());   // [P] o(x)
+          const auto gate = ncg::diffuse::completion_gate(o_tex, cc);              // [P] g(1-obs semantics: 1=complete)
+          const auto evidence = (gate <= 0.0F);                                    // Ω_obs texels
+
+          auto uvcur = uvtex.reshape({T * T, 3}).clone();
+          const auto pidx = m.nonzero().squeeze(1);
+          // Evidence texels start conf=2 (> any view weight ≤ 1): mathematically unoverwritable.
+          auto conf = evidence.to(fp.dtype()) * 2.0F;
+          auto painted = evidence.to(fp.dtype()).clone();  // provenance: what has real content
+
+          // Render clouds: strided subsample (texel density >> pixels; renders 4x faster).
+          const auto ridx = torch::arange(0, P, stride, pidx.options());
+          auto make_cloud = [&](const torch::Tensor& colors) {
+            ncg::recon::GaussianCloud c;
+            c.positions = fp.index_select(0, ridx);
+            c.colors = colors.index_select(0, ridx);
+            const int64_t Q = ridx.size(0);
+            c.scales = torch::full({Q, 3}, args.get_float("texel-scale", 0.0010F) *
+                                               static_cast<float>(stride), fp.options());
+            c.opacities = torch::ones({Q, 1}, fp.options());
+            c.rotations = torch::zeros({Q, 4}, fp.options());
+            c.rotations.select(1, 0).fill_(1.0F);
+            return c;
+          };
+          auto splat = [&](const torch::Tensor& colors, const ncg::runtime::Camera& cam,
+                           std::array<float, 3> bg) {
+            torch::NoGradGuard ng;
+            return ncg::runtime::render_soft_aniso(make_cloud(colors), cam, bg, rchunk);
+          };
+          auto sample_at = [&](const torch::Tensor& img3hw, const torch::Tensor& uvp) {
+            const auto gx = uvp.select(1, 0) / (br - 1) * 2 - 1;
+            const auto gy = uvp.select(1, 1) / (br - 1) * 2 - 1;
+            const auto grid = torch::stack({gx, gy}, 1).view({1, P, 1, 2});
+            return Fn::grid_sample(img3hw.unsqueeze(0), grid,
+                                   Fn::GridSampleFuncOptions().mode(torch::kBilinear)
+                                       .padding_mode(torch::kZeros).align_corners(true))
+                .view({img3hw.size(0), P}).t();  // [P,C]
+          };
+
+          // Body-framing views (mesh fully in frame) + head harmonization views.
+          const auto vmin = std::get<0>(verts_dev.min(0)), vmax = std::get<0>(verts_dev.max(0));
+          const auto bc = (vmin + vmax) * 0.5F;
+          const float brad2 = args.get_float("complete-radius", 2.4F);
+          const float bfov2 = args.get_float("complete-fov", 50.0F);
+          struct Vw { float az, el, rad, fov; torch::Tensor ctr; };
+          std::vector<Vw> vws;
+          for (float vaz : {0.F, 45.F, -45.F, 90.F, -90.F, 135.F, -135.F, 180.F})
+            vws.push_back({vaz, 5.F, brad2, bfov2, bc});
+          for (float vaz : {30.F, -30.F}) vws.push_back({vaz, -20.F, brad2 * 0.85F, bfov2, bc});
+          for (float vaz : {0.F, 90.F, -90.F, 180.F}) vws.push_back({vaz, 5.F, 0.42F, 28.F, hc});
+
+          const int passes = args.get_int("complete-passes", 2);
+          for (int pass = 0; pass < passes; ++pass) {
+            if (pass > 0)  // pass B: better views may re-win painted texels; evidence stays locked
+              conf = torch::maximum(conf * 0.7F, evidence.to(fp.dtype()) * 2.0F);
+            const float plo = pass == 0 ? s_lo : 0.2F;
+            const float phi = pass == 0 ? s_hi : 0.2F;
+            for (size_t vi = 0; vi < vws.size(); ++vi) {
+              const auto& vw = vws[vi];
+              const auto cam = ncg::runtime::Camera::orbit(vw.ctr, vw.rad, vw.az, vw.el, vw.fov,
+                                                           br, br, device);
+              const auto ro = splat(uvcur.index({m}), cam, {0.5F, 0.5F, 0.5F});  // flat ALBEDO
+              const auto rendered = ro.image;                                     // [3,br,br]
+              torch::Tensor uvp, depth;
+              cam.project(fp, uvp, depth);
+              const auto ncam = torch::matmul(fn, cam.R.t());
+              // Per-pixel GATE map (the theorem's mechanism in view space).
+              const auto gmap3 = splat(gate.unsqueeze(1).expand({P, 3}).contiguous(), cam,
+                                       {0.F, 0.F, 0.F}).image;
+              const auto gmap = gmap3.select(0, 0).clamp(0.0F, 1.0F);             // [br,br]
+              // Depth map for the occlusion test (arms occlude torso on 3/4 views).
+              const float dmn = depth.min().item<float>(), dmx = depth.max().item<float>();
+              const auto dn = ((depth - dmn) / std::max(dmx - dmn, 1e-4F)).clamp(0.0F, 1.0F);
+              const auto dmap = splat(dn.unsqueeze(1).expand({P, 3}).contiguous(), cam,
+                                      {1.F, 1.F, 1.F}).image.select(0, 0);        // far background
+              // Two-strength completion of this view (lo refine / hi generate), CFG + ControlNet.
+              torch::Tensor rl, rh;
+              {
+                torch::NoGradGuard ng;
+                if (ctrl) {
+                  const auto nmap = splat((torch::stack({ncam.select(1, 0), -ncam.select(1, 1),
+                                                         -ncam.select(1, 2)}, 1) * 0.5F + 0.5F)
+                                              .clamp(0.0F, 1.0F), cam, {0.5F, 0.5F, 1.0F}).image;
+                  rl = guide.img2img_control(rendered.unsqueeze(0), nmap.unsqueeze(0), plo, steps,
+                                             sch).squeeze(0);
+                  rh = phi == plo ? rl
+                                  : guide.img2img_control(rendered.unsqueeze(0), nmap.unsqueeze(0),
+                                                          phi, steps, sch).squeeze(0);
+                } else {
+                  rl = guide.img2img(rendered.unsqueeze(0), plo, steps, sch).squeeze(0);
+                  rh = phi == plo ? rl : guide.img2img(rendered.unsqueeze(0), phi, steps, sch)
+                                             .squeeze(0);
+                }
+              }
+              // Composite in view space: evidence pixels keep the render EXACTLY (gmap=0 there);
+              // gated pixels blend lo->hi with the gate (C¹ transition, no seams).
+              const auto tmix = ((gmap - 0.35F) / 0.30F).clamp(0.0F, 1.0F).unsqueeze(0);
+              const auto mix = rl * (1.0F - tmix) + rh * tmix;
+              const auto out = rendered * (1.0F - gmap.unsqueeze(0)) + mix * gmap.unsqueeze(0);
+              if (vi == 0 && pass == 0) {  // GATE D triptych for the front view
+                ncg::io::save_png(prefix + "_complete_v0_base.png", rendered);
+                ncg::io::save_png(prefix + "_complete_v0_gate.png", gmap3);
+                ncg::io::save_png(prefix + "_complete_v0_out.png", out);
+              }
+              // Reproject: most-frontal + in-bounds + UNOCCLUDED + inside eroded silhouette.
+              const auto samp = sample_at(out, uvp);                              // [P,3]
+              const auto sdep = sample_at(dmap.unsqueeze(0), uvp).squeeze(1);     // [P]
+              const auto alpha_er =
+                  1.0F - Fn::max_pool2d((1.0F - ro.alpha.view({1, 1, br, br})),
+                                        Fn::MaxPool2dFuncOptions(7).stride(1).padding(3))
+                             .view({br, br});
+              const auto sil = sample_at(alpha_er.unsqueeze(0), uvp).squeeze(1);  // [P]
+              const float dtol = 0.015F / std::max(dmx - dmn, 1e-4F);
+              const auto visible = ((dn - sdep) < dtol).to(fp.dtype());
+              const auto front = torch::relu(-ncam.select(1, 2)) * (depth > 0).to(fp.dtype());
+              const auto inb = ((uvp.select(1, 0) >= 0) & (uvp.select(1, 0) <= br - 1) &
+                                (uvp.select(1, 1) >= 0) & (uvp.select(1, 1) <= br - 1))
+                                   .to(fp.dtype());
+              const auto w = front * inb * visible * (sil > 0.5F).to(fp.dtype()) *
+                             (gate > 0.0F).to(fp.dtype());   // evidence texels never update
+              const auto better = (w > conf).to(fp.dtype()).unsqueeze(1);
+              const auto old = uvcur.index_select(0, pidx);
+              uvcur.index_copy_(0, pidx, samp * better + old * (1.0F - better));
+              conf = torch::maximum(conf, w);
+              painted = torch::maximum(painted, (w > 0.05F).to(fp.dtype()));
+              NCG_LOG_INFO("complete: pass {} view {}/{} (az={:.0f} el={:.0f}) done", pass + 1,
+                           vi + 1, vws.size(), vw.az, vw.el);
+            }
+          }
+          // Push-pull fill for gated texels no view reached (armpits, soles): normalized blur.
+          {
+            auto cimg = painted.to(at::kFloat);
+            auto cfull = torch::zeros({T * T}, uvcur.options());
+            cfull.index_copy_(0, pidx, cimg);
+            auto tfull = uvcur.clone();
+            auto k1 = torch::tensor({1.F, 4.F, 6.F, 4.F, 1.F}, uvcur.options());
+            auto k2 = torch::outer(k1, k1); k2 = k2 / k2.sum();
+            const auto kb = k2.view({1, 1, 5, 5});
+            for (int it = 0; it < 16; ++it) {
+              const auto ti = tfull.t().reshape({3, 1, T, T});
+              const auto ci = cfull.reshape({1, 1, T, T});
+              const auto tb = Fn::conv2d(ti * ci, kb, Fn::Conv2dFuncOptions().padding(2));
+              const auto cb = Fn::conv2d(ci, kb, Fn::Conv2dFuncOptions().padding(2));
+              const auto filled = (tb / cb.clamp_min(1e-6F)).reshape({3, T * T}).t();
+              const auto has = (cfull > 1e-4F).unsqueeze(1).to(uvcur.dtype());
+              tfull = tfull * has + filled * (1.0F - has);
+              cfull = torch::maximum(cfull, (cb.reshape({T * T}) > 1e-4F).to(cfull.dtype()) * 0.5F);
+            }
+            uvcur = tfull;
+          }
+          // Provenance + metrics: evidence invariance is structural — verify and report it anyway.
+          const auto ev_idx = evidence.nonzero().squeeze(1);
+          const auto orig = uvtex.reshape({T * T, 3}).index_select(0, pidx.index_select(0, ev_idx));
+          const auto now = uvcur.index_select(0, pidx.index_select(0, ev_idx));
+          NCG_LOG_INFO("complete: Omega_obs invariance |new-old| max = {:.2e} on {} evidence texels "
+                       "(must be 0)", (now - orig).abs().max().item<float>(), ev_idx.size(0));
+          auto prov = torch::zeros({T * T}, uvcur.options());
+          prov.index_copy_(0, pidx, gate);  // 0 = evidence, >0 = completed
+          ncg::io::save_png(prefix + "_provenance_uv.png",
+                            prov.reshape({1, T, T}).expand({3, T, T}).contiguous());
+          ncg::io::save_png(prefix + "_albedo_complete_uv.png",
+                            uvcur.reshape({T, T, 3}).permute({2, 0, 1}).contiguous());
+          // Turntable verify renders (GATE D eye-check).
+          for (int k = 0; k < 8; ++k) {
+            const float vaz = -180.0F + 45.0F * static_cast<float>(k);
+            const auto cam = ncg::runtime::Camera::orbit(bc, brad2, vaz, 5.0F, bfov2, 640, 640,
+                                                         device);
+            const auto img = splat(uvcur.index({m}), cam, {0.15F, 0.15F, 0.18F}).image;
+            char nm[40];
+            std::snprintf(nm, sizeof(nm), "_complete_turn_%+04d.png", static_cast<int>(vaz));
+            ncg::io::save_png(prefix + nm, img);
+          }
+          uv_completed = uvcur.reshape({T, T, 3});
+          NCG_LOG_INFO("complete: Theorem-3 body completion done -> {}_albedo_complete_uv.png "
+                       "(+provenance, +turntable)", prefix);
+        }
       }
       // EXTERNAL REPROJECTION: bake user-provided refined views (off-the-shelf IP-Adapter-FaceID
       // renders of the lit portraits, named refine_<+/-NN>.png at the 5 lit camera angles) back onto
       // the UV texture, keeping each texel's MOST-FRONTAL view. A stronger off-the-shelf refiner
       // replaces the analytic skin while the recovered geometry/rig stay untouched (appearance-only).
-      auto uv_final = uvtex.reshape({T * T, 3}).clone();  // [T^2,3]
+      // Completed texture (Theorem-3 --complete-body) wins over the raw analytic one when present.
+      auto uv_final = (uv_completed.defined() ? uv_completed : uvtex).reshape({T * T, 3}).clone();
       if (args.has("reproject-dir")) {
         namespace Fn = torch::nn::functional;
         const std::string rd = args.require("reproject-dir");

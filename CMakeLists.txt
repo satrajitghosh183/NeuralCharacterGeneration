@@ -87,15 +87,14 @@ add_subdirectory(ncg-rig)
 add_subdirectory(ncg-mesh)
 add_subdirectory(ncg-record)
 
-# ncg-runtime contains the splat CUDA kernel; ncg-fit/ncg-nerf use its renderer + camera.
-if(NCG_WITH_CUDA)
-  add_subdirectory(ncg-runtime)
-  add_subdirectory(ncg-fit)
-  add_subdirectory(ncg-nerf)
-endif()
+# ncg-runtime's only CUDA piece is the fast splat kernel (auto-dropped without CUDA; the
+# soft/aniso renderers + camera are pure LibTorch). fit/nerf/apps run on CPU/MPS via those,
+# so the whole pipeline builds on the Mac — the fast kernel path throws when !NCG_WITH_CUDA.
+add_subdirectory(ncg-runtime)
+add_subdirectory(ncg-fit)
+add_subdirectory(ncg-nerf)
 
-if(NCG_BUILD_APPS AND NCG_WITH_CUDA)
-  # apps depend on the CUDA render/runtime path; skip in host-only lint configs.
+if(NCG_BUILD_APPS AND NOT NCG_LINT_ONLY)
   add_subdirectory(apps)
 endif()
 

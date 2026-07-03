@@ -1,5 +1,6 @@
 #include <ncg/runtime/renderer.hpp>
 
+#include <ncg/core/config.hpp>
 #include <ncg/core/error.hpp>
 #include <ncg/runtime/splat_raster.hpp>
 
@@ -9,6 +10,12 @@ namespace ncg::runtime {
 
 RenderOutput render_gaussians(const recon::GaussianCloud& g, const Camera& cam,
                               std::array<float, 3> background) {
+#ifndef NCG_WITH_CUDA
+  // No CUDA build (Mac/MPS/CPU): the fast splat kernel doesn't exist. Render with the pure
+  // LibTorch anisotropic splatter instead — same GaussianCloud, same output, any device.
+  torch::NoGradGuard ng;
+  return render_soft_aniso(g, cam, background);
+#else
   g.validate();
   NCG_CHECK(g.device().is_cuda(), "render_gaussians: cloud must be on CUDA");
   NCG_CHECK(cam.width > 0 && cam.height > 0, "render_gaussians: invalid image size");
@@ -36,6 +43,7 @@ RenderOutput render_gaussians(const recon::GaussianCloud& g, const Camera& cam,
   auto [image, alpha] = splat_render_cuda(sel(u), sel(v), sel(inv_s2), sel(op),
                                           sel(g.colors), cam.height, cam.width, background);
   return {image, alpha};
+#endif
 }
 
 RenderOutput render_soft(const recon::GaussianCloud& g, const Camera& cam,
