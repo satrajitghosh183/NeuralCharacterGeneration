@@ -20,7 +20,8 @@ Tensor to_broadcast(const Tensor& v, int64_t ndim) {
 
 DdpmSchedule::DdpmSchedule(const ScheduleConfig& cfg, at::Device device) : cfg_(cfg) {
   NCG_CHECK(cfg.num_train_timesteps > 0, "num_train_timesteps must be positive");
-  const auto opts = at::TensorOptions().dtype(at::kDouble).device(device);
+  // Build in double ON CPU for cumprod precision (MPS has no float64), then store f32 on device.
+  const auto opts = at::TensorOptions().dtype(at::kDouble).device(at::kCPU);
   // "scaled_linear": betas = linspace(sqrt(b0), sqrt(bT))^2 — SD's convention (more steps near 0).
   const auto beta_sqrt = torch::linspace(std::sqrt(static_cast<double>(cfg.beta_start)),
                                          std::sqrt(static_cast<double>(cfg.beta_end)),
@@ -28,8 +29,8 @@ DdpmSchedule::DdpmSchedule(const ScheduleConfig& cfg, at::Device device) : cfg_(
   betas_ = beta_sqrt * beta_sqrt;                          // [T]
   const auto alphas = 1.0 - betas_;                        // [T]
   alphas_cumprod_ = torch::cumprod(alphas, /*dim=*/0);     // [T] abar_t in (0,1], decreasing
-  betas_ = betas_.to(at::kFloat);
-  alphas_cumprod_ = alphas_cumprod_.to(at::kFloat);
+  betas_ = betas_.to(device, at::kFloat);
+  alphas_cumprod_ = alphas_cumprod_.to(device, at::kFloat);
 }
 
 Tensor DdpmSchedule::sqrt_alpha_bar(const Tensor& t, int64_t ndim) const {

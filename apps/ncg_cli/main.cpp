@@ -3250,10 +3250,17 @@ int cmd_face(const ncg::app::Args& args) {
           ncg::diffuse::SdGuidanceConfig gc;
           gc.guidance = args.get_float("complete-guidance", 7.5F);
           const bool ctrl = args.get_int("complete-control", 1) != 0;
+          // The diffusion prior can live on its own device (--sd-device mps): the texture solve
+          // is memory-heavy (CPU-safe) while the ~26 UNet calls are compute-heavy (MPS-fast).
+          const auto sd_dev_s = args.get("sd-device", "");
+          const auto sd_dev = sd_dev_s == "mps"    ? at::Device(at::kMPS)
+                              : sd_dev_s == "cpu"  ? at::Device(at::kCPU)
+                              : sd_dev_s == "cuda" ? at::Device(at::kCUDA, 0)
+                                                   : device;
           auto guide = ncg::diffuse::SdGuidance::load(
               sdd + (ctrl ? "/control_unet.ts" : "/sd_unet.ts"), sdd + "/sd_vae.ts",
-              sdd + "/sd_cond.safetensors", device, gc);
-          const ncg::diffuse::DdpmSchedule sch({}, device);
+              sdd + "/sd_cond.safetensors", sd_dev, gc);
+          const ncg::diffuse::DdpmSchedule sch({}, sd_dev);
           const int steps = args.get_int("complete-steps", 30);
           const int br = args.get_int("complete-res", 512);
           const float s_lo = args.get_float("complete-lo", 0.30F);  // refine (some evidence nearby)
@@ -3273,6 +3280,19 @@ int cmd_face(const ncg::app::Args& args) {
           // Evidence texels start conf=2 (> any view weight ≤ 1): mathematically unoverwritable.
           auto conf = evidence.to(fp.dtype()) * 2.0F;
           auto painted = evidence.to(fp.dtype()).clone();  // provenance: what has real content
+          // Unobserved texels hold merge NOISE (the dark blotch) — and img2img anchors to the
+          // base's low frequencies, so completing from noise yields noise-toned skin. Re-init all
+          // gated texels to the mean EVIDENCE skin tone before painting: the prior then works from
+          // a plausible base and the completed skin matches the photographed skin. (Ω_obs untouched.)
+          {
+            const auto texP = uvcur.index_select(0, pidx);                    // [P,3]
+            const auto ev_w = evidence.to(fp.dtype()).unsqueeze(1);           // [P,1]
+            const auto skin = (texP * ev_w).sum(0) / ev_w.sum().clamp_min(1.0F);  // mean evidence tone
+            const auto reinit = texP * ev_w + skin.unsqueeze(0) * (1.0F - ev_w);
+            uvcur.index_copy_(0, pidx, reinit);
+            NCG_LOG_INFO("complete: gated texels re-initialized to evidence skin tone ({:.2f},{:.2f},{:.2f})",
+                         skin[0].item<float>(), skin[1].item<float>(), skin[2].item<float>());
+          }
 
           // Render clouds: strided subsample (texel density >> pixels; renders 4x faster).
           const auto ridx = torch::arange(0, P, stride, pidx.options());
@@ -3343,19 +3363,20 @@ int cmd_face(const ncg::app::Args& args) {
               torch::Tensor rl, rh;
               {
                 torch::NoGradGuard ng;
+                const auto rin = rendered.unsqueeze(0).to(sd_dev);
                 if (ctrl) {
                   const auto nmap = splat((torch::stack({ncam.select(1, 0), -ncam.select(1, 1),
                                                          -ncam.select(1, 2)}, 1) * 0.5F + 0.5F)
                                               .clamp(0.0F, 1.0F), cam, {0.5F, 0.5F, 1.0F}).image;
-                  rl = guide.img2img_control(rendered.unsqueeze(0), nmap.unsqueeze(0), plo, steps,
-                                             sch).squeeze(0);
+                  const auto nin = nmap.unsqueeze(0).to(sd_dev);
+                  rl = guide.img2img_control(rin, nin, plo, steps, sch).squeeze(0).to(device);
                   rh = phi == plo ? rl
-                                  : guide.img2img_control(rendered.unsqueeze(0), nmap.unsqueeze(0),
-                                                          phi, steps, sch).squeeze(0);
+                                  : guide.img2img_control(rin, nin, phi, steps, sch)
+                                        .squeeze(0).to(device);
                 } else {
-                  rl = guide.img2img(rendered.unsqueeze(0), plo, steps, sch).squeeze(0);
-                  rh = phi == plo ? rl : guide.img2img(rendered.unsqueeze(0), phi, steps, sch)
-                                             .squeeze(0);
+                  rl = guide.img2img(rin, plo, steps, sch).squeeze(0).to(device);
+                  rh = phi == plo ? rl
+                                  : guide.img2img(rin, phi, steps, sch).squeeze(0).to(device);
                 }
               }
               // Composite in view space: evidence pixels keep the render EXACTLY (gmap=0 there);
