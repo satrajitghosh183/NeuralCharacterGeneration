@@ -3268,9 +3268,12 @@ int cmd_face(const ncg::app::Args& args) {
           const int64_t stride = args.get_int("complete-stride", 2);  // splat subsample (render only)
           const int64_t rchunk = args.get_int("complete-chunk", 1024);
 
+          // Evidence needs >=2 well-weighted views (the C1 identifiability proposition literally
+          // requires two observations per region): with the soft count squash, o(1 view)~0.5,
+          // o(2)~0.75 — obs_hi 0.6 admits 2+ views as evidence, single-view texels stay completable.
           ncg::diffuse::CompletionConfig cc;
-          cc.obs_lo = args.get_float("obs-lo", 0.15F);
-          cc.obs_hi = args.get_float("obs-hi", 0.35F);
+          cc.obs_lo = args.get_float("obs-lo", 0.30F);
+          cc.obs_hi = args.get_float("obs-hi", 0.60F);
           const auto o_tex = uvobs.reshape({T * T}).index({m}).to(fp.options());   // [P] o(x)
           const auto gate = ncg::diffuse::completion_gate(o_tex, cc);              // [P] g(1-obs semantics: 1=complete)
           const auto evidence = (gate <= 0.0F);                                    // Ω_obs texels
@@ -3408,21 +3411,28 @@ int cmd_face(const ncg::app::Args& args) {
                                         Fn::MaxPool2dFuncOptions(7).stride(1).padding(3))
                              .view({br, br});
               const auto sil = sample_at(alpha_er.unsqueeze(0), uvp).squeeze(1);  // [P]
-              const float dtol = 0.015F / std::max(dmx - dmn, 1e-4F);
+              // Occlusion tolerance: the depth map is EWA-BLENDED (soft splats, strided cloud), so
+              // it deviates from exact surface depth far more than geometry noise; a tight 1.5cm
+              // test mass-rejects valid texels (the paint never reached the bake). Real
+              // self-occlusion (arm over torso) is a 0.1-0.2 normalized gap — 0.06 separates it.
+              const float dtol = args.get_float("complete-occl-tol", 0.06F);
               const auto visible = ((dn - sdep) < dtol).to(fp.dtype());
               const auto front = torch::relu(-ncam.select(1, 2)) * (depth > 0).to(fp.dtype());
               const auto inb = ((uvp.select(1, 0) >= 0) & (uvp.select(1, 0) <= br - 1) &
                                 (uvp.select(1, 1) >= 0) & (uvp.select(1, 1) <= br - 1))
                                    .to(fp.dtype());
-              const auto w = front * inb * visible * (sil > 0.5F).to(fp.dtype()) *
+              const auto w = front * inb * visible * (sil > 0.3F).to(fp.dtype()) *
                              (gate > 0.0F).to(fp.dtype());   // evidence texels never update
               const auto better = (w > conf).to(fp.dtype()).unsqueeze(1);
               const auto old = uvcur.index_select(0, pidx);
               uvcur.index_copy_(0, pidx, samp * better + old * (1.0F - better));
               conf = torch::maximum(conf, w);
               painted = torch::maximum(painted, (w > 0.05F).to(fp.dtype()));
-              NCG_LOG_INFO("complete: pass {} view {}/{} (az={:.0f} el={:.0f}) done", pass + 1,
-                           vi + 1, vws.size(), vw.az, vw.el);
+              NCG_LOG_INFO("complete: pass {} view {}/{} (az={:.0f} el={:.0f}) accepted {:.0f} "
+                           "texels (vis {:.0f}% sil {:.0f}%)", pass + 1, vi + 1, vws.size(), vw.az,
+                           vw.el, better.sum().item<float>(),
+                           100.0F * visible.mean().item<float>(),
+                           100.0F * (sil > 0.3F).to(fp.dtype()).mean().item<float>());
             }
           }
           // Push-pull fill for gated texels no view reached (armpits, soles): normalized blur.
