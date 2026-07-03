@@ -46,8 +46,19 @@ SdGuidance SdGuidance::load(const std::string& unet_ts, const std::string& vae_t
   g.impl_->device = device;
   g.impl_->cfg = cfg;
   try {
-    g.impl_->unet = torch::jit::load(unet_ts, device);
-    g.impl_->vae = torch::jit::load(vae_ts, device);
+    if (device.is_mps()) {
+      // MPS has no float64. The diffusers trace carries a few f64 buffers, so deserializing
+      // straight onto MPS throws. Load on CPU, cast everything to f32, THEN move to Metal.
+      g.impl_->unet = torch::jit::load(unet_ts, at::Device(at::kCPU));
+      g.impl_->vae = torch::jit::load(vae_ts, at::Device(at::kCPU));
+      g.impl_->unet.to(at::kFloat);
+      g.impl_->vae.to(at::kFloat);
+      g.impl_->unet.to(device);
+      g.impl_->vae.to(device);
+    } else {
+      g.impl_->unet = torch::jit::load(unet_ts, device);
+      g.impl_->vae = torch::jit::load(vae_ts, device);
+    }
   } catch (const std::exception& e) {
     NCG_THROW("SdGuidance::load: torch::jit::load failed: {}", e.what());
   }

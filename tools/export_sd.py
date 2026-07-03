@@ -83,7 +83,11 @@ def main():
     ap.add_argument("--res", type=int, default=512, help="example latent res = res/8")
     args = ap.parse_args()
     os.makedirs(args.out_dir, exist_ok=True)
-    dev = "cuda" if torch.cuda.is_available() else "cpu"
+    # Trace on the DEPLOY device family when possible: tracing on MPS bakes diffusers'
+    # MPS-safe (no-float64) branches into the graph, which a CPU/CUDA trace does not.
+    dev = os.environ.get("EXPORT_DEVICE") or (
+        "cuda" if torch.cuda.is_available()
+        else "mps" if torch.backends.mps.is_available() else "cpu")
     dt = torch.float32
 
     unet = UNet2DConditionModel.from_pretrained(args.model, subfolder="unet").to(dev, dt).eval()
