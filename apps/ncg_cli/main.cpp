@@ -2503,11 +2503,13 @@ int cmd_geom(const ncg::app::Args& args) {
             const auto uvl = smodel.uv_faces().reshape(-1).to(at::kLong);
             auto vuv = torch::zeros({pcpu.size(0), 2}, uvtex.options());     // [V,2] per-vertex UV
             vuv.index_put_({fl}, smodel.uv_coords().index_select(0, uvl));
-            const auto grid = torch::stack({vuv.select(1, 0) * 2 - 1, (1 - vuv.select(1, 1)) * 2 - 1}, 1)
+            // kBorder emulated via clamped grid (MPS lacks border padding; ±1 = edge pixel).
+            const auto grid = torch::stack({(vuv.select(1, 0) * 2 - 1).clamp(-1.0, 1.0),
+                                            ((1 - vuv.select(1, 1)) * 2 - 1).clamp(-1.0, 1.0)}, 1)
                                   .view({1, -1, 1, 2});
             const auto vcol = Fn2::grid_sample(uvtex.permute({2, 0, 1}).unsqueeze(0), grid,
                                   Fn2::GridSampleFuncOptions().mode(torch::kBilinear)
-                                      .padding_mode(torch::kBorder).align_corners(true))
+                                      .padding_mode(torch::kZeros).align_corners(true))
                                   .squeeze(3).squeeze(0).t().contiguous().clamp(0.0, 1.0);  // [V,3]
             ncg::fit::AvatarFitConfig fc;
             fc.iterations = args.get_int("densify-iters", 1800);
@@ -2845,7 +2847,10 @@ int cmd_face(const ncg::app::Args& args) {
       pred.vertices3d = ncg::io::load_npy(f3d.string()).to(at::kFloat);
       return pred;
     }
-    if (!nlf) nlf.emplace(ncg::body::Nlf::load(args.require("weights"), device, nc));
+    // NLF's released TorchScript does not run on MPS (unimplemented ops even with fallback);
+    // pin it to CPU there. Cached texture-only reruns never reach this line at all.
+    const auto nlf_dev = device.is_mps() ? at::Device(at::kCPU) : device;
+    if (!nlf) nlf.emplace(ncg::body::Nlf::load(args.require("weights"), nlf_dev, nc));
     pred = nlf->detect(img);
     if (!nlf_cache.empty() && pred.vertices2d.defined() && pred.vertices2d.size(0) > 0) {
       ncg::io::save_npy(f2d.string(), pred.vertices2d.to(at::kCPU).to(at::kFloat).contiguous());

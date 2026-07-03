@@ -23,14 +23,16 @@ Tensor sample_vertex_colors(const Tensor& image_chw, const Tensor& verts2d) {
   const auto x = p.select(1, 0);  // column
   const auto y = p.select(1, 1);  // row
   // Normalize pixel coords -> [-1,1] for grid_sample (align_corners=true => exact at centers).
-  const auto gx = x / (W - 1.0) * 2.0 - 1.0;
-  const auto gy = y / (H - 1.0) * 2.0 - 1.0;
+  // Border padding is emulated by CLAMPING the grid to [-1,1] (with align_corners=true, ±1 hits
+  // the edge pixel exactly — identical to kBorder) because MPS does not implement kBorder.
+  const auto gx = (x / (W - 1.0) * 2.0 - 1.0).clamp(-1.0, 1.0);
+  const auto gy = (y / (H - 1.0) * 2.0 - 1.0).clamp(-1.0, 1.0);
   const auto grid = torch::stack({gx, gy}, 1).view({1, -1, 1, 2});  // [1,V,1,2]
 
   namespace F = torch::nn::functional;
   const auto sampled = F::grid_sample(
       img, grid,
-      F::GridSampleFuncOptions().mode(torch::kBilinear).padding_mode(torch::kBorder).align_corners(
+      F::GridSampleFuncOptions().mode(torch::kBilinear).padding_mode(torch::kZeros).align_corners(
           true));  // [1,3,V,1]
   return sampled.squeeze(3).squeeze(0).transpose(0, 1).contiguous();  // [V,3]
 }
