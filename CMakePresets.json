@@ -1,6 +1,10 @@
 {
   "version": 6,
-  "cmakeMinimumRequired": { "major": 3, "minor": 27, "patch": 0 },
+  "cmakeMinimumRequired": {
+    "major": 3,
+    "minor": 27,
+    "patch": 0
+  },
   "configurePresets": [
     {
       "name": "base",
@@ -26,7 +30,9 @@
       "name": "h100-debug",
       "inherits": "h100-release",
       "displayName": "H100 Debug (sm_90, cuda sync checks on)",
-      "cacheVariables": { "CMAKE_BUILD_TYPE": "Debug" }
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug"
+      }
     },
     {
       "name": "mac-lint",
@@ -37,18 +43,40 @@
         "NCG_BUILD_APPS": "OFF",
         "CMAKE_PREFIX_PATH": "$env{LIBTORCH_ROOT}"
       }
+    },
+    {
+      "name": "mac-release",
+      "displayName": "Mac arm64 Release (LibTorch MPS/CPU, no CUDA)",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/mac-apps",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "NCG_BUILD_APPS": "ON",
+        "NCG_BUILD_TESTS": "OFF",
+        "CMAKE_PREFIX_PATH": "$env{TORCH_PREFIX}"
+      }
     }
   ],
   "buildPresets": [
-    { "name": "h100-release", "configurePreset": "h100-release" },
-    { "name": "h100-debug", "configurePreset": "h100-debug" }
+    {
+      "name": "h100-release",
+      "configurePreset": "h100-release"
+    },
+    {
+      "name": "h100-debug",
+      "configurePreset": "h100-debug"
+    }
   ],
   "testPresets": [
     {
       "name": "h100",
       "configurePreset": "h100-release",
-      "output": { "outputOnFailure": true },
-      "execution": { "stopOnFailure": false }
+      "output": {
+        "outputOnFailure": true
+      },
+      "execution": {
+        "stopOnFailure": false
+      }
     }
   ]
 }
