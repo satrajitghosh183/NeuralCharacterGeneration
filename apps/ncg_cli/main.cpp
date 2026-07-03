@@ -3287,8 +3287,19 @@ int cmd_face(const ncg::app::Args& args) {
           {
             const auto texP = uvcur.index_select(0, pidx);                    // [P,3]
             const auto ev_w = evidence.to(fp.dtype()).unsqueeze(1);           // [P,1]
-            const auto skin = (texP * ev_w).sum(0) / ev_w.sum().clamp_min(1.0F);  // mean evidence tone
-            const auto reinit = texP * ev_w + skin.unsqueeze(0) * (1.0F - ev_w);
+            // SKIN tone, not evidence-mean: evidence includes hair/shadow texels that drag the
+            // mean to dark gray. Average only the BRIGHT HALF of evidence (luminance above the
+            // evidence median) — robustly the lit skin. Clamp into a plausible skin band.
+            const auto lum = texP.mean(1);                                    // [P]
+            const auto ev_lum = lum.masked_select(evidence);
+            const float lmed = ev_lum.numel() > 0
+                                   ? std::get<0>(ev_lum.to(at::kCPU).median(0)).item<float>()
+                                   : 0.5F;
+            const auto bright = (evidence & (lum > lmed)).to(fp.dtype()).unsqueeze(1);
+            auto skin = (texP * bright).sum(0) / bright.sum().clamp_min(1.0F);
+            const float sl = skin.mean().item<float>();
+            if (sl < 0.30F) skin = skin * (0.45F / std::max(sl, 1e-3F));      // never darker than dusk
+            const auto reinit = texP * ev_w + skin.unsqueeze(0).clamp(0.0F, 0.9F) * (1.0F - ev_w);
             uvcur.index_copy_(0, pidx, reinit);
             NCG_LOG_INFO("complete: gated texels re-initialized to evidence skin tone ({:.2f},{:.2f},{:.2f})",
                          skin[0].item<float>(), skin[1].item<float>(), skin[2].item<float>());
