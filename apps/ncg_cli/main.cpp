@@ -1102,9 +1102,12 @@ torch::Tensor recover_uv_albedo(const ncg::body::SmplxModel& model,
   const auto W = torch::stack(w_l, 0);                             // [N,T^2]
   const int64_t Nph = O.size(0);
   if (obs_out != nullptr) {
-    // o(x): soft count of well-weighted views per texel, squashed to [0,1]. One good view
-    // (w>0.35) -> ~0.5, three or more -> ~1. Multiplied by `valid` so gutter texels are 0.
-    const auto soft_count = torch::sigmoid((W - 0.35F) * 10.0F).sum(0);          // [T^2]
+    // o(x): soft count of well-weighted views per texel, squashed to [0,1]. The sigmoid must
+    // have NEGLIGIBLE tails or the count becomes album-size-dependent: at (w-0.35)*10, sixty
+    // views contribute 60*sigmoid(-3.5) ~ 1.8 phantom views and o saturates everywhere (measured
+    // on the 60-photo album — the gate died). (w-0.5)*24 gives tail 6e-6: only genuinely
+    // well-weighted views (w>~0.55: frontal, visible, trusted) count, at any album size.
+    const auto soft_count = torch::sigmoid((W - 0.5F) * 24.0F).sum(0);           // [T^2]
     *obs_out = ((1.0F - torch::exp(-soft_count * 0.7F)) * valid).reshape({T, T});
   }
   {
@@ -3325,6 +3328,10 @@ int cmd_face(const ncg::app::Args& args) {
             uvcur.index_copy_(0, pidx, reinit);
             NCG_LOG_INFO("complete: gated texels re-initialized to evidence skin tone ({:.2f},{:.2f},{:.2f})",
                          skin[0].item<float>(), skin[1].item<float>(), skin[2].item<float>());
+            const float gated_frac = (gate > 0.0F).to(at::kFloat).mean().item<float>();
+            NCG_LOG_INFO("complete: {:.0f}% of valid texels are COMPLETABLE (gate>0), {:.0f}% evidence "
+                         "(a dead gate here means o(x) saturated — recalibrate)",
+                         100.0F * gated_frac, 100.0F * (1.0F - gated_frac));
           }
 
           // Render clouds: strided subsample (texel density >> pixels; renders 4x faster).
