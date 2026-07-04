@@ -50,22 +50,32 @@ def make_garment(name, lo_f, hi_f, color, thickness=0.006, max_x=None):
         return max_x is not None and abs(w.x) > max_x  # trim sleeves (T-pose hands sit at shirt height)
     doomed = [v for v in bm.verts if outside(v)]
     bmesh.ops.delete(bm, geom=doomed, context="VERTS")
+    # push the garment off the skin so the body never pokes through on curved areas
+    for v in bm.verts:
+        v.co += v.normal * 0.004
     bm.to_mesh(dup.data)
     bm.free()
     solid = dup.modifiers.new("Shell", "SOLIDIFY")
     solid.thickness = thickness
     solid.offset = 1.0
+    subdiv = dup.modifiers.new("Smooth", "SUBSURF")   # smooths the ragged cut edges into cloth
+    subdiv.levels = 2
+    subdiv.render_levels = 2
     mat = bpy.data.materials.new(name + "Mat")
     mat.use_nodes = True
     bsdf = mat.node_tree.nodes["Principled BSDF"]
     bsdf.inputs["Base Color"].default_value = (*color, 1.0)
-    bsdf.inputs["Roughness"].default_value = 0.9
+    bsdf.inputs["Roughness"].default_value = 0.85
+    if "Sheen Weight" in bsdf.inputs:                 # fabric response
+        bsdf.inputs["Sheen Weight"].default_value = 0.4
     dup.data.materials.clear()
     dup.data.materials.append(mat)
+    for p in dup.data.polygons:
+        p.use_smooth = True
     return dup
 
-shirt = make_garment("Shirt", 0.52, 0.80, (0.09, 0.12, 0.30), max_x=0.45)  # tee, sleeves end above elbow
-shorts = make_garment("Shorts", 0.34, 0.56, (0.13, 0.13, 0.14))  # dark shorts (hip to mid-thigh)
+shirt = make_garment("Shirt", 0.50, 0.80, (0.09, 0.12, 0.30), max_x=0.45)  # tee, sleeves above elbow
+shorts = make_garment("Shorts", 0.34, 0.545, (0.13, 0.13, 0.14), thickness=0.008)  # overlaps shirt hem
 
 # ---- floor / lights / camera / world -----------------------------------------------------------
 bpy.ops.mesh.primitive_plane_add(size=12, location=(0, 0, zmin))
