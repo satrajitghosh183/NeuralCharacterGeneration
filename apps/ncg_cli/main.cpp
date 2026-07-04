@@ -3532,6 +3532,16 @@ int cmd_face(const ncg::app::Args& args) {
       // replaces the analytic skin while the recovered geometry/rig stay untouched (appearance-only).
       // Completed texture (Theorem-3 --complete-body) wins over the raw analytic one when present.
       auto uv_final = (uv_completed.defined() ? uv_completed : uvtex).reshape({T * T, 3}).clone();
+      // --uv-albedo-in <png>: use a previously completed/baked UV texture for the glb instead of
+      // re-running the (expensive) completion — decouples geometry iterations (eyes/hair) from
+      // texture iterations. Must match --tex-res.
+      if (args.has("uv-albedo-in")) {
+        const auto ext = ncg::io::load_image(args.require("uv-albedo-in"), 3);  // [3,H,W] in [0,1]
+        NCG_CHECK(ext.size(1) == T && ext.size(2) == T,
+                  "uv-albedo-in: texture is {}x{}, expected --tex-res {}", ext.size(1), ext.size(2), T);
+        uv_final = ext.permute({1, 2, 0}).reshape({T * T, 3}).to(uv_final.options()).clone();
+        NCG_LOG_INFO("face: using external UV albedo '{}'", args.require("uv-albedo-in"));
+      }
       if (args.has("reproject-dir")) {
         namespace Fn = torch::nn::functional;
         const std::string rd = args.require("reproject-dir");
