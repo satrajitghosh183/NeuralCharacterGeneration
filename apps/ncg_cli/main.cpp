@@ -3637,6 +3637,108 @@ int cmd_face(const ncg::app::Args& args) {
       const auto hair_cpu = verts_hair.to(at::kCPU);
       const auto hnrm = ncg::mesh::compute_vertex_normals(ncg::mesh::TriMesh{hair_cpu, faces});
 
+      // ---- TONE UNIFY (--tone-unify, default on): the multi-view completion can leave an upper/
+      // lower body tone split (different views author different regions). Affine-match the lower
+      // body's per-channel stats to the upper body's on valid texels below the neck. Head untouched.
+      if (args.get_int("tone-unify", 1) != 0) {
+        const auto vm = (uvmask.reshape({T * T}) > 0.5F);
+        const auto py = uvpos.select(1, 1);                                    // texel world y
+        const float yneck = torch::quantile(py.masked_select(vm).to(at::kCPU), 0.85).item<float>();
+        const float yhip = torch::quantile(py.masked_select(vm).to(at::kCPU), 0.45).item<float>();
+        const auto up = vm & (py < yneck) & (py >= yhip);
+        const auto lo_m = vm & (py < yhip);
+        for (int c = 0; c < 3; ++c) {
+          auto ch = uv_final.select(1, c);
+          const auto u_v = ch.masked_select(up), l_v = ch.masked_select(lo_m);
+          if (u_v.numel() < 100 || l_v.numel() < 100) continue;
+          const float mu_u = u_v.mean().item<float>(), sd_u = u_v.std().item<float>();
+          const float mu_l = l_v.mean().item<float>(), sd_l = std::max(l_v.std().item<float>(), 1e-4F);
+          ch.masked_scatter_(lo_m, ((l_v - mu_l) * (sd_u / sd_l) + mu_u).clamp(0.0F, 1.0F));
+        }
+        uv_final = uv_final.clamp(0.0F, 1.0F);
+        NCG_LOG_INFO("face: tone-unified lower body to upper-body stats");
+      }
+
+      // ---- FACE REFINE (--face-refine + --sd-dir-face): img2img the HEAD views with a portrait
+      // prompt on top of whatever texture uv_final holds (works with --uv-albedo-in, so the
+      // photoreal face lands without re-running the body completion). Most-frontal reprojection,
+      // low strength (refine identity, don't replace it).
+      if (args.get_int("face-refine", 0) != 0 && args.has("sd-dir-face")) {
+        namespace Fnf = torch::nn::functional;
+        const std::string sdf = args.require("sd-dir-face");
+        const auto sdd_dev_s = args.get("sd-device", "");
+        const auto sdf_dev = sdd_dev_s == "cpu" ? at::Device(at::kCPU)
+                             : sdd_dev_s == "mps" ? at::Device(at::kMPS) : device;
+        ncg::diffuse::SdGuidanceConfig gcf;
+        gcf.guidance = args.get_float("face-guidance", 6.5F);
+        auto fguide = ncg::diffuse::SdGuidance::load(sdf + "/control_unet.ts", sdf + "/sd_vae.ts",
+                                                     sdf + "/sd_cond.safetensors", sdf_dev, gcf);
+        const ncg::diffuse::DdpmSchedule fsch({}, sdf_dev);
+        const float fstr = args.get_float("face-strength", 0.32F);
+        const int fsteps = args.get_int("face-steps", 24);
+        const int fbr = 512;
+        const auto vm = (uvmask.reshape({T * T}) > 0.5F);
+        const auto fpx = uvpos.index({vm});                                     // [P,3]
+        const auto fnx = uvgn.index({vm});                                      // [P,3]
+        const auto fidx = vm.nonzero().squeeze(1);
+        const int64_t Pf = fpx.size(0);
+        const float yq = torch::quantile(fpx.select(1, 1).to(at::kCPU), 0.88).item<float>();
+        const auto hm = fpx.select(1, 1) > yq;
+        const auto hcen = fpx.index({hm}).mean(0);
+        auto fconf = torch::zeros({Pf}, fpx.options());
+        torch::manual_seed(args.get_int("complete-seed", 42));
+        auto fsplat = [&](const torch::Tensor& colors, const ncg::runtime::Camera& cam,
+                          std::array<float, 3> bg) {
+          torch::NoGradGuard ng;
+          ncg::recon::GaussianCloud c;
+          c.positions = fpx;
+          c.colors = colors;
+          c.scales = torch::full({Pf, 3}, args.get_float("texel-scale", 0.0010F), fpx.options());
+          c.opacities = torch::ones({Pf, 1}, fpx.options());
+          c.rotations = torch::zeros({Pf, 4}, fpx.options());
+          c.rotations.select(1, 0).fill_(1.0F);
+          return ncg::runtime::render_soft_aniso(c, cam, bg, 1024);
+        };
+        for (float faz : {0.F, -25.F, 25.F, -50.F, 50.F}) {
+          const auto cam = ncg::runtime::Camera::orbit(hcen, 0.42F, faz, 5.0F, 28.0F, fbr, fbr,
+                                                       device);
+          const auto rendered = fsplat(uv_final.index({vm}), cam, {0.5F, 0.5F, 0.5F}).image;
+          torch::Tensor uvp, depth;
+          cam.project(fpx, uvp, depth);
+          const auto ncam = torch::matmul(fnx, cam.R.t());
+          const auto nmap = fsplat((torch::stack({ncam.select(1, 0), -ncam.select(1, 1),
+                                                  -ncam.select(1, 2)}, 1) * 0.5F + 0.5F)
+                                       .clamp(0.0F, 1.0F), cam, {0.5F, 0.5F, 1.0F}).image;
+          torch::Tensor refined;
+          {
+            torch::NoGradGuard ng;
+            refined = fguide.img2img_control(rendered.unsqueeze(0).to(sdf_dev),
+                                             nmap.unsqueeze(0).to(sdf_dev), fstr, fsteps, fsch)
+                          .squeeze(0).to(device);
+          }
+          const auto gx = uvp.select(1, 0) / (fbr - 1) * 2 - 1;
+          const auto gy = uvp.select(1, 1) / (fbr - 1) * 2 - 1;
+          const auto grid = torch::stack({gx, gy}, 1).view({1, Pf, 1, 2});
+          const auto samp = Fnf::grid_sample(refined.unsqueeze(0), grid,
+                                             Fnf::GridSampleFuncOptions().mode(torch::kBilinear)
+                                                 .padding_mode(torch::kZeros).align_corners(true))
+                                .view({3, Pf}).t();
+          const auto front = torch::relu(-ncam.select(1, 2)) * (depth > 0).to(fpx.dtype());
+          const auto inb = ((uvp.select(1, 0) >= 0) & (uvp.select(1, 0) <= fbr - 1) &
+                            (uvp.select(1, 1) >= 0) & (uvp.select(1, 1) <= fbr - 1))
+                               .to(fpx.dtype());
+          const auto w = front * inb * hm.to(fpx.dtype());   // head texels only
+          const auto better = (w > fconf).to(fpx.dtype()).unsqueeze(1);
+          const auto old = uv_final.index_select(0, fidx);
+          uv_final.index_copy_(0, fidx, samp * better + old * (1.0F - better));
+          fconf = torch::maximum(fconf, w);
+          NCG_LOG_INFO("face-refine: view az={:.0f} done", faz);
+        }
+        ncg::io::save_png(prefix + "_albedo_facerefined_uv.png",
+                          uv_final.reshape({T, T, 3}).permute({2, 0, 1}).contiguous());
+        NCG_LOG_INFO("face-refine: photoreal head pass baked into the texture");
+      }
+
       // ---- EYEBALL GEOMETRY (--eyes): SMPL-X has no eyeballs, so refined eyes have nowhere to land
       // (dark sockets / smudges, proven unfixable by texture strength). Add a sphere at each SMPL-X
       // eye joint (23=left, 24=right), skinned to the head joint, coloured by a reserved brown texel,
@@ -3692,17 +3794,32 @@ int cmd_face(const ncg::app::Args& args) {
         const auto sF = torch::from_blob(sf.data(), {static_cast<int64_t>(sf.size()) / 3, 3},
                                          torch::kLong).clone();
         const int64_t N = sV.size(0), Jn = g_lbs.size(1);
-        // brown eye texel at UV (0.01,0.01) -> pixel (row=(1-v)*T, col=u*T) per the texture convention.
+        // REAL eye texture, not a flat brown ball (a single dark texel reads as a black pit):
+        // three reserved texels — SCLERA (warm white), IRIS (amber brown), PUPIL (near black) —
+        // and each sphere vert picks one by how far forward it points (z in the unit sphere):
+        // z>0.86 pupil cap, z>0.55 iris ring, else sclera. Forward = +z = where the face looks.
         auto tx = tex_uv.reshape({T, T, 3}).clone();
-        const int pr = static_cast<int>(0.99F * T), pc = static_cast<int>(0.01F * T);
-        for (int di = -2; di <= 2; ++di)
-          for (int dj = -2; dj <= 2; ++dj) {
-            const int rr = std::clamp(pr + di, 0, static_cast<int>(T) - 1);
-            const int cc = std::clamp(pc + dj, 0, static_cast<int>(T) - 1);
-            tx[rr][cc][0] = 0.32F; tx[rr][cc][1] = 0.22F; tx[rr][cc][2] = 0.17F;
-          }
+        auto paint_texel = [&](float u, float v, float r, float gc, float b) {
+          const int pr = static_cast<int>((1.0F - v) * (T - 1)), pc = static_cast<int>(u * (T - 1));
+          for (int di = -2; di <= 2; ++di)
+            for (int dj = -2; dj <= 2; ++dj) {
+              const int rr = std::clamp(pr + di, 0, static_cast<int>(T) - 1);
+              const int cc = std::clamp(pc + dj, 0, static_cast<int>(T) - 1);
+              tx[rr][cc][0] = r; tx[rr][cc][1] = gc; tx[rr][cc][2] = b;
+            }
+        };
+        paint_texel(0.01F, 0.01F, 0.90F, 0.87F, 0.84F);  // sclera
+        paint_texel(0.05F, 0.01F, 0.36F, 0.24F, 0.14F);  // iris
+        paint_texel(0.09F, 0.01F, 0.04F, 0.03F, 0.03F);  // pupil
         tex_uv = tx.reshape({T * T, 3});
-        const auto eye_uv = torch::tensor({0.01F, 0.01F}).reshape({1, 2}).expand({N, 2}).contiguous();
+        auto eye_uv = torch::empty({N, 2});
+        for (int64_t vi2 = 0; vi2 < N; ++vi2) {
+          const float zf = sV[vi2][2].item<float>();  // forwardness of this sphere vert
+          const float uu = zf > 0.86F ? 0.09F : zf > 0.55F ? 0.05F : 0.01F;
+          eye_uv[vi2][0] = uu;
+          eye_uv[vi2][1] = 0.01F;
+        }
+        eye_uv = eye_uv.contiguous();
         std::vector<torch::Tensor> Vs{g_verts}, Ns{g_norm}, UVs{g_uv}, Ls{g_lbs}, Fs{g_faces}, UVFs{g_uvf};
         int64_t vbase = g_verts.size(0), uvbase = g_uv.size(0);
         for (int e = 0; e < 2; ++e) {
