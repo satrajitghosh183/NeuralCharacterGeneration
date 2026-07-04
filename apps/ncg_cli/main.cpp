@@ -3385,6 +3385,7 @@ int cmd_face(const ncg::app::Args& args) {
           for (float vaz : {30.F, -30.F}) vws.push_back({vaz, -20.F, brad2 * 0.85F, bfov2, bc});
           for (float vaz : {0.F, 90.F, -90.F, 180.F}) vws.push_back({vaz, 5.F, 0.42F, 28.F, hc});
 
+          torch::manual_seed(args.get_int("complete-seed", 42));  // reproducible paints (randn_like)
           const int passes = args.get_int("complete-passes", 2);
           for (int pass = 0; pass < passes; ++pass) {
             if (pass > 0)  // pass B: better views may re-win painted texels; evidence stays locked
@@ -3429,10 +3430,16 @@ int cmd_face(const ncg::app::Args& args) {
                                   : guide.img2img(rin, phi, steps, sch).squeeze(0).to(device);
                 }
               }
-              // Composite in view space: evidence pixels keep the render EXACTLY (gmap=0 there);
-              // gated pixels blend lo->hi with the gate (C¹ transition, no seams).
-              const auto tmix = ((gmap - 0.35F) / 0.30F).clamp(0.0F, 1.0F).unsqueeze(0);
-              const auto mix = rl * (1.0F - tmix) + rh * tmix;
+              // Composite in view space (the TEXTure keep/refine/generate mechanism): evidence
+              // pixels keep the render EXACTLY (gmap=0); among gated pixels, regions some earlier
+              // view already painted are only REFINED (rl, low strength — preserves the first
+              // view's decisions => cross-view consistency), and only never-painted regions are
+              // GENERATED (rh). Without this, every view re-generates at high strength and the
+              // bake becomes a quilt of disagreeing hallucinations (measured).
+              const auto pmap3 = splat(painted.unsqueeze(1).expand({P, 3}).contiguous(), cam,
+                                       {0.F, 0.F, 0.F}).image;
+              const auto pmap = pmap3.select(0, 0).clamp(0.0F, 1.0F);           // 1 = already painted
+              const auto mix = rl * pmap.unsqueeze(0) + rh * (1.0F - pmap.unsqueeze(0));
               const auto out = rendered * (1.0F - gmap.unsqueeze(0)) + mix * gmap.unsqueeze(0);
               if (vi == 0 && pass == 0) {  // GATE D triptych for the front view
                 ncg::io::save_png(prefix + "_complete_v0_base.png", rendered);
