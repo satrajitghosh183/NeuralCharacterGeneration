@@ -3297,7 +3297,17 @@ int cmd_face(const ncg::app::Args& args) {
           cc.obs_lo = args.get_float("obs-lo", 0.30F);
           cc.obs_hi = args.get_float("obs-hi", 0.60F);
           const auto o_tex = uvobs.reshape({T * T}).index({m}).to(fp.options());   // [P] o(x)
-          const auto gate = ncg::diffuse::completion_gate(o_tex, cc);              // [P] g(1-obs semantics: 1=complete)
+          auto gate = ncg::diffuse::completion_gate(o_tex, cc);                    // [P] g: 1=complete
+          // BASE-BODY semantics (--complete-skin-body, default on): what the photos observed on the
+          // body is CLOTHING, not skin — jeans-blue legs and shirt-yellow torsos are "evidence" the
+          // gate would faithfully preserve (measured: pastel clothing patches in the completed bake).
+          // Identity lives in the HEAD; below the neck every texel is paintable base skin. Ω_obs
+          // (and its exact-zero invariance guarantee) remains for the head region.
+          if (args.get_int("complete-skin-body", 1) != 0) {
+            const auto yq = torch::quantile(fp.select(1, 1).to(at::kCPU), 0.85).item<float>();
+            const auto body = (fp.select(1, 1) < yq).to(fp.dtype());               // below neck
+            gate = torch::maximum(gate, body);                                     // body: full paint
+          }
           const auto evidence = (gate <= 0.0F);                                    // Ω_obs texels
 
           auto uvcur = uvtex.reshape({T * T, 3}).clone();
