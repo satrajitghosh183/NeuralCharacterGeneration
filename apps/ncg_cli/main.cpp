@@ -1138,7 +1138,26 @@ torch::Tensor recover_uv_albedo(const ncg::body::SmplxModel& model,
   ncg::recon::InverseRenderConfig ic;
   ic.iterations = 80;
   ic.robust = true;
-  const auto ir = ncg::recon::solve_inverse_render(O, torch::stack(nrm_l, 0), W, ic);  // lights→normals
+  // The solve exists ONLY to recover per-view SH lights (N x 3ch x 9 numbers): fitting them on all
+  // T^2 texels materializes ~[N,T^2,3,3(x9)] intermediates (19 GB at N=60, T=1024 — kills MPS and
+  // crawls on CPU). Lights are global per view — fit on a random 30k subsample of well-weighted
+  // texels (statistically identical), then apply to all texels in the normal solve below.
+  const auto nrm_stack = torch::stack(nrm_l, 0);                                 // [N,T^2,3]
+  torch::Tensor ir_lights;
+  {
+    const int64_t K = std::min<int64_t>(30000, TT);
+    const auto wsum = W.sum(0);                                                   // [T^2]
+    const auto cand = (wsum > 0.5F).nonzero().squeeze(1);                         // usable texels
+    const auto pick = cand.numel() > K
+                          ? cand.index_select(0, torch::randperm(cand.numel(),
+                                torch::TensorOptions().dtype(at::kLong).device(cand.device()))
+                                                    .slice(0, 0, K))
+                          : cand;
+    const auto ir = ncg::recon::solve_inverse_render(O.index_select(1, pick),
+                                                     nrm_stack.index_select(1, pick),
+                                                     W.index_select(1, pick), ic);
+    ir_lights = ir.lights;                                                        // [N,3ch,9]
+  }
   // GATE1 (reported honestly): cross-photo shared-skin variance, raw vs robust per-texel-median residual.
   torch::Tensor albedo;
   {
@@ -1306,10 +1325,10 @@ torch::Tensor recover_uv_albedo(const ncg::body::SmplxModel& model,
     const auto M = B.index({torch::indexing::Slice(), torch::indexing::Slice(1, 4)});  // [3,3]
     const auto obs = torch::stack(obs_l, 0);                            // [N,T^2,3]
     const auto w = torch::stack(w_l, 0);                                // [N,T^2]
-    const auto L1 = ir.lights.index({torch::indexing::Slice(), torch::indexing::Slice(),
+    const auto L1 = ir_lights.index({torch::indexing::Slice(), torch::indexing::Slice(),
                                      torch::indexing::Slice(1, 4)});    // [N,3ch,3k] order-1 coeffs
     const auto g = torch::einsum("ak,fck->fca", {M, L1});              // [N,3ch,3axis]
-    const auto a_dc = ir.lights.index({torch::indexing::Slice(), torch::indexing::Slice(), 0}) * b0;  // [N,3ch]
+    const auto a_dc = ir_lights.index({torch::indexing::Slice(), torch::indexing::Slice(), 0}) * b0;  // [N,3ch]
     const auto ratio = obs / albedo.unsqueeze(0).clamp_min(0.05F);     // [N,T^2,3]
     const auto y = (ratio - a_dc.unsqueeze(1)).permute({0, 2, 1});     // [N,3ch,T^2]
     const auto GG = torch::einsum("fca,fcb->fab", {g, g});             // [N,3,3]
