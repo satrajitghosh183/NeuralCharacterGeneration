@@ -3726,8 +3726,14 @@ int cmd_face(const ncg::app::Args& args) {
                              : sdd_dev_s == "mps" ? at::Device(at::kMPS) : device;
         ncg::diffuse::SdGuidanceConfig gcf;
         gcf.guidance = args.get_float("face-guidance", 6.5F);
-        auto fguide = ncg::diffuse::SdGuidance::load(sdf + "/control_unet.ts", sdf + "/sd_vae.ts",
-                                                     sdf + "/sd_cond.safetensors", sdf_dev, gcf);
+        // Prefer the ControlNet UNet when the export provides one; otherwise plain img2img
+        // (the SDXL+FaceID export has no control — identity comes from the FaceID tokens).
+        const bool fctrl = std::filesystem::exists(sdf + "/control_unet.ts");
+        auto fguide = ncg::diffuse::SdGuidance::load(
+            sdf + (fctrl ? "/control_unet.ts"
+                         : (std::filesystem::exists(sdf + "/sdxl_unet_ip.ts") ? "/sdxl_unet_ip.ts"
+                                                                              : "/sd_unet.ts")),
+            sdf + "/sd_vae.ts", sdf + "/sd_cond.safetensors", sdf_dev, gcf);
         const ncg::diffuse::DdpmSchedule fsch({}, sdf_dev);
         const float fstr = args.get_float("face-strength", 0.45F);
         const int fsteps = args.get_int("face-steps", 24);
@@ -3815,9 +3821,11 @@ int cmd_face(const ncg::app::Args& args) {
           torch::Tensor refined;
           {
             torch::NoGradGuard ng;
-            refined = fguide.img2img_control(rendered.unsqueeze(0).to(sdf_dev),
-                                             nmap.unsqueeze(0).to(sdf_dev), fstr, fsteps, fsch)
-                          .squeeze(0).to(device);
+            refined = fctrl ? fguide.img2img_control(rendered.unsqueeze(0).to(sdf_dev),
+                                                     nmap.unsqueeze(0).to(sdf_dev), fstr, fsteps,
+                                                     fsch).squeeze(0).to(device)
+                            : fguide.img2img(rendered.unsqueeze(0).to(sdf_dev), fstr, fsteps, fsch)
+                                  .squeeze(0).to(device);
           }
           const auto gx = uvp.select(1, 0) / (fbr - 1) * 2 - 1;
           const auto gy = uvp.select(1, 1) / (fbr - 1) * 2 - 1;
@@ -3958,7 +3966,9 @@ int cmd_face(const ncg::app::Args& args) {
           for (int64_t vi2 = 0; vi2 < N; ++vi2) {
             const float xf = sV[vi2][0].item<float>(), yf = sV[vi2][1].item<float>(),
                         zf = std::clamp(sV[vi2][2].item<float>(), -1.0F, 1.0F);
-            const float rho = std::min(1.0F, std::acos(zf) / (0.62F * 3.14159265F));
+            // Real irises subtend ~45 deg of the globe; 0.30*pi puts the tile edge (sclera)
+            // at ~54 deg so the visible ball is mostly white with a correctly-sized iris.
+            const float rho = std::min(1.0F, std::acos(zf) / (0.30F * 3.14159265F));
             const float rl = std::sqrt(std::max(xf * xf + yf * yf, 1e-9F));
             const float dx = xf / rl, dy = yf / rl;
             eye_uv[vi2][0] = u0 + rho * uext * dx * 0.96F;

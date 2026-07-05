@@ -19,6 +19,10 @@ struct SdGuidance::Impl {
   torch::jit::script::Module vae;
   Tensor cond;    // [1,77,C]
   Tensor uncond;  // [1,77,C]
+  // SDXL + IP-Adapter (FaceID) mode: present when the cond safetensors carries pooled/ip embeds.
+  bool sdxl_ip = false;
+  Tensor cond_pooled, uncond_pooled;  // [1,1280]
+  Tensor ip_cond, ip_uncond;          // [1,K,512] subject identity embeds / zeros
   at::Device device = at::kCPU;
   SdGuidanceConfig cfg;
 };
@@ -69,6 +73,14 @@ SdGuidance SdGuidance::load(const std::string& unet_ts, const std::string& vae_t
   auto st = ncg::io::SafeTensors::open(cond_safetensors);
   g.impl_->cond = st.view("cond").clone().to(device, at::kFloat);
   g.impl_->uncond = st.view("uncond").clone().to(device, at::kFloat);
+  if (st.has("cond_pooled") && st.has("ip_cond")) {  // SDXL + FaceID export
+    g.impl_->sdxl_ip = true;
+    g.impl_->cond_pooled = st.view("cond_pooled").clone().to(device, at::kFloat);
+    g.impl_->uncond_pooled = st.view("uncond_pooled").clone().to(device, at::kFloat);
+    g.impl_->ip_cond = st.view("ip_cond").clone().to(device, at::kFloat);
+    g.impl_->ip_uncond = st.view("ip_uncond").clone().to(device, at::kFloat);
+    NCG_LOG_INFO("SdGuidance: SDXL+FaceID mode ({} identity embeds)", g.impl_->ip_cond.size(1));
+  }
   NCG_CHECK(g.impl_->cond.dim() == 3 && g.impl_->uncond.dim() == 3,
             "SdGuidance: cond/uncond must be [1,77,C]");
   NCG_LOG_INFO("SdGuidance: loaded UNet+VAE; ctx dim {}", g.impl_->cond.size(2));
@@ -181,8 +193,14 @@ NoisePredictor SdGuidance::predictor() const {
     const auto tl = t.to(p->device, at::kLong);
     const auto ctx_u = p->uncond.expand({B, p->uncond.size(1), p->uncond.size(2)});
     const auto ctx_c = p->cond.expand({B, p->cond.size(1), p->cond.size(2)});
-    const auto eps_u = unet.forward({x_t, tl, ctx_u}).toTensor();
-    const auto eps_c = unet.forward({x_t, tl, ctx_c}).toTensor();
+    Tensor eps_u, eps_c;
+    if (p->sdxl_ip) {
+      eps_u = unet.forward({x_t, tl, ctx_u, p->uncond_pooled, p->ip_uncond}).toTensor();
+      eps_c = unet.forward({x_t, tl, ctx_c, p->cond_pooled, p->ip_cond}).toTensor();
+    } else {
+      eps_u = unet.forward({x_t, tl, ctx_u}).toTensor();
+      eps_c = unet.forward({x_t, tl, ctx_c}).toTensor();
+    }
     return cfg_eps(eps_u, eps_c, guidance);
   };
 }
