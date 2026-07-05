@@ -3931,17 +3931,52 @@ int cmd_face(const ncg::app::Args& args) {
               }
             }
         }
-        paint_texel(euv[0][0], euv[0][1], 0.90F, 0.87F, 0.84F);  // sclera
-        paint_texel(euv[1][0], euv[1][1], 0.36F, 0.24F, 0.14F);  // iris
-        paint_texel(euv[2][0], euv[2][1], 0.04F, 0.03F, 0.03F);  // pupil
-        tex_uv = tx.reshape({T * T, 3});
         auto eye_uv = torch::empty({N, 2});
-        for (int64_t vi2 = 0; vi2 < N; ++vi2) {
-          const float zf = sV[vi2][2].item<float>();  // forwardness of this sphere vert
-          const int which = zf > 0.86F ? 2 : zf > 0.55F ? 1 : 0;
-          eye_uv[vi2][0] = euv[which][0];
-          eye_uv[vi2][1] = euv[which][1];
+        if (args.has("eye-tile")) {
+          // REAL EYE TILE (built from the subject's own photos by tools/make_iris.py): find a
+          // big free gutter block, blit the tile, and map each sphere vert RADIALLY into it —
+          // front pole -> tile center (pupil), outward angle -> real iris ring -> sclera rim.
+          const auto tile = ncg::io::load_image(args.require("eye-tile"), 3);  // [3,S,S] in [0,1]
+          const int S = static_cast<int>(tile.size(1));
+          const auto mk = uvmask.to(at::kCPU);
+          int br0 = -1, bc0 = -1;
+          for (int rr = static_cast<int>(T) - S - 4 - 1; rr >= 4 && br0 < 0; rr -= 16)
+            for (int cc = 4; cc < static_cast<int>(T) - S - 4 && br0 < 0; cc += 16) {
+              bool free_block = true;
+              for (int di = -2; di <= S + 1 && free_block; di += 4)
+                for (int dj = -2; dj <= S + 1 && free_block; dj += 4)
+                  if (mk[rr + di][cc + dj].item<float>() > 0.5F) free_block = false;
+              if (free_block) { br0 = rr; bc0 = cc; }
+            }
+          NCG_CHECK(br0 >= 0, "eyes: no free {}x{} gutter block for the eye tile", S, S);
+          const auto tile_hwc = tile.permute({1, 2, 0});  // [S,S,3]
+          for (int i = 0; i < S; ++i)
+            for (int j = 0; j < S; ++j) tx[br0 + i][bc0 + j] = tile_hwc[i][j];
+          // sphere -> tile: forward pole at tile center; radial by polar angle.
+          const float u0 = (bc0 + S * 0.5F) / (T - 1), v0 = 1.0F - (br0 + S * 0.5F) / (T - 1);
+          const float uext = 0.5F * S / (T - 1), vext = 0.5F * S / (T - 1);
+          for (int64_t vi2 = 0; vi2 < N; ++vi2) {
+            const float xf = sV[vi2][0].item<float>(), yf = sV[vi2][1].item<float>(),
+                        zf = std::clamp(sV[vi2][2].item<float>(), -1.0F, 1.0F);
+            const float rho = std::min(1.0F, std::acos(zf) / (0.62F * 3.14159265F));
+            const float rl = std::sqrt(std::max(xf * xf + yf * yf, 1e-9F));
+            const float dx = xf / rl, dy = yf / rl;
+            eye_uv[vi2][0] = u0 + rho * uext * dx * 0.96F;
+            eye_uv[vi2][1] = v0 + rho * vext * dy * 0.96F;
+          }
+          NCG_LOG_INFO("eyes: real-iris tile blitted at ({},{}), radial-mapped {} verts", br0, bc0, N);
+        } else {
+          paint_texel(euv[0][0], euv[0][1], 0.90F, 0.87F, 0.84F);  // sclera
+          paint_texel(euv[1][0], euv[1][1], 0.36F, 0.24F, 0.14F);  // iris
+          paint_texel(euv[2][0], euv[2][1], 0.04F, 0.03F, 0.03F);  // pupil
+          for (int64_t vi2 = 0; vi2 < N; ++vi2) {
+            const float zf = sV[vi2][2].item<float>();  // forwardness of this sphere vert
+            const int which = zf > 0.93F ? 2 : zf > 0.62F ? 1 : 0;  // smaller pupil, more iris
+            eye_uv[vi2][0] = euv[which][0];
+            eye_uv[vi2][1] = euv[which][1];
+          }
         }
+        tex_uv = tx.reshape({T * T, 3});
         eye_uv = eye_uv.contiguous();
         std::vector<torch::Tensor> Vs{g_verts}, Ns{g_norm}, UVs{g_uv}, Ls{g_lbs}, Fs{g_faces}, UVFs{g_uvf};
         int64_t vbase = g_verts.size(0), uvbase = g_uv.size(0);
