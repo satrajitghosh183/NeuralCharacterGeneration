@@ -1040,7 +1040,7 @@ torch::Tensor recover_uv_albedo(const ncg::body::SmplxModel& model,
                                 torch::Tensor& normal_out, torch::Tensor& pos_out,
                                 torch::Tensor& gnrm_out, float detail_weight = 1.5F,
                                 float deshade = 0.5F, float chroma = 0.6F, float seam = 0.6F,
-                                torch::Tensor* obs_out = nullptr) {
+                                torch::Tensor* obs_out = nullptr, bool geometry_only = false) {
   // obs_out (optional): per-texel OBSERVABILITY o(x) in [0,1] — the evidence field of the
   // paper's Theorem-3 completion. o(x) = a soft count of well-weighted views per texel
   // (frontality x visibility x in-bounds x specular-reject), squashed so 1 good view ~ 0.5
@@ -1054,6 +1054,28 @@ torch::Tensor recover_uv_albedo(const ncg::body::SmplxModel& model,
   const auto geomv = faces.index_select(0, face.clamp_min(0)).reshape(-1);  // [T^2*3]
   const int64_t TT = face.size(0);
   namespace F = torch::nn::functional;
+
+  if (geometry_only) {
+    // Fast path for --uv-albedo-in + --uv-normal-in: the caller supplies the texture, so only the
+    // texel GEOMETRY is needed (pos/mask/geometric normal). Skips the entire photometric pipeline
+    // (per-view sampling, equalize, merge, deshade, seam, normal solve) — ~30 min saved per run.
+    pos_out = (rest_verts.to(device).index_select(0, geomv).reshape({TT, 3, 3}) * bary.unsqueeze(2))
+                  .sum(1);
+    mask_out = valid.view({T, T});
+    ncg::mesh::TriMesh rm0;
+    rm0.vertices = rest_verts.to(at::kCPU);
+    rm0.faces = model.faces().to(at::kCPU);
+    const auto vn0 = ncg::mesh::compute_vertex_normals(rm0).to(device);
+    auto ng0 = (vn0.index_select(0, geomv).reshape({TT, 3, 3}) * bary.unsqueeze(2)).sum(1);
+    ng0 = ng0 / ng0.norm(2, 1, true).clamp_min(1e-6F);
+    gnrm_out = ng0;
+    normal_out = torch::zeros({T, T, 3}, pos_out.options());
+    normal_out.select(2, 0).fill_(0.5F);
+    normal_out.select(2, 1).fill_(0.5F);
+    normal_out.select(2, 2).fill_(1.0F);
+    if (obs_out != nullptr) *obs_out = torch::zeros({T, T}, pos_out.options());
+    return torch::full({T, T, 3}, 0.5F, pos_out.options());
+  }
 
   std::vector<torch::Tensor> obs_l, nrm_l, w_l;
   for (size_t f = 0; f < imgs.size(); ++f) {
@@ -3019,10 +3041,11 @@ int cmd_face(const ncg::app::Args& args) {
         viss_t.push_back(vis_l[static_cast<size_t>(i)] * R.weight[i].to(device).clamp_min(0.05));
       torch::Tensor uvmask, uvnrm, uvpos, uvgn;
       torch::Tensor uvobs;  // o(x) — per-texel observability, the Theorem-3 gate input
+      const bool geom_only = args.has("uv-albedo-in") && args.has("uv-normal-in");
       const auto uvtex =
           recover_uv_albedo(model, uv_img, uv_v2d, nrm_l, viss_t, T, verts_dev, uvmask, uvnrm, uvpos,
                             uvgn, args.get_float("detail", 0.7F), args.get_float("deshade", 0.5F),
-                            args.get_float("chroma", 0.6F), 0.6F, &uvobs);
+                            args.get_float("chroma", 0.6F), 0.6F, &uvobs, geom_only);
       // Persist the observability field: the completion stage gates generation by g(1-o(x)),
       // and the dump is GATE B's eye-check (face bright, unseen body dark).
       ncg::io::save_npy(prefix + "_obs_uv.npy", uvobs.to(at::kCPU).contiguous());
@@ -3606,7 +3629,12 @@ int cmd_face(const ncg::app::Args& args) {
       }
       ncg::io::save_png(prefix + "_albedo_uv.png",
                         uv_final.reshape({T, T, 3}).permute({2, 0, 1}).contiguous().detach());
-      ncg::io::save_png(prefix + "_normal_uv.png", uvnrm.permute({2, 0, 1}).contiguous().detach());
+      if (args.has("uv-normal-in")) {  // reuse a previously solved normal map (fast-path runs)
+        std::filesystem::copy_file(args.require("uv-normal-in"), prefix + "_normal_uv.png",
+                                   std::filesystem::copy_options::overwrite_existing);
+      } else {
+        ncg::io::save_png(prefix + "_normal_uv.png", uvnrm.permute({2, 0, 1}).contiguous().detach());
+      }
       ncg::io::save_npy(prefix + "_uvcoords.npy", model.uv_coords().to(at::kCPU).contiguous());
       ncg::io::save_npy(prefix + "_uvfaces.npy", model.uv_faces().to(at::kInt).contiguous());
       NCG_LOG_INFO("face: wrote {}x{} per-texel UV albedo + normal map -> {}_albedo_uv.png", T, T,
@@ -3725,8 +3753,13 @@ int cmd_face(const ncg::app::Args& args) {
           c.rotations.select(1, 0).fill_(1.0F);
           return ncg::runtime::render_soft_aniso(c, cam, bg, 1024);
         };
+        // TIGHT face framing (radius 0.30, fov 24 — the proven H100 bake recipe): SD1.5 only
+        // produces good faces when the face fills the frame; at head-framing distance the
+        // effective face resolution is too small and the model smears or hallucinates.
+        const float frad = args.get_float("face-radius", 0.30F);
+        const float ffov = args.get_float("face-fov", 24.0F);
         for (float faz : {0.F, -25.F, 25.F, -50.F, 50.F}) {
-          const auto cam = ncg::runtime::Camera::orbit(hcen, 0.42F, faz, 5.0F, 28.0F, fbr, fbr,
+          const auto cam = ncg::runtime::Camera::orbit(hcen, frad, faz, 5.0F, ffov, fbr, fbr,
                                                        device);
           const auto rendered = fsplat(uv_final.index({vm}), cam, {0.5F, 0.5F, 0.5F}).image;
           torch::Tensor uvp, depth;
