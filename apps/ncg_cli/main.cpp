@@ -3655,6 +3655,17 @@ int cmd_face(const ncg::app::Args& args) {
           const float mu_l = l_v.mean().item<float>(), sd_l = std::max(l_v.std().item<float>(), 1e-4F);
           ch.masked_scatter_(lo_m, ((l_v - mu_l) * (sd_u / sd_l) + mu_u).clamp(0.0F, 1.0F));
         }
+        // And lift the WHOLE body's luminance to skin range (median ~0.5): the completion can
+        // leave regions dusk-dark, and stat-matching alone preserves that shared darkness.
+        {
+          const auto bidx = (vm & (py < yneck)).nonzero().squeeze(1);
+          auto btex = uv_final.index_select(0, bidx);
+          const float bmed = btex.mean(1).median().item<float>();
+          const float bgain = std::clamp(0.50F / std::max(bmed, 0.05F), 1.0F, 2.0F);
+          if (bgain > 1.02F)
+            uv_final.index_copy_(0, bidx, (btex * bgain).clamp(0.0F, 1.0F));
+          NCG_LOG_INFO("face: body luminance x{:.2f} (median {:.2f} -> ~0.50)", bgain, bmed);
+        }
         uv_final = uv_final.clamp(0.0F, 1.0F);
         NCG_LOG_INFO("face: tone-unified lower body to upper-body stats");
       }
@@ -3674,7 +3685,7 @@ int cmd_face(const ncg::app::Args& args) {
         auto fguide = ncg::diffuse::SdGuidance::load(sdf + "/control_unet.ts", sdf + "/sd_vae.ts",
                                                      sdf + "/sd_cond.safetensors", sdf_dev, gcf);
         const ncg::diffuse::DdpmSchedule fsch({}, sdf_dev);
-        const float fstr = args.get_float("face-strength", 0.32F);
+        const float fstr = args.get_float("face-strength", 0.45F);
         const int fsteps = args.get_int("face-steps", 24);
         const int fbr = 512;
         const auto vm = (uvmask.reshape({T * T}) > 0.5F);
@@ -3685,6 +3696,21 @@ int cmd_face(const ncg::app::Args& args) {
         const float yq = torch::quantile(fpx.select(1, 1).to(at::kCPU), 0.88).item<float>();
         const auto hm = fpx.select(1, 1) > yq;
         const auto hcen = fpx.index({hm}).mean(0);
+        // Pre-brighten the head to skin range: the analytic face is dusk-dark (deshade can't fully
+        // undo casual lighting) and low-strength img2img keeps low frequencies — refining a dark
+        // face yields a dark face. Scale head-texel luminance so the median lands at ~0.52, then
+        // let the portrait prompt add detail at that tone.
+        {
+          const auto hidx = fidx.index({hm.nonzero().squeeze(1)});
+          auto htex = uv_final.index_select(0, hidx);
+          const float med = htex.mean(1).median().item<float>();
+          const float gain = std::clamp(0.52F / std::max(med, 0.05F), 1.0F, 2.2F);
+          if (gain > 1.02F) {
+            uv_final.index_copy_(0, hidx, (htex * gain).clamp(0.0F, 1.0F));
+            NCG_LOG_INFO("face-refine: pre-brightened head x{:.2f} (median {:.2f} -> ~0.52)", gain,
+                         med);
+          }
+        }
         auto fconf = torch::zeros({Pf}, fpx.options());
         torch::manual_seed(args.get_int("complete-seed", 42));
         auto fsplat = [&](const torch::Tensor& colors, const ncg::runtime::Camera& cam,
