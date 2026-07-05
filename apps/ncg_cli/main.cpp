@@ -3749,18 +3749,23 @@ int cmd_face(const ncg::app::Args& args) {
           // face texels, and img2img preserves them as "structure". Any head texel far from the
           // local blur (in luminance) is replaced by the blurred color before refining.
           {
+            // FACE-SCALE context (8x down + up): a 30-texel-wide band matches its own 5x5 blur,
+            // so small kernels only flag its edges. Against the 8x-downsampled context the whole
+            // band (and dark hair streaks) are outliers.
             auto img = uv_final.reshape({T, T, 3}).permute({2, 0, 1}).unsqueeze(0);  // [1,3,T,T]
-            auto k1 = torch::tensor({1.F, 4.F, 6.F, 4.F, 1.F}, uv_final.options());
-            auto k2 = torch::outer(k1, k1); k2 = k2 / k2.sum();
-            const auto kb = k2.view({1, 1, 5, 5}).expand({3, 1, 5, 5}).contiguous();
-            const auto blur = Fnf::conv2d(img, kb, Fnf::Conv2dFuncOptions().padding(2).groups(3))
-                                  .squeeze(0).permute({1, 2, 0}).reshape({T * T, 3});
+            const auto ctx = Fnf::interpolate(
+                Fnf::interpolate(img, Fnf::InterpolateFuncOptions()
+                                          .size(std::vector<int64_t>{T / 8, T / 8})
+                                          .mode(torch::kBilinear).align_corners(false)),
+                Fnf::InterpolateFuncOptions().size(std::vector<int64_t>{(int64_t)T, (int64_t)T})
+                    .mode(torch::kBilinear).align_corners(false))
+                                 .squeeze(0).permute({1, 2, 0}).reshape({T * T, 3});
             auto hfull = torch::zeros({T * T}, uv_final.options());
             hfull.index_copy_(0, fidx.index({hm.nonzero().squeeze(1)}),
                               torch::ones({hm.sum().item<int64_t>()}, uv_final.options()));
-            const auto dl = (uv_final.mean(1) - blur.mean(1)).abs();
-            const auto bad = ((dl > 0.16F) & (hfull > 0.5F)).unsqueeze(1).to(uv_final.dtype());
-            uv_final = uv_final * (1.0F - bad) + blur * bad;
+            const auto dl = (uv_final.mean(1) - ctx.mean(1)).abs();
+            const auto bad = ((dl > 0.13F) & (hfull > 0.5F)).unsqueeze(1).to(uv_final.dtype());
+            uv_final = uv_final * (1.0F - bad) + ctx * bad;
             NCG_LOG_INFO("face-refine: suppressed {:.0f} outlier head texels (band/print artifacts)",
                          bad.sum().item<float>());
           }
