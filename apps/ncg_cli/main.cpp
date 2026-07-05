@@ -3737,9 +3737,13 @@ int cmd_face(const ncg::app::Args& args) {
         const auto fnx = uvgn.index({vm});                                      // [P,3]
         const auto fidx = vm.nonzero().squeeze(1);
         const int64_t Pf = fpx.size(0);
-        const float yq = torch::quantile(fpx.select(1, 1).to(at::kCPU), 0.88).item<float>();
-        const auto hm = fpx.select(1, 1) > yq;
-        const auto hcen = fpx.index({hm}).mean(0);
+        // WHOLE head, anchored to the crown: the old 88th-percentile-of-texel-y cut landed
+        // mid-face (texel density skews the quantile), so the refine/suppression never touched
+        // the nose/mouth band — it stayed byte-identical across every iteration. Crown minus
+        // 30 cm covers scalp to chin.
+        const float ytop = torch::quantile(fpx.select(1, 1).to(at::kCPU), 0.995).item<float>();
+        const auto hm = fpx.select(1, 1) > (ytop - 0.30F);
+        const auto hcen = fpx.index({fpx.select(1, 1) > (ytop - 0.15F)}).mean(0);
         // Pre-brighten the head to skin range: the analytic face is dusk-dark (deshade can't fully
         // undo casual lighting) and low-strength img2img keeps low frequencies — refining a dark
         // face yields a dark face. Scale head-texel luminance so the median lands at ~0.52, then
