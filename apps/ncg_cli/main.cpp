@@ -3051,7 +3051,10 @@ int cmd_face(const ncg::app::Args& args) {
         viss_t.push_back(vis_l[static_cast<size_t>(i)] * R.weight[i].to(device).clamp_min(0.05));
       torch::Tensor uvmask, uvnrm, uvpos, uvgn;
       torch::Tensor uvobs;  // o(x) — per-texel observability, the Theorem-3 gate input
-      const bool geom_only = args.has("uv-albedo-in") && args.has("uv-normal-in");
+      // With an external albedo the photometric solve is skipped entirely; if no external normal
+      // map is given the glb gets a FLAT one — which is CORRECT: the photometric normal solve on
+      // casual photos produces rainbow noise that wrecks engine shading (measured in Blender).
+      const bool geom_only = args.has("uv-albedo-in");
       const auto uvtex =
           recover_uv_albedo(model, uv_img, uv_v2d, nrm_l, viss_t, T, verts_dev, uvmask, uvnrm, uvpos,
                             uvgn, args.get_float("detail", 0.7F), args.get_float("deshade", 0.5F),
