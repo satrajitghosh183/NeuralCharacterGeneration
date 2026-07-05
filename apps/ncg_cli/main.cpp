@@ -3808,7 +3808,13 @@ int cmd_face(const ncg::app::Args& args) {
         // effective face resolution is too small and the model smears or hallucinates.
         const float frad = args.get_float("face-radius", 0.30F);
         const float ffov = args.get_float("face-fov", 24.0F);
+        bool author_done = false;
         for (float faz : {0.F, -25.F, 25.F, -50.F, 50.F}) {
+          // AUTHOR-VIEW identity: the frontal view generates at full strength (FaceID identity
+          // lands whole); side views only REFINE at 0.4x so cross-view averaging cannot wash
+          // the identity back out.
+          const float vstr = author_done ? fstr * 0.4F : fstr;
+          author_done = true;
           const auto cam = ncg::runtime::Camera::orbit(hcen, frad, faz, 5.0F, ffov, fbr, fbr,
                                                        device);
           const auto rendered = fsplat(uv_final.index({vm}), cam, {0.5F, 0.5F, 0.5F}).image;
@@ -3822,9 +3828,9 @@ int cmd_face(const ncg::app::Args& args) {
           {
             torch::NoGradGuard ng;
             refined = fctrl ? fguide.img2img_control(rendered.unsqueeze(0).to(sdf_dev),
-                                                     nmap.unsqueeze(0).to(sdf_dev), fstr, fsteps,
+                                                     nmap.unsqueeze(0).to(sdf_dev), vstr, fsteps,
                                                      fsch).squeeze(0).to(device)
-                            : fguide.img2img(rendered.unsqueeze(0).to(sdf_dev), fstr, fsteps, fsch)
+                            : fguide.img2img(rendered.unsqueeze(0).to(sdf_dev), vstr, fsteps, fsch)
                                   .squeeze(0).to(device);
           }
           const auto gx = uvp.select(1, 0) / (fbr - 1) * 2 - 1;
@@ -3875,7 +3881,7 @@ int cmd_face(const ncg::app::Args& args) {
         const auto nose = headv[headv.select(1, 2).argmax().item<int64_t>()];
         const float nx = nose[0].item<float>(), ny = nose[1].item<float>(), nz = nose[2].item<float>();
         const float eyx = args.get_float("eye-x", 0.032F), eyy = args.get_float("eye-up", 0.030F),
-                    eyz = args.get_float("eye-back", 0.018F);
+                    eyz = args.get_float("eye-back", 0.014F);
         const auto eyes_c = torch::stack({torch::tensor({nx - eyx, ny + eyy, nz - eyz}),
                                           torch::tensor({nx + eyx, ny + eyy, nz - eyz})}, 0);  // [2,3]
         const float ir = args.get_float("eye-r", 0.012F);

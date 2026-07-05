@@ -88,22 +88,22 @@ def main():
     for i in range(S):
         for j in range(S):
             q = r[i, j]
-            if q <= 0.16:
+            if q <= 0.10:
                 tile[i, j] = (0.03, 0.025, 0.025)
-            elif q <= 0.62:
-                t = (q - 0.16) / 0.46
+            elif q <= 0.35:
+                t = (q - 0.10) / 0.25
                 k = 4 + t * 14  # map into the measured 4..18px iris band of the 22-ring profile
                 k0 = int(np.clip(k, 0, 20))
                 fr = k - k0
                 tile[i, j] = prof[k0] * (1 - fr) + prof[min(k0 + 1, 21)] * fr
-            elif q <= 0.70:
-                t = (q - 0.62) / 0.08
+            elif q <= 0.42:
+                t = (q - 0.35) / 0.07
                 tile[i, j] = (prof[18] * (1 - t) + sclera * t) * (0.75 + 0.25 * t)  # limbal ring
             else:
-                shade = 1.0 - 0.12 * max(0.0, (q - 0.85)) / 0.15  # slight corner shading
+                shade = 1.0 - 0.10 * max(0.0, (q - 0.85)) / 0.15  # slight corner shading
                 tile[i, j] = sclera * shade
     # catchlight
-    ci, cj = int(S * 0.38), int(S * 0.42)
+    ci, cj = int(S * 0.44), int(S * 0.46)
     for di in range(-3, 4):
         for dj in range(-3, 4):
             if di * di + dj * dj <= 9:
