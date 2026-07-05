@@ -35,7 +35,7 @@ zs = [ (body.matrix_world @ v.co).z for v in body.data.vertices ]
 zmin, zmax = min(zs), max(zs)
 H = zmax - zmin
 
-def make_garment(name, lo_f, hi_f, color, thickness=0.006, max_x=None):
+def make_garment(name, lo_f, hi_f, color, thickness=0.006, max_x=None, loose=0.012, pin_top=0.05):
     dup = body.copy()
     dup.data = body.data.copy()
     dup.name = name
@@ -50,32 +50,86 @@ def make_garment(name, lo_f, hi_f, color, thickness=0.006, max_x=None):
         return max_x is not None and abs(w.x) > max_x  # trim sleeves (T-pose hands sit at shirt height)
     doomed = [v for v in bm.verts if outside(v)]
     bmesh.ops.delete(bm, geom=doomed, context="VERTS")
-    # push the garment off the skin so the body never pokes through on curved areas
+    # loose fit: offset outward so the cloth solver has room to drape and wrinkle
     for v in bm.verts:
-        v.co += v.normal * 0.004
+        v.co += v.normal * loose
     bm.to_mesh(dup.data)
     bm.free()
-    solid = dup.modifiers.new("Shell", "SOLIDIFY")
-    solid.thickness = thickness
-    solid.offset = 1.0
-    subdiv = dup.modifiers.new("Smooth", "SUBSURF")   # smooths the ragged cut edges into cloth
-    subdiv.levels = 2
-    subdiv.render_levels = 2
+    # pin the top band (shoulders / waistband) so the garment hangs from it during the sim
+    pin = dup.vertex_groups.new(name="ClothPin")
+    top = [v.index for v in dup.data.vertices if (dup.matrix_world @ v.co).z > hi - pin_top * H]
+    pin.add(top, 1.0, "REPLACE")
     mat = bpy.data.materials.new(name + "Mat")
     mat.use_nodes = True
-    bsdf = mat.node_tree.nodes["Principled BSDF"]
+    nt = mat.node_tree
+    bsdf = nt.nodes["Principled BSDF"]
     bsdf.inputs["Base Color"].default_value = (*color, 1.0)
     bsdf.inputs["Roughness"].default_value = 0.85
     if "Sheen Weight" in bsdf.inputs:                 # fabric response
-        bsdf.inputs["Sheen Weight"].default_value = 0.4
+        bsdf.inputs["Sheen Weight"].default_value = 0.5
+    # woven-fabric micro bump
+    noise = nt.nodes.new("ShaderNodeTexNoise")
+    noise.inputs["Scale"].default_value = 900.0
+    bump = nt.nodes.new("ShaderNodeBump")
+    bump.inputs["Strength"].default_value = 0.15
+    nt.links.new(noise.outputs["Fac"], bump.inputs["Height"])
+    nt.links.new(bump.outputs["Normal"], bsdf.inputs["Normal"])
     dup.data.materials.clear()
     dup.data.materials.append(mat)
     for p in dup.data.polygons:
         p.use_smooth = True
     return dup
 
+
+def simulate_cloth(garments):
+    """Drape the garments over the body with Blender's cloth solver, bake the folds into the
+    mesh, then re-attach the armature so the draped clothes still follow the rig."""
+    col = body.modifiers.new("Collide", "COLLISION")
+    body.collision.thickness_outer = 0.003
+    for g in garments:
+        # remember the armature modifier spec, remove it during the sim
+        for m in list(g.modifiers):
+            g.modifiers.remove(m)
+        cloth = g.modifiers.new("Cloth", "CLOTH")
+        cs = cloth.settings
+        cs.quality = 8
+        cs.mass = 0.25
+        cs.tension_stiffness = 12.0
+        cs.bending_stiffness = 0.4
+        cs.vertex_group_mass = "ClothPin"           # pinned band hangs the garment
+        cloth.collision_settings.collision_quality = 4
+        cloth.collision_settings.distance_min = 0.003
+        cloth.point_cache.frame_start = 1
+        cloth.point_cache.frame_end = 40
+    # run the sim
+    for f in range(1, 41):
+        scn.frame_set(f)
+    deps = bpy.context.evaluated_depsgraph_get()
+    for g in garments:
+        ev = g.evaluated_get(deps)
+        draped = bpy.data.meshes.new_from_object(ev)   # baked folds
+        old = g.data
+        g.data = draped
+        g.modifiers.remove(g.modifiers["Cloth"])
+        bpy.data.meshes.remove(old)
+        # thickness + smoothing on the draped shape
+        solid = g.modifiers.new("Shell", "SOLIDIFY")
+        solid.thickness = 0.005
+        solid.offset = 1.0
+        sub = g.modifiers.new("Smooth", "SUBSURF")
+        sub.levels = 1
+        sub.render_levels = 2
+        # re-attach to the rig (vertex groups survived the bake via new_from_object)
+        arm_mod = g.modifiers.new("Armature", "ARMATURE")
+        arm_mod.object = arm
+        for p in g.data.polygons:
+            p.use_smooth = True
+    body.modifiers.remove(col)
+    scn.frame_set(1)
+
 shirt = make_garment("Shirt", 0.50, 0.80, (0.09, 0.12, 0.30), max_x=0.45)  # tee, sleeves above elbow
 shorts = make_garment("Shorts", 0.34, 0.545, (0.13, 0.13, 0.14), thickness=0.008)  # overlaps shirt hem
+simulate_cloth([shirt, shorts])
 
 # ---- floor / lights / camera / world -----------------------------------------------------------
 bpy.ops.mesh.primitive_plane_add(size=12, location=(0, 0, zmin))
