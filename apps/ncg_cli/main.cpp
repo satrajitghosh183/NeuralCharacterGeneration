@@ -3742,6 +3742,25 @@ int cmd_face(const ncg::app::Args& args) {
         // face yields a dark face. Scale head-texel luminance so the median lands at ~0.52, then
         // let the portrait prompt add detail at that tone.
         {
+          // Outlier suppression FIRST: photo-misalignment can print shirt text/bright bands onto
+          // face texels, and img2img preserves them as "structure". Any head texel far from the
+          // local blur (in luminance) is replaced by the blurred color before refining.
+          {
+            auto img = uv_final.reshape({T, T, 3}).permute({2, 0, 1}).unsqueeze(0);  // [1,3,T,T]
+            auto k1 = torch::tensor({1.F, 4.F, 6.F, 4.F, 1.F}, uv_final.options());
+            auto k2 = torch::outer(k1, k1); k2 = k2 / k2.sum();
+            const auto kb = k2.view({1, 1, 5, 5}).expand({3, 1, 5, 5}).contiguous();
+            const auto blur = Fnf::conv2d(img, kb, Fnf::Conv2dFuncOptions().padding(2).groups(3))
+                                  .squeeze(0).permute({1, 2, 0}).reshape({T * T, 3});
+            auto hfull = torch::zeros({T * T}, uv_final.options());
+            hfull.index_copy_(0, fidx.index({hm.nonzero().squeeze(1)}),
+                              torch::ones({hm.sum().item<int64_t>()}, uv_final.options()));
+            const auto dl = (uv_final.mean(1) - blur.mean(1)).abs();
+            const auto bad = ((dl > 0.16F) & (hfull > 0.5F)).unsqueeze(1).to(uv_final.dtype());
+            uv_final = uv_final * (1.0F - bad) + blur * bad;
+            NCG_LOG_INFO("face-refine: suppressed {:.0f} outlier head texels (band/print artifacts)",
+                         bad.sum().item<float>());
+          }
           const auto hidx = fidx.index({hm.nonzero().squeeze(1)});
           auto htex = uv_final.index_select(0, hidx);
           const float med = htex.mean(1).median().item<float>();
