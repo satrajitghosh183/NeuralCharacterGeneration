@@ -2894,8 +2894,18 @@ int cmd_face(const ncg::app::Args& args) {
     // NLF's released TorchScript does not run on MPS (unimplemented ops even with fallback);
     // pin it to CPU there. Cached texture-only reruns never reach this line at all.
     const auto nlf_dev = device.is_mps() ? at::Device(at::kCPU) : device;
+    // Negative cache: photos NLF finds no person in fail identically every run (~90s each on
+    // CPU). A .nodetect marker skips them forever.
+    const auto fno = fs::path(nlf_cache) / (stem + ".nodetect");
+    if (!nlf_cache.empty() && fs::exists(fno))
+      throw std::runtime_error("cached: no detection in " + stem);
     if (!nlf) nlf.emplace(ncg::body::Nlf::load(args.require("weights"), nlf_dev, nc));
-    pred = nlf->detect(img);
+    try {
+      pred = nlf->detect(img);
+    } catch (const std::exception&) {
+      if (!nlf_cache.empty()) std::ofstream(fno.string()) << "no detection\n";
+      throw;
+    }
     if (!nlf_cache.empty() && pred.vertices2d.defined() && pred.vertices2d.size(0) > 0) {
       ncg::io::save_npy(f2d.string(), pred.vertices2d.to(at::kCPU).to(at::kFloat).contiguous());
       ncg::io::save_npy(f3d.string(), pred.vertices3d.to(at::kCPU).to(at::kFloat).contiguous());
@@ -3330,6 +3340,9 @@ int cmd_face(const ncg::app::Args& args) {
             const auto yq = torch::quantile(fp.select(1, 1).to(at::kCPU), 0.85).item<float>();
             const auto body = (fp.select(1, 1) < yq).to(fp.dtype());               // below neck
             gate = torch::maximum(gate, body);                                     // body: full paint
+            // And the HEAD is never completed here — the face-refine stage owns it with a
+            // portrait prompt. Body-prompt paints on face texels produced text-like bands.
+            gate = gate * body;
           }
           const auto evidence = (gate <= 0.0F);                                    // Ω_obs texels
 
@@ -3867,16 +3880,36 @@ int cmd_face(const ncg::app::Args& args) {
               tx[rr][cc][0] = r; tx[rr][cc][1] = gc; tx[rr][cc][2] = b;
             }
         };
-        paint_texel(0.01F, 0.01F, 0.90F, 0.87F, 0.84F);  // sclera
-        paint_texel(0.05F, 0.01F, 0.36F, 0.24F, 0.14F);  // iris
-        paint_texel(0.09F, 0.01F, 0.04F, 0.03F, 0.03F);  // pupil
+        // Reserve the three texels in guaranteed-EMPTY atlas gutter (uvmask==0), not a hardcoded
+        // corner that may sit inside a body island: scan the mask for three separated free spots.
+        float euv[3][2] = {{0.01F, 0.01F}, {0.05F, 0.01F}, {0.09F, 0.01F}};  // fallback
+        {
+          const auto mk = uvmask.to(at::kCPU);
+          int found = 0;
+          for (int rr = static_cast<int>(T) - 8; rr >= 8 && found < 3; rr -= 8)
+            for (int cc = 8; cc < static_cast<int>(T) - 8 && found < 3; cc += 8) {
+              bool free_block = true;
+              for (int di = -4; di <= 4 && free_block; ++di)
+                for (int dj = -4; dj <= 4 && free_block; ++dj)
+                  if (mk[rr + di][cc + dj].item<float>() > 0.5F) free_block = false;
+              if (free_block) {
+                euv[found][0] = static_cast<float>(cc) / (T - 1);
+                euv[found][1] = 1.0F - static_cast<float>(rr) / (T - 1);
+                ++found;
+                cc += 16;  // separate the three spots
+              }
+            }
+        }
+        paint_texel(euv[0][0], euv[0][1], 0.90F, 0.87F, 0.84F);  // sclera
+        paint_texel(euv[1][0], euv[1][1], 0.36F, 0.24F, 0.14F);  // iris
+        paint_texel(euv[2][0], euv[2][1], 0.04F, 0.03F, 0.03F);  // pupil
         tex_uv = tx.reshape({T * T, 3});
         auto eye_uv = torch::empty({N, 2});
         for (int64_t vi2 = 0; vi2 < N; ++vi2) {
           const float zf = sV[vi2][2].item<float>();  // forwardness of this sphere vert
-          const float uu = zf > 0.86F ? 0.09F : zf > 0.55F ? 0.05F : 0.01F;
-          eye_uv[vi2][0] = uu;
-          eye_uv[vi2][1] = 0.01F;
+          const int which = zf > 0.86F ? 2 : zf > 0.55F ? 1 : 0;
+          eye_uv[vi2][0] = euv[which][0];
+          eye_uv[vi2][1] = euv[which][1];
         }
         eye_uv = eye_uv.contiguous();
         std::vector<torch::Tensor> Vs{g_verts}, Ns{g_norm}, UVs{g_uv}, Ls{g_lbs}, Fs{g_faces}, UVFs{g_uvf};
