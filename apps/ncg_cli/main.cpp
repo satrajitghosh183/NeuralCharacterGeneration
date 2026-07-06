@@ -3714,6 +3714,74 @@ int cmd_face(const ncg::app::Args& args) {
         NCG_LOG_INFO("face: tone-unified lower body to upper-body stats");
       }
 
+      // ---- HERO-PHOTO PROJECTION (--hero-photo <path|auto>): the subject's best frontal photo,
+      // sampled per-texel through its cached NLF vertex projections, becomes the face — REAL
+      // pixels, real identity, razor sharp. The gentle FaceID refine afterwards only blends
+      // seams. Photo-projection is the highest-fidelity identity source available.
+      if (args.has("hero-photo")) {
+        namespace Fnh = torch::nn::functional;
+        std::string hero = args.get("hero-photo", "auto");
+        if (hero == "auto") {
+          // most-frontal high-trust photo: score = trust x face frontality (mean -nz, head verts)
+          float best = -1e9F;
+          for (size_t i = 0; i < used.size(); ++i) {
+            const auto stem0 = fs::path(used[i]).stem().string();
+            const auto f3 = fs::path(nlf_cache) / (stem0 + ".v3d.npy");
+            if (!fs::exists(f3)) continue;
+            const auto v3 = ncg::io::load_npy(f3.string()).to(at::kFloat);
+            ncg::mesh::TriMesh hm3{v3, faces.to(at::kCPU)};
+            const auto n3 = ncg::mesh::compute_vertex_normals(hm3);
+            const float yq3 = torch::quantile(v3.select(1, 1), 0.10).item<float>();
+            const auto headsel = v3.select(1, 1) < yq3;  // NLF camera frame: image y grows down
+            const float frontal = (-n3.select(1, 2)).masked_select(headsel).mean().item<float>();
+            const float trust = R.weight[static_cast<int64_t>(i)].item<float>();
+            const float sc = trust * std::max(frontal, 0.0F);
+            if (sc > best) { best = sc; hero = used[i]; }
+          }
+          NCG_LOG_INFO("hero-photo: auto-picked '{}' (score {:.3f})", hero, best);
+        }
+        const auto stem = fs::path(hero).stem().string();
+        const auto f2d = fs::path(nlf_cache) / (stem + ".v2d.npy");
+        NCG_CHECK(fs::exists(f2d), "hero-photo: no NLF cache for '{}'", hero);
+        const auto hv2d = ncg::io::load_npy(f2d.string()).to(at::kFloat);         // [V,2]
+        const auto hv3d = ncg::io::load_npy((fs::path(nlf_cache) / (stem + ".v3d.npy")).string())
+                              .to(at::kFloat);
+        const auto himg = ncg::io::load_image(hero, 3);                            // [3,H,W] full res
+        const int64_t Hh = himg.size(1), Wh = himg.size(2);
+        const auto hras = ncg::recon::uv_rasterize(model.uv_coords().to(at::kCPU),
+                                                   model.uv_faces().to(at::kCPU), T);
+        const auto hgeomv =
+            faces.to(at::kCPU).index_select(0, hras.face.clamp_min(0)).reshape(-1);
+        const auto pv = hv2d.index_select(0, hgeomv).reshape({T * T, 3, 2});
+        const auto tuv = (pv * hras.bary.unsqueeze(2)).sum(1);                     // [T^2,2] pixels
+        ncg::mesh::TriMesh hm4{hv3d, faces.to(at::kCPU)};
+        const auto hn = ncg::mesh::compute_vertex_normals(hm4);
+        const auto tn =
+            (hn.index_select(0, hgeomv).reshape({T * T, 3, 3}) * hras.bary.unsqueeze(2)).sum(1);
+        const auto gx = (tuv.select(1, 0) / (Wh - 1) * 2 - 1).clamp(-1.0F, 1.0F);
+        const auto gy = (tuv.select(1, 1) / (Hh - 1) * 2 - 1).clamp(-1.0F, 1.0F);
+        const auto grid = torch::stack({gx, gy}, 1).view({1, T * T, 1, 2});
+        const auto samp = Fnh::grid_sample(himg.unsqueeze(0), grid,
+                                           Fnh::GridSampleFuncOptions().mode(torch::kBilinear)
+                                               .padding_mode(torch::kZeros).align_corners(true))
+                              .view({3, T * T}).t();                               // [T^2,3]
+        const auto vmH = (uvmask.reshape({T * T}) > 0.5F);
+        const auto pyH = uvpos.select(1, 1);
+        const float ytopH =
+            torch::quantile(pyH.masked_select(vmH).to(at::kCPU), 0.995).item<float>();
+        const auto headH = vmH & (pyH > (ytopH - 0.30F));
+        const auto frontH = torch::relu(-tn.select(1, 2)).to(uv_final.dtype());
+        const auto inbH = ((tuv.select(1, 0) >= 0) & (tuv.select(1, 0) <= Wh - 1) &
+                           (tuv.select(1, 1) >= 0) & (tuv.select(1, 1) <= Hh - 1))
+                              .to(uv_final.dtype());
+        auto wH = (frontH * inbH * headH.to(uv_final.dtype())).clamp(0.0F, 1.0F);
+        wH = ((wH - 0.25F) / 0.35F).clamp(0.0F, 1.0F);                             // feather
+        uv_final =
+            uv_final * (1.0F - wH.unsqueeze(1)) + samp.to(uv_final.dtype()) * wH.unsqueeze(1);
+        NCG_LOG_INFO("hero-photo: projected {:.0f}k face texels from '{}'",
+                     (wH > 0.5F).sum().item<float>() / 1000.0F, hero);
+      }
+
       // ---- FACE REFINE (--face-refine + --sd-dir-face): img2img the HEAD views with a portrait
       // prompt on top of whatever texture uv_final holds (works with --uv-albedo-in, so the
       // photoreal face lands without re-running the body completion). Most-frontal reprojection,
