@@ -3728,9 +3728,11 @@ int cmd_face(const ncg::app::Args& args) {
         gcf.guidance = args.get_float("face-guidance", 6.5F);
         // Prefer the ControlNet UNet when the export provides one; otherwise plain img2img
         // (the SDXL+FaceID export has no control — identity comes from the FaceID tokens).
-        const bool fctrl = std::filesystem::exists(sdf + "/control_unet.ts");
+        const bool fctrl_ip = std::filesystem::exists(sdf + "/control_unet_ip.ts");
+        const bool fctrl = fctrl_ip || std::filesystem::exists(sdf + "/control_unet.ts");
         auto fguide = ncg::diffuse::SdGuidance::load(
-            sdf + (fctrl ? "/control_unet.ts"
+            sdf + (fctrl_ip ? "/control_unet_ip.ts"
+                   : fctrl ? "/control_unet.ts"
                          : (std::filesystem::exists(sdf + "/sdxl_unet_ip.ts") ? "/sdxl_unet_ip.ts"
                                                                               : "/sd_unet.ts")),
             sdf + "/sd_vae.ts", sdf + "/sd_cond.safetensors", sdf_dev, gcf);

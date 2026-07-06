@@ -21,6 +21,7 @@ struct SdGuidance::Impl {
   Tensor uncond;  // [1,77,C]
   // SDXL + IP-Adapter (FaceID) mode: present when the cond safetensors carries pooled/ip embeds.
   bool sdxl_ip = false;
+  bool ctrl_ip = false;  // SD1.5 ControlNet + FaceID: ip embeds without pooled
   Tensor cond_pooled, uncond_pooled;  // [1,1280]
   Tensor ip_cond, ip_uncond;          // [1,K,512] subject identity embeds / zeros
   at::Device device = at::kCPU;
@@ -73,6 +74,13 @@ SdGuidance SdGuidance::load(const std::string& unet_ts, const std::string& vae_t
   auto st = ncg::io::SafeTensors::open(cond_safetensors);
   g.impl_->cond = st.view("cond").clone().to(device, at::kFloat);
   g.impl_->uncond = st.view("uncond").clone().to(device, at::kFloat);
+  if (!st.has("cond_pooled") && st.has("ip_cond")) {  // SD1.5 ControlNet + FaceID export
+    g.impl_->ctrl_ip = true;
+    g.impl_->ip_cond = st.view("ip_cond").clone().to(device, at::kFloat);
+    g.impl_->ip_uncond = st.view("ip_uncond").clone().to(device, at::kFloat);
+    NCG_LOG_INFO("SdGuidance: ControlNet+FaceID mode ({} identity embeds)",
+                 g.impl_->ip_cond.size(1));
+  }
   if (st.has("cond_pooled") && st.has("ip_cond")) {  // SDXL + FaceID export
     g.impl_->sdxl_ip = true;
     g.impl_->cond_pooled = st.view("cond_pooled").clone().to(device, at::kFloat);
@@ -156,8 +164,14 @@ Tensor SdGuidance::img2img_control(const Tensor& init_rgb, const Tensor& control
     const auto tl = t.to(p->device, at::kLong);
     const auto cu = p->uncond.expand({B, p->uncond.size(1), p->uncond.size(2)});
     const auto cc = p->cond.expand({B, p->cond.size(1), p->cond.size(2)});
-    const auto eps_u = unet.forward({z, tl, cu, ctrl}).toTensor();
-    const auto eps_c = unet.forward({z, tl, cc, ctrl}).toTensor();
+    Tensor eps_u, eps_c;
+    if (p->ctrl_ip) {
+      eps_u = unet.forward({z, tl, cu, ctrl, p->ip_uncond}).toTensor();
+      eps_c = unet.forward({z, tl, cc, ctrl, p->ip_cond}).toTensor();
+    } else {
+      eps_u = unet.forward({z, tl, cu, ctrl}).toTensor();
+      eps_c = unet.forward({z, tl, cc, ctrl}).toTensor();
+    }
     return cfg_eps(eps_u, eps_c, guidance);
   };
 
